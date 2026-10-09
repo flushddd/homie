@@ -234,6 +234,66 @@ class HomieOnPolicyRunner:
     finally:
       self._stop_train_viser()
 
+  def _print_iteration_log(
+    self,
+    *,
+    it: int,
+    tot_iter: int,
+    start_iter: int,
+    fps: int,
+    collection_time: float,
+    learn_time: float,
+    iteration_time: float,
+    mean_value_loss: float,
+    mean_surrogate_loss: float,
+    mean_estimation_loss: float,
+    mean_loss_keep: float,
+    mean_swap_loss: float,
+    mean_actor_sym_loss: float,
+    mean_critic_sym_loss: float,
+    mean_std: float,
+    mean_rew: float,
+    mean_ep_len: float,
+    ep_means: dict,
+    num_learning_iterations: int,
+    width: int = 80,
+    pad: int = 35,
+  ) -> None:
+    """Homie-style console log: reward, episode length, collection/learn time."""
+    title = f" \033[1m Learning iteration {it}/{tot_iter - 1} \033[0m "
+    log_string = f"{'#' * width}\n{title.center(width, ' ')}\n\n"
+    log_string += (
+      f"{'Computation:':>{pad}} {fps:.0f} steps/s "
+      f"(collection: {collection_time:.3f}s, learning {learn_time:.3f}s)\n"
+      f"{'Value function loss:':>{pad}} {mean_value_loss:.4f}\n"
+      f"{'Surrogate loss:':>{pad}} {mean_surrogate_loss:.4f}\n"
+      f"{'Estimation loss:':>{pad}} {mean_estimation_loss:.4f}\n"
+      f"{'Keep loss:':>{pad}} {mean_loss_keep:.4f}\n"
+      f"{'Swap loss:':>{pad}} {mean_swap_loss:.4f}\n"
+      f"{'Mean actor sym loss:':>{pad}} {mean_actor_sym_loss:.4f}\n"
+      f"{'Mean critic sym loss:':>{pad}} {mean_critic_sym_loss:.4f}\n"
+      f"{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"
+    )
+    if mean_rew == mean_rew:  # not NaN
+      log_string += (
+        f"{'Mean reward:':>{pad}} {mean_rew:.2f}\n"
+        f"{'Mean episode length:':>{pad}} {mean_ep_len:.2f}\n"
+      )
+    for key, val in sorted(ep_means.items()):
+      log_string += f"{f'Mean episode {key}:':>{pad}} {val:.4f}\n"
+    done_iters = it - start_iter + 1
+    remaining = tot_iter - it - 1
+    eta = self.tot_time / max(done_iters, 1) * max(remaining, 0)
+    del num_learning_iterations
+    log_string += (
+      f"{'-' * width}\n"
+      f"{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"
+      f"{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"
+      f"{'Total time:':>{pad}} {self.tot_time:.2f}s\n"
+      f"{'ETA:':>{pad}} {eta:.1f}s\n"
+    )
+    print(log_string)
+
   def _learn_loop(
     self,
     start_iter,
@@ -311,6 +371,34 @@ class HomieOnPolicyRunner:
       self.tot_timesteps += self.num_steps_per_env * self.adapter.num_envs
       self.tot_time += collection_time + learn_time
 
+      iteration_time = collection_time + learn_time
+      fps = int(
+        self.num_steps_per_env
+        * self.adapter.num_envs
+        / max(iteration_time, 1e-6)
+      )
+      mean_std = float(self.alg.actor_critic.std.mean().item())
+      mean_rew = statistics.mean(rewbuffer) if rewbuffer else float("nan")
+      mean_ep_len = statistics.mean(lenbuffer) if lenbuffer else float("nan")
+
+      # Aggregate per-term episode rewards for TB + console (Homie-style).
+      ep_means: dict[str, float] = {}
+      if ep_extras:
+        all_keys = {k for ep in ep_extras for k in ep}
+        for key in all_keys:
+          vals = []
+          for ep in ep_extras:
+            if key not in ep:
+              continue
+            v = ep[key]
+            if isinstance(v, torch.Tensor):
+              vals.append(float(v.detach().mean().cpu()))
+            else:
+              vals.append(float(v))
+          if vals:
+            ep_means[key] = sum(vals) / len(vals)
+        ep_extras.clear()
+
       if self.writer is not None:
         self.writer.add_scalar("Loss/value_function", mean_value_loss, it)
         self.writer.add_scalar("Loss/surrogate", mean_surrogate_loss, it)
@@ -320,38 +408,36 @@ class HomieOnPolicyRunner:
         self.writer.add_scalar("Loss/critic_sym", mean_critic_sym_loss, it)
         self.writer.add_scalar("Loss/keep", mean_loss_keep, it)
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, it)
+        self.writer.add_scalar("Policy/mean_noise_std", mean_std, it)
+        self.writer.add_scalar("Perf/total_fps", fps, it)
+        self.writer.add_scalar("Perf/collection_time", collection_time, it)
+        self.writer.add_scalar("Perf/learning_time", learn_time, it)
         if len(rewbuffer) > 0:
-          self.writer.add_scalar("Train/mean_reward", statistics.mean(rewbuffer), it)
-          self.writer.add_scalar(
-            "Train/mean_episode_length", statistics.mean(lenbuffer), it
-          )
-        # Per-term episode rewards / metrics from mjlab managers.
-        if ep_extras:
-          all_keys = {k for ep in ep_extras for k in ep}
-          for key in all_keys:
-            vals = []
-            for ep in ep_extras:
-              if key not in ep:
-                continue
-              v = ep[key]
-              if isinstance(v, torch.Tensor):
-                vals.append(float(v.detach().mean().cpu()))
-              else:
-                vals.append(float(v))
-            if vals:
-              self.writer.add_scalar(key, sum(vals) / len(vals), it)
-          ep_extras.clear()
+          self.writer.add_scalar("Train/mean_reward", mean_rew, it)
+          self.writer.add_scalar("Train/mean_episode_length", mean_ep_len, it)
+        for key, val in ep_means.items():
+          self.writer.add_scalar(key, val, it)
 
-      fps = int(
-        self.num_steps_per_env
-        * self.adapter.num_envs
-        / max(collection_time + learn_time, 1e-6)
-      )
-      mean_rew = statistics.mean(rewbuffer) if rewbuffer else float("nan")
-      print(
-        f"[Homie HIM] it={it}/{tot_iter - 1} fps={fps} "
-        f"rew={mean_rew:.3f} v_loss={mean_value_loss:.4f} "
-        f"surr={mean_surrogate_loss:.4f} sym={mean_actor_sym_loss:.4f}"
+      self._print_iteration_log(
+        it=it,
+        tot_iter=tot_iter,
+        start_iter=start_iter,
+        fps=fps,
+        collection_time=collection_time,
+        learn_time=learn_time,
+        iteration_time=iteration_time,
+        mean_value_loss=mean_value_loss,
+        mean_surrogate_loss=mean_surrogate_loss,
+        mean_estimation_loss=mean_estimation_loss,
+        mean_loss_keep=mean_loss_keep,
+        mean_swap_loss=mean_swap_loss,
+        mean_actor_sym_loss=mean_actor_sym_loss,
+        mean_critic_sym_loss=mean_critic_sym_loss,
+        mean_std=mean_std,
+        mean_rew=mean_rew,
+        mean_ep_len=mean_ep_len,
+        ep_means=ep_means,
+        num_learning_iterations=tot_iter - start_iter,
       )
 
       if it % self.save_interval == 0 and self.log_dir is not None:
