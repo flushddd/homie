@@ -70,6 +70,21 @@ HomieRL_mjlab/.python-version
 HomieRL_mjlab/**/__pycache__/
 *.egg-info/
 
+# Large / generated MuJoCo deploy artifacts (GitHub 100MB limit)
+MujocoDeploy/*.mjb
+MujocoDeploy/MJMODEL.TXT
+MujocoDeploy/MJDATA.TXT
+MujocoDeploy/screenshot*.png
+MujocoDeploy/wcgs.csv
+
+# Local backup / scratch copies
+**/copy*.py
+**/* copy.py
+**/* copy *.py
+**/*copy.py
+HomieRL/legged_gym/legged_gym/envs/base/legged_robot[0-9]*.py
+HomieRL/legged_gym/legged_gym/envs/base/legged_robot *.py
+
 # cpp
 build
 

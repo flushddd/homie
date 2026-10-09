@@ -182,8 +182,13 @@ def hold_joints_at_default(
   """Keep listed joints' PD targets at ``default_joint_pos`` (Homie action=0)."""
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  joint_ids = asset_cfg.joint_ids
+  # Must be a 1-D LongTensor so Entity._outer_index can broadcast with env_ids.
+  joint_ids = torch.as_tensor(
+    asset_cfg.joint_ids, device=env.device, dtype=torch.long
+  ).view(-1)
   if env_ids is None:
     env_ids = torch.arange(env.num_envs, device=env.device)
+  else:
+    env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
   default = asset.data.default_joint_pos[env_ids][:, joint_ids]
   asset.set_joint_position_target(default, joint_ids=joint_ids, env_ids=env_ids)

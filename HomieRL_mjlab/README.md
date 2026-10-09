@@ -6,16 +6,19 @@ This package is **independent** of the IsaacGym `HomieRL/` tree. It ports:
 
 - Lower-body 12-DoF velocity tracking
 - Height / squat command + tracking rewards
-- Upper-body pose curriculum (policy does not control arms/waist)
+- Waist/arms held at default pose with Homie PD (policy = 12 legs only)
 - HIM-PPO with left-right symmetry loss (`L_sym`)
 
 ## Install
+
+`.venv` 不在 git 里；克隆后必须在本机创建一次环境：
 
 ```bash
 cd HomieRL_mjlab
 uv sync
 ```
 
+VS Code / Cursor：用仓库根目录 `homie/`（或 `OpenHomie/`）作为 workspace 打开，再跑 launch。  
 Requires an NVIDIA GPU for training (mjlab / MuJoCo Warp).
 
 ## Train
