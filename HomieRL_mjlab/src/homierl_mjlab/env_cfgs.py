@@ -111,12 +111,19 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   actor_terms = {
     "command_twist": ObservationTermCfg(
       func=homie_mdp.twist_command_xy_yaw,
-      params={"command_name": "twist"},
+      params={
+        "command_name": "twist",
+        "scale": (2.0, 2.0, 0.5),  # Homie obs_scales lin_vel/ang_vel
+      },
       noise=Unoise(n_min=-0.1, n_max=0.1),
     ),
     "command_height": ObservationTermCfg(
       func=homie_mdp.height_command,
-      params={"command_name": "twist"},
+      params={
+        "command_name": "twist",
+        "absolute": True,  # Homie observes absolute meters, not offset
+        "base_height_target": 0.74,
+      },
       noise=Unoise(n_min=-0.05, n_max=0.05),
     ),
     "base_ang_vel": ObservationTermCfg(

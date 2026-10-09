@@ -56,6 +56,8 @@ class TwistHeightCommand(UniformVelocityCommand):
     self.is_standing_env = torch.zeros_like(self.is_heading_env)
     self.is_world_env = torch.zeros_like(self.is_heading_env)
     self.is_forward_env = torch.zeros_like(self.is_heading_env)
+    # Homie-style: height-only envs (vel forced 0, height offset sampled).
+    self.is_height_env = torch.zeros_like(self.is_heading_env)
 
     self.commanded_displacement_w = torch.zeros(self.num_envs, 2, device=self.device)
     self.episode_start_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
@@ -84,11 +86,27 @@ class TwistHeightCommand(UniformVelocityCommand):
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
-    # Random height offset (training). Skipped when Viser height slider owns height.
-    if self._height_gui_active():
-      return
-    r = torch.empty(len(env_ids), device=self.device)
-    self.height_command[env_ids] = r.uniform_(*self.cfg.ranges.height)
+
+    # Homie schedule (legged_robot._resample_commands):
+    #   set_x < 1/3  → height-only (vel=0, squat offset)
+    #   set_x > 1/2  → velocity-only (height offset=0)
+    #   else         → idle (vel=0, height offset=0)
+    # Always apply — Viser compute() overrides the viewed env each step.
+    n = len(env_ids)
+    set_x = torch.rand(n, device=self.device)
+    is_height = set_x < (1.0 / 3.0)
+    is_vel = set_x > 0.5
+    self.is_height_env[env_ids] = is_height
+    # Keep vel at 0 for height-only + idle (parent _update_command honors this).
+    self.is_standing_env[env_ids] = ~is_vel
+    self.vel_command_b[env_ids[~is_vel]] = 0.0
+    self.vel_command_w[env_ids[~is_vel]] = 0.0
+
+    r = torch.empty(n, device=self.device)
+    h_off = r.uniform_(*self.cfg.ranges.height)
+    self.height_command[env_ids] = torch.where(
+      is_height, h_off, torch.zeros_like(h_off)
+    )
 
   def _update_metrics(self) -> None:
     super()._update_metrics()
@@ -102,11 +120,12 @@ class TwistHeightCommand(UniformVelocityCommand):
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     super()._update_command(env_ids)
-    # Standing envs normally force height_offset=0; don't fight the Viser slider.
-    if self._height_gui_active() or self._joystick_active():
-      return
-    standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
-    self.height_command[standing_env_ids] = 0.0
+    # Idle band: force height_offset=0; keep height-only squat cmds.
+    # Viser compute() re-applies the viewed env after this each step.
+    idle_ids = (self.is_standing_env & ~self.is_height_env).nonzero(
+      as_tuple=False
+    ).flatten()
+    self.height_command[idle_ids] = 0.0
 
   def create_gui(
     self,
@@ -204,10 +223,13 @@ class TwistHeightCommand(UniformVelocityCommand):
     if self._height_abs_slider is not None:
       abs_h = float(self._height_abs_slider.value)
       self.height_command[idx] = abs_h - float(self.cfg.base_height_target)
-    # Velocity sliders still require Enable (same as mjlab velocity joystick).
+    # Velocity: Enable ON → follow sliders; Enable OFF → force zero (stand still).
+    # Previously Enable OFF left random train velocities, so the robot kept walking.
     if self._joystick_active():
       for i, s in enumerate(self._joystick_sliders):
         self.vel_command_b[idx, i] = s.value
+    elif self._joystick_sliders:
+      self.vel_command_b[idx, :] = 0.0
 
 
 @dataclass(kw_only=True)
