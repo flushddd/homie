@@ -48,8 +48,10 @@ Thumbs.db
 *.mov
 *.wmv
 
-# VS Code
-.vscode
+# VS Code — keep shared launch configs
+.vscode/*
+!.vscode/launch.json
+
 # logs
 legged_gym/logs
 logs
@@ -62,8 +64,11 @@ __pycache__
 wandb/
 *.pt
 
-# IDE
-.vscode
+# HomieRL_mjlab local env / caches
+HomieRL_mjlab/.venv/
+HomieRL_mjlab/.python-version
+HomieRL_mjlab/**/__pycache__/
+*.egg-info/
 
 # cpp
 build

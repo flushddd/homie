@@ -34,7 +34,10 @@ import torch.optim as optim
 
 from rsl_rl.modules import HIMActorCritic
 from rsl_rl.storage import HIMRolloutStorage
-
+from legged_gym.utils.curriculum import CurriculumScheduler
+import matplotlib.pyplot as plt
+import os
+import csv
 class HIMPPO:
     actor_critic: HIMActorCritic
     def __init__(self,
@@ -81,6 +84,24 @@ class HIMPPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self.update_num = 0 
+        self.elbow_curriculum = CurriculumScheduler(
+            start_step = 6000,
+            end_step = 16000,
+            min_value = 0.0,
+            max_value = 0.01
+        )
+        self.action_std_list = []  # 存储每个 epoch 的动作标准差
+        plt.ion()  # 开启交互模式，支持实时更新图形
+        self.fig, self.ax = plt.subplots()  # 创建图形对象
+        self.ax.set_xlabel('Epoch')
+        self.ax.set_ylabel('Action Standard Deviation')
+        self.ax.set_title('Action Variability (Std) Over Time')        
+                # ===== keep stage1 locomotion (LOCK) =====
+        self.teacher_actor_critic = None      # stage1 teacher
+        self.keep_loco_weight = 2.0           # 建议 2~5（越大越锁）
+        self.keep_loco_dims = 15              # 你说的 12腿+3腰=15
+        self.freeze_std_dims = 15           # 只锁腿std；如果你也想锁腰就写15
 
     def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
         self.storage = HIMRolloutStorage(num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device)
@@ -139,24 +160,52 @@ class HIMPPO:
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self):
+        self.update_num +=1
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_estimation_loss = 0
         mean_swap_loss = 0
         mean_actor_sym_loss = 0
         mean_critic_sym_loss = 0
+        mean_elbow_loss = 0
+        mean_loss_keep = 0
+
+        mean_action_variability = 0  
         
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         for obs_batch, critic_obs_batch, actions_batch, next_critic_obs_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, \
             old_mu_batch, old_sigma_batch in generator:
                 self.actor_critic.act(obs_batch)
+
+                # elbow_shape_batch = self.get_elbow_angle(obs_batch)
+                # print("elbow_shape_batch.shape",elbow_shape_batch.shape)
+                # print("batch:",elbow_shape_batch)
                 actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
                 value_batch = self.actor_critic.evaluate(critic_obs_batch)
                 mu_batch = self.actor_critic.action_mean
                 sigma_batch = self.actor_critic.action_std
                 entropy_batch = self.actor_critic.entropy
+            # ===== LOCK: keep locomotion close to stage1 teacher =====
 
+                loss_keep = 0.0
+                waist_mask = (obs_batch[:, 99] < 1e-3).float()
+                waist_count = waist_mask.sum().clamp(min=1.0)
+                if self.teacher_actor_critic is not None and self.keep_loco_weight > 0:
+                    with torch.no_grad():
+                        # teacher 用 mean（不要 sample），避免噪声干扰
+                        _ = self.teacher_actor_critic.act(obs_batch)
+                        teacher_mu = self.teacher_actor_critic.action_mean
+                        teacher_sigma = self.teacher_actor_critic.action_std
+                    k = self.keep_loco_dims
+                    diff = (mu_batch[:, :k] - teacher_mu[:, :k])
+
+                    mu_s = mu_batch[:,:k]
+                    sig_s = sigma_batch[:,:k]
+                    mu_t = teacher_mu[:,:k]
+                    sig_t = teacher_sigma[:,:k]
+                    kl = self._kl_diag_gauss(mu_s,sig_s,mu_t,sig_t)
+                    loss_keep = ((kl).sum() +(diff*diff).sum())/ ( k)
                 # KL
                 if self.desired_kl != None and self.schedule == 'adaptive':
                     with torch.inference_mode():
@@ -202,13 +251,29 @@ class HIMPPO:
                     flipped_critic_obs_batch = self.flip_g1_critic_obs(critic_obs_batch)
                     actor_sym_loss = self.symmetry_scale * torch.mean(torch.sum(torch.square(self.actor_critic.act_inference(flipped_obs_batch) - self.flip_g1_actions(self.actor_critic.act_inference(obs_batch))), dim=-1))
                     critic_sym_loss = self.symmetry_scale * torch.mean(torch.square(self.actor_critic.evaluate(flipped_critic_obs_batch) - self.actor_critic.evaluate(critic_obs_batch).detach()))
-                    loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + actor_sym_loss + critic_sym_loss
+                    loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + actor_sym_loss + critic_sym_loss + self.keep_loco_weight * loss_keep
                 else:
                     loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+
+                # ## elbow_angle_loss
+                # elbow_weight = self.elbow_curriculum.value(self.update_num)
+                # # print(elbow_weight)
+                # mask = elbow_shape_batch.squeeze(1)!=0
+                # elbow_angle = elbow_shape_batch.squeeze(1)[mask]
+                # # print("elbow_angle",elbow_angle)
+                # ideal_angle = 1.5 # ~ 85
+                # elbow_loss = ((elbow_angle -ideal_angle )**2).mean()* elbow_weight*0.01
+                # # print("elbow_loss",elbow_loss)
+                # loss += elbow_loss
+
 
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
+                                # ===== LOCK: freeze std for legs (reduce exploration) =====
+                if hasattr(self.actor_critic, "std") and self.actor_critic.std.grad is not None:
+                    self.actor_critic.std.grad[:self.freeze_std_dims].zero_()
+
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
@@ -216,22 +281,56 @@ class HIMPPO:
                 mean_surrogate_loss += surrogate_loss.item()
                 mean_estimation_loss += estimation_loss
                 mean_swap_loss += swap_loss
+                mean_loss_keep += loss_keep
+                # mean_elbow_loss += elbow_loss
                 if self.use_flip:
                     mean_actor_sym_loss += actor_sym_loss.item()
                     mean_critic_sym_loss += critic_sym_loss.item()
+        mean_action_variability += sigma_batch.mean().item()  # 累加每个 batch 的平均标准差
+        print("mean_action_variability",mean_action_variability)
+        self.action_std_list.append(mean_action_variability / self.num_mini_batches)
+        print(f"Epoch {self.update_num} - Action Variability (Std): {mean_action_variability / self.num_mini_batches:.4f}")
+
+        save_dir = "./logs"
+        os.makedirs(save_dir, exist_ok=True)
+
+        csv_path = os.path.join(save_dir, "action_std_list1.csv")
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+    
+         # 如果文件不存在，先写表头
+            if not file_exists:
+                writer.writerow(["epoch", "action_std"])
+    
+    # 每次训练更新追加一行
+            writer.writerow([self.update_num, mean_action_variability / self.num_mini_batches])
+
+                # 每次更新时实时绘制图形
+        self.ax.clear()  # 清除当前图像
+        self.ax.plot(self.action_std_list)  # 绘制标准差曲线
+        self.ax.set_xlabel('Epoch')
+        self.ax.set_ylabel('Action Standard Deviation')
+        self.ax.set_title('Action Variability (Std) Over Time')
+
+        # 强制刷新图形
+        plt.pause(0.1)
 
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_estimation_loss /= num_updates
         mean_swap_loss /= num_updates
+        mean_loss_keep /= num_updates
+        # mean_elbow_loss /= num_updates
         if self.use_flip:
             mean_actor_sym_loss /= num_updates
             mean_critic_sym_loss /= num_updates
         self.storage.clear()
 
         if self.use_flip:
-            return mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_actor_sym_loss, mean_critic_sym_loss
+            return mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_actor_sym_loss, mean_critic_sym_loss,mean_loss_keep#,mean_elbow_loss
         else:
             return mean_value_loss, mean_surrogate_loss, estimation_loss, swap_loss, 0, 0
     
@@ -266,70 +365,74 @@ class HIMPPO:
         flipped_proprioceptive_obs[:, :, 21] = -proprioceptive_obs[:, :, 15]
         
         flipped_proprioceptive_obs[:, :, 22] =  -proprioceptive_obs[:, :, 22] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23] =  proprioceptive_obs[:, :, 30] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24] = -proprioceptive_obs[:, :, 31]
-        flipped_proprioceptive_obs[:, :, 25] = -proprioceptive_obs[:, :, 32]
-        flipped_proprioceptive_obs[:, :, 26] =  proprioceptive_obs[:, :, 33] # elbow
-        flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34] # wrist
-        flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35]
-        flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36]
+        flipped_proprioceptive_obs[:, :, 23] =  -proprioceptive_obs[:, :, 23] # waist
+        flipped_proprioceptive_obs[:, :, 24] =  proprioceptive_obs[:, :, 24] # waist
+
+        # flipped_proprioceptive_obs[:, :, 25] =  proprioceptive_obs[:, :, 32] # left shoulder
+        # flipped_proprioceptive_obs[:, :, 26] = -proprioceptive_obs[:, :, 33]
+        # flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34]
+        # flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35] # elbow
+        # flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36] # wrist
+        # flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 37]
+        # flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 38]
 
         
-        flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 23] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 24]
-        flipped_proprioceptive_obs[:, :, 32] = -proprioceptive_obs[:, :, 25]
-        flipped_proprioceptive_obs[:, :, 33] =  proprioceptive_obs[:, :, 26] # elbow
-        flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27] # wrist
-        flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28]
-        flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29]
+        # flipped_proprioceptive_obs[:, :, 32] =  proprioceptive_obs[:, :, 25] # right shoulder
+        # flipped_proprioceptive_obs[:, :, 33] = -proprioceptive_obs[:, :, 26]
+        # flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27]
+        # flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28] # elbow
+        # flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29] # wrist
+        # flipped_proprioceptive_obs[:, :, 37] =  proprioceptive_obs[:, :, 30]
+        # flipped_proprioceptive_obs[:, :, 38] = -proprioceptive_obs[:, :, 31]
         
         # joint vel
-        flipped_proprioceptive_obs[:, :, 10+27] =  proprioceptive_obs[:, :, 16+27] # lower
-        flipped_proprioceptive_obs[:, :, 11+27] = -proprioceptive_obs[:, :, 17+27]
-        flipped_proprioceptive_obs[:, :, 12+27] = -proprioceptive_obs[:, :, 18+27]
-        flipped_proprioceptive_obs[:, :, 13+27] =  proprioceptive_obs[:, :, 19+27]
-        flipped_proprioceptive_obs[:, :, 14+27] =  proprioceptive_obs[:, :, 20+27]
-        flipped_proprioceptive_obs[:, :, 15+27] = -proprioceptive_obs[:, :, 21+27]
-        flipped_proprioceptive_obs[:, :, 16+27] =  proprioceptive_obs[:, :, 10+27]
-        flipped_proprioceptive_obs[:, :, 17+27] = -proprioceptive_obs[:, :, 11+27]
-        flipped_proprioceptive_obs[:, :, 18+27] = -proprioceptive_obs[:, :, 12+27]
-        flipped_proprioceptive_obs[:, :, 19+27] =  proprioceptive_obs[:, :, 13+27]
-        flipped_proprioceptive_obs[:, :, 20+27] =  proprioceptive_obs[:, :, 14+27]
-        flipped_proprioceptive_obs[:, :, 21+27] = -proprioceptive_obs[:, :, 15+27]
+        flipped_proprioceptive_obs[:, :, 10+29] =  proprioceptive_obs[:, :, 16+29] # lower
+        flipped_proprioceptive_obs[:, :, 11+29] = -proprioceptive_obs[:, :, 17+29]
+        flipped_proprioceptive_obs[:, :, 12+29] = -proprioceptive_obs[:, :, 18+29]
+        flipped_proprioceptive_obs[:, :, 13+29] =  proprioceptive_obs[:, :, 19+29]
+        flipped_proprioceptive_obs[:, :, 14+29] =  proprioceptive_obs[:, :, 20+29]
+        flipped_proprioceptive_obs[:, :, 15+29] = -proprioceptive_obs[:, :, 21+29]
+        flipped_proprioceptive_obs[:, :, 16+29] =  proprioceptive_obs[:, :, 10+29]
+        flipped_proprioceptive_obs[:, :, 17+29] = -proprioceptive_obs[:, :, 11+29]
+        flipped_proprioceptive_obs[:, :, 18+29] = -proprioceptive_obs[:, :, 12+29]
+        flipped_proprioceptive_obs[:, :, 19+29] =  proprioceptive_obs[:, :, 13+29]
+        flipped_proprioceptive_obs[:, :, 20+29] =  proprioceptive_obs[:, :, 14+29]
+        flipped_proprioceptive_obs[:, :, 21+29] = -proprioceptive_obs[:, :, 15+29]
         
-        flipped_proprioceptive_obs[:, :, 22+27] =  -proprioceptive_obs[:, :, 22+27] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23+27] =  proprioceptive_obs[:, :, 30+27] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24+27] = -proprioceptive_obs[:, :, 31+27]
-        flipped_proprioceptive_obs[:, :, 25+27] = -proprioceptive_obs[:, :, 32+27]
-        flipped_proprioceptive_obs[:, :, 26+27] =  proprioceptive_obs[:, :, 33+27] # elbow
-        flipped_proprioceptive_obs[:, :, 27+27] = -proprioceptive_obs[:, :, 34+27] # wrist
-        flipped_proprioceptive_obs[:, :, 28+27] =  proprioceptive_obs[:, :, 35+27]
-        flipped_proprioceptive_obs[:, :, 29+27] = -proprioceptive_obs[:, :, 36+27]
+        flipped_proprioceptive_obs[:, :, 22+29] =  -proprioceptive_obs[:, :, 22+29] # waist
+        flipped_proprioceptive_obs[:, :, 23+27] =  -proprioceptive_obs[:, :, 23+29] # waist
+        flipped_proprioceptive_obs[:, :, 24+27] =  proprioceptive_obs[:, :, 24+29] # waist
+
+        # flipped_proprioceptive_obs[:, :, 25+29] =  proprioceptive_obs[:, :, 32+29] # left shoulder
+        # flipped_proprioceptive_obs[:, :, 26+29] = -proprioceptive_obs[:, :, 33+29]
+        # flipped_proprioceptive_obs[:, :, 27+29] = -proprioceptive_obs[:, :, 34+29]
+        # flipped_proprioceptive_obs[:, :, 28+29] =  proprioceptive_obs[:, :, 35+29] # elbow
+        # flipped_proprioceptive_obs[:, :, 29+29] = -proprioceptive_obs[:, :, 36+29] # wrist
+        # flipped_proprioceptive_obs[:, :, 30+29] =  proprioceptive_obs[:, :, 37+29]
+        # flipped_proprioceptive_obs[:, :, 31+29] = -proprioceptive_obs[:, :, 38+29]
 
         
-        flipped_proprioceptive_obs[:, :, 30+27] =  proprioceptive_obs[:, :, 23+27] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31+27] = -proprioceptive_obs[:, :, 24+27]
-        flipped_proprioceptive_obs[:, :, 32+27] = -proprioceptive_obs[:, :, 25+27]
-        flipped_proprioceptive_obs[:, :, 33+27] =  proprioceptive_obs[:, :, 26+27] # elbow
-        flipped_proprioceptive_obs[:, :, 34+27] = -proprioceptive_obs[:, :, 27+27] # wrist
-        flipped_proprioceptive_obs[:, :, 35+27] =  proprioceptive_obs[:, :, 28+27]
-        flipped_proprioceptive_obs[:, :, 36+27] = -proprioceptive_obs[:, :, 29+27]
+        # flipped_proprioceptive_obs[:, :, 32+29] =  proprioceptive_obs[:, :, 25+29] # right shoulder
+        # flipped_proprioceptive_obs[:, :, 33+29] = -proprioceptive_obs[:, :, 26+29]
+        # flipped_proprioceptive_obs[:, :, 34+29] = -proprioceptive_obs[:, :, 27+29]
+        # flipped_proprioceptive_obs[:, :, 35+29] =  proprioceptive_obs[:, :, 28+29] # elbow
+        # flipped_proprioceptive_obs[:, :, 36+29] = -proprioceptive_obs[:, :, 29+29] # wrist
+        # flipped_proprioceptive_obs[:, :, 37+29] =  proprioceptive_obs[:, :, 30+29]
+        # flipped_proprioceptive_obs[:, :, 38+29] = -proprioceptive_obs[:, :, 31+29]
         
         # joint target
-        flipped_proprioceptive_obs[:, :, 10+54] =  proprioceptive_obs[:, :, 16+54] # lower
-        flipped_proprioceptive_obs[:, :, 11+54] = -proprioceptive_obs[:, :, 17+54]
-        flipped_proprioceptive_obs[:, :, 12+54] = -proprioceptive_obs[:, :, 18+54]
-        flipped_proprioceptive_obs[:, :, 13+54] =  proprioceptive_obs[:, :, 19+54]
-        flipped_proprioceptive_obs[:, :, 14+54] =  proprioceptive_obs[:, :, 20+54]
-        flipped_proprioceptive_obs[:, :, 15+54] = -proprioceptive_obs[:, :, 21+54]
-        flipped_proprioceptive_obs[:, :, 16+54] =  proprioceptive_obs[:, :, 10+54]
-        flipped_proprioceptive_obs[:, :, 17+54] = -proprioceptive_obs[:, :, 11+54]
-        flipped_proprioceptive_obs[:, :, 18+54] = -proprioceptive_obs[:, :, 12+54]
-        flipped_proprioceptive_obs[:, :, 19+54] =  proprioceptive_obs[:, :, 13+54]
-        flipped_proprioceptive_obs[:, :, 20+54] =  proprioceptive_obs[:, :, 14+54]
-        flipped_proprioceptive_obs[:, :, 21+54] = -proprioceptive_obs[:, :, 15+54]
+        flipped_proprioceptive_obs[:, :, 10+58] =  proprioceptive_obs[:, :, 16+58] # lower
+        flipped_proprioceptive_obs[:, :, 11+58] = -proprioceptive_obs[:, :, 17+58]
+        flipped_proprioceptive_obs[:, :, 12+58] = -proprioceptive_obs[:, :, 18+58]
+        flipped_proprioceptive_obs[:, :, 13+58] =  proprioceptive_obs[:, :, 19+58]
+        flipped_proprioceptive_obs[:, :, 14+58] =  proprioceptive_obs[:, :, 20+58]
+        flipped_proprioceptive_obs[:, :, 15+58] = -proprioceptive_obs[:, :, 21+58]
+        flipped_proprioceptive_obs[:, :, 16+58] =  proprioceptive_obs[:, :, 10+58]
+        flipped_proprioceptive_obs[:, :, 17+58] = -proprioceptive_obs[:, :, 11+58]
+        flipped_proprioceptive_obs[:, :, 18+58] = -proprioceptive_obs[:, :, 12+58]
+        flipped_proprioceptive_obs[:, :, 19+58] =  proprioceptive_obs[:, :, 13+58]
+        flipped_proprioceptive_obs[:, :, 20+58] =  proprioceptive_obs[:, :, 14+58]
+        flipped_proprioceptive_obs[:, :, 21+58] = -proprioceptive_obs[:, :, 15+58]
 
         return flipped_proprioceptive_obs.view(-1, self.actor_critic.num_one_step_obs * self.actor_critic.actor_history_length).detach()                                                                                                                                                                                                                                             
     
@@ -365,74 +468,78 @@ class HIMPPO:
         flipped_proprioceptive_obs[:, :, 21] = -proprioceptive_obs[:, :, 15]
         
         flipped_proprioceptive_obs[:, :, 22] =  -proprioceptive_obs[:, :, 22] # waist
-        
-        flipped_proprioceptive_obs[:, :, 23] =  proprioceptive_obs[:, :, 30] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24] = -proprioceptive_obs[:, :, 31]
-        flipped_proprioceptive_obs[:, :, 25] = -proprioceptive_obs[:, :, 32]
-        flipped_proprioceptive_obs[:, :, 26] =  proprioceptive_obs[:, :, 33] # elbow
-        flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34] # wrist
-        flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35]
-        flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36]
+        flipped_proprioceptive_obs[:, :, 23] =  -proprioceptive_obs[:, :, 23] # waist
+        flipped_proprioceptive_obs[:, :, 24] =  proprioceptive_obs[:, :, 24] # waist
+
+        # flipped_proprioceptive_obs[:, :, 25] =  proprioceptive_obs[:, :, 32] # left shoulder
+        # flipped_proprioceptive_obs[:, :, 26] = -proprioceptive_obs[:, :, 33]
+        # flipped_proprioceptive_obs[:, :, 27] = -proprioceptive_obs[:, :, 34]
+        # flipped_proprioceptive_obs[:, :, 28] =  proprioceptive_obs[:, :, 35] # elbow
+        # flipped_proprioceptive_obs[:, :, 29] = -proprioceptive_obs[:, :, 36] # wrist
+        # flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 37]
+        # flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 38]
 
         
-        flipped_proprioceptive_obs[:, :, 30] =  proprioceptive_obs[:, :, 23] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31] = -proprioceptive_obs[:, :, 24]
-        flipped_proprioceptive_obs[:, :, 32] = -proprioceptive_obs[:, :, 25]
-        flipped_proprioceptive_obs[:, :, 33] =  proprioceptive_obs[:, :, 26] # elbow
-        flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27] # wrist
-        flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28]
-        flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29]
+        # flipped_proprioceptive_obs[:, :, 32] =  proprioceptive_obs[:, :, 25] # right shoulder
+        # flipped_proprioceptive_obs[:, :, 33] = -proprioceptive_obs[:, :, 26]
+        # flipped_proprioceptive_obs[:, :, 34] = -proprioceptive_obs[:, :, 27]
+        # flipped_proprioceptive_obs[:, :, 35] =  proprioceptive_obs[:, :, 28] # elbow
+        # flipped_proprioceptive_obs[:, :, 36] = -proprioceptive_obs[:, :, 29] # wrist
+        # flipped_proprioceptive_obs[:, :, 37] =  proprioceptive_obs[:, :, 30]
+        # flipped_proprioceptive_obs[:, :, 38] = -proprioceptive_obs[:, :, 31]
         
         # joint vel
-        flipped_proprioceptive_obs[:, :, 10+27] =  proprioceptive_obs[:, :, 16+27] # lower
-        flipped_proprioceptive_obs[:, :, 11+27] = -proprioceptive_obs[:, :, 17+27]
-        flipped_proprioceptive_obs[:, :, 12+27] = -proprioceptive_obs[:, :, 18+27]
-        flipped_proprioceptive_obs[:, :, 13+27] =  proprioceptive_obs[:, :, 19+27]
-        flipped_proprioceptive_obs[:, :, 14+27] =  proprioceptive_obs[:, :, 20+27]
-        flipped_proprioceptive_obs[:, :, 15+27] = -proprioceptive_obs[:, :, 21+27]
-        flipped_proprioceptive_obs[:, :, 16+27] =  proprioceptive_obs[:, :, 10+27]
-        flipped_proprioceptive_obs[:, :, 17+27] = -proprioceptive_obs[:, :, 11+27]
-        flipped_proprioceptive_obs[:, :, 18+27] = -proprioceptive_obs[:, :, 12+27]
-        flipped_proprioceptive_obs[:, :, 19+27] =  proprioceptive_obs[:, :, 13+27]
-        flipped_proprioceptive_obs[:, :, 20+27] =  proprioceptive_obs[:, :, 14+27]
-        flipped_proprioceptive_obs[:, :, 21+27] = -proprioceptive_obs[:, :, 15+27]
+        flipped_proprioceptive_obs[:, :, 10+29] =  proprioceptive_obs[:, :, 16+29] # lower
+        flipped_proprioceptive_obs[:, :, 11+29] = -proprioceptive_obs[:, :, 17+29]
+        flipped_proprioceptive_obs[:, :, 12+29] = -proprioceptive_obs[:, :, 18+29]
+        flipped_proprioceptive_obs[:, :, 13+29] =  proprioceptive_obs[:, :, 19+29]
+        flipped_proprioceptive_obs[:, :, 14+29] =  proprioceptive_obs[:, :, 20+29]
+        flipped_proprioceptive_obs[:, :, 15+29] = -proprioceptive_obs[:, :, 21+29]
+        flipped_proprioceptive_obs[:, :, 16+29] =  proprioceptive_obs[:, :, 10+29]
+        flipped_proprioceptive_obs[:, :, 17+29] = -proprioceptive_obs[:, :, 11+29]
+        flipped_proprioceptive_obs[:, :, 18+29] = -proprioceptive_obs[:, :, 12+29]
+        flipped_proprioceptive_obs[:, :, 19+29] =  proprioceptive_obs[:, :, 13+29]
+        flipped_proprioceptive_obs[:, :, 20+29] =  proprioceptive_obs[:, :, 14+29]
+        flipped_proprioceptive_obs[:, :, 21+29] = -proprioceptive_obs[:, :, 15+29]
         
-        flipped_proprioceptive_obs[:, :, 22+27] =  -proprioceptive_obs[:, :, 22+27] # waist
+        flipped_proprioceptive_obs[:, :, 22+29] =  -proprioceptive_obs[:, :, 22+29] # waist
+        flipped_proprioceptive_obs[:, :, 23+29] =  -proprioceptive_obs[:, :, 23+29] # waist
+        flipped_proprioceptive_obs[:, :, 24+29] =  proprioceptive_obs[:, :, 24+29] # waist
         
-        flipped_proprioceptive_obs[:, :, 23+27] =  proprioceptive_obs[:, :, 30+27] # left shoulder
-        flipped_proprioceptive_obs[:, :, 24+27] = -proprioceptive_obs[:, :, 31+27]
-        flipped_proprioceptive_obs[:, :, 25+27] = -proprioceptive_obs[:, :, 32+27]
-        flipped_proprioceptive_obs[:, :, 26+27] =  proprioceptive_obs[:, :, 33+27] # elbow
-        flipped_proprioceptive_obs[:, :, 27+27] = -proprioceptive_obs[:, :, 34+27] # wrist
-        flipped_proprioceptive_obs[:, :, 28+27] =  proprioceptive_obs[:, :, 35+27]
-        flipped_proprioceptive_obs[:, :, 29+27] = -proprioceptive_obs[:, :, 36+27]
+        # flipped_proprioceptive_obs[:, :, 25+29] =  proprioceptive_obs[:, :, 32+29] # left shoulder
+        # flipped_proprioceptive_obs[:, :, 26+29] = -proprioceptive_obs[:, :, 33+29]
+        # flipped_proprioceptive_obs[:, :, 27+29] = -proprioceptive_obs[:, :, 34+29]
+        # flipped_proprioceptive_obs[:, :, 28+29] =  proprioceptive_obs[:, :, 35+29] # elbow
+        # flipped_proprioceptive_obs[:, :, 29+29] = -proprioceptive_obs[:, :, 36+29] # wrist
+        # flipped_proprioceptive_obs[:, :, 30+29] =  proprioceptive_obs[:, :, 37+29]
+        # flipped_proprioceptive_obs[:, :, 31+29] = -proprioceptive_obs[:, :, 38+29]
 
         
-        flipped_proprioceptive_obs[:, :, 30+27] =  proprioceptive_obs[:, :, 23+27] # right shoulder
-        flipped_proprioceptive_obs[:, :, 31+27] = -proprioceptive_obs[:, :, 24+27]
-        flipped_proprioceptive_obs[:, :, 32+27] = -proprioceptive_obs[:, :, 25+27]
-        flipped_proprioceptive_obs[:, :, 33+27] =  proprioceptive_obs[:, :, 26+27] # elbow
-        flipped_proprioceptive_obs[:, :, 34+27] = -proprioceptive_obs[:, :, 27+27] # wrist
-        flipped_proprioceptive_obs[:, :, 35+27] =  proprioceptive_obs[:, :, 28+27]
-        flipped_proprioceptive_obs[:, :, 36+27] = -proprioceptive_obs[:, :, 29+27]
+        # flipped_proprioceptive_obs[:, :, 32+29] =  proprioceptive_obs[:, :, 25+29] # right shoulder
+        # flipped_proprioceptive_obs[:, :, 33+29] = -proprioceptive_obs[:, :, 26+29]
+        # flipped_proprioceptive_obs[:, :, 34+29] = -proprioceptive_obs[:, :, 27+29]
+        # flipped_proprioceptive_obs[:, :, 35+29] =  proprioceptive_obs[:, :, 28+29] # elbow
+        # flipped_proprioceptive_obs[:, :, 36+29] = -proprioceptive_obs[:, :, 29+29] # wrist
+        # flipped_proprioceptive_obs[:, :, 37+29] =  proprioceptive_obs[:, :, 30+29]
+        # flipped_proprioceptive_obs[:, :, 38+29] = -proprioceptive_obs[:, :, 31+29]
         
         # joint target
-        flipped_proprioceptive_obs[:, :, 10+54] =  proprioceptive_obs[:, :, 16+54] # lower
-        flipped_proprioceptive_obs[:, :, 11+54] = -proprioceptive_obs[:, :, 17+54]
-        flipped_proprioceptive_obs[:, :, 12+54] = -proprioceptive_obs[:, :, 18+54]
-        flipped_proprioceptive_obs[:, :, 13+54] =  proprioceptive_obs[:, :, 19+54]
-        flipped_proprioceptive_obs[:, :, 14+54] =  proprioceptive_obs[:, :, 20+54]
-        flipped_proprioceptive_obs[:, :, 15+54] = -proprioceptive_obs[:, :, 21+54]
-        flipped_proprioceptive_obs[:, :, 16+54] =  proprioceptive_obs[:, :, 10+54]
-        flipped_proprioceptive_obs[:, :, 17+54] = -proprioceptive_obs[:, :, 11+54]
-        flipped_proprioceptive_obs[:, :, 18+54] = -proprioceptive_obs[:, :, 12+54]
-        flipped_proprioceptive_obs[:, :, 19+54] =  proprioceptive_obs[:, :, 13+54]
-        flipped_proprioceptive_obs[:, :, 20+54] =  proprioceptive_obs[:, :, 14+54]
-        flipped_proprioceptive_obs[:, :, 21+54] = -proprioceptive_obs[:, :, 15+54]
+        flipped_proprioceptive_obs[:, :, 10+58] =  proprioceptive_obs[:, :, 16+58] # lower
+        flipped_proprioceptive_obs[:, :, 11+58] = -proprioceptive_obs[:, :, 17+58]
+        flipped_proprioceptive_obs[:, :, 12+58] = -proprioceptive_obs[:, :, 18+58]
+        flipped_proprioceptive_obs[:, :, 13+58] =  proprioceptive_obs[:, :, 19+58]
+        flipped_proprioceptive_obs[:, :, 14+58] =  proprioceptive_obs[:, :, 20+58]
+        flipped_proprioceptive_obs[:, :, 15+58] = -proprioceptive_obs[:, :, 21+58]
+        flipped_proprioceptive_obs[:, :, 16+58] =  proprioceptive_obs[:, :, 10+58]
+        flipped_proprioceptive_obs[:, :, 17+58] = -proprioceptive_obs[:, :, 11+58]
+        flipped_proprioceptive_obs[:, :, 18+58] = -proprioceptive_obs[:, :, 12+58]
+        flipped_proprioceptive_obs[:, :, 19+58] =  proprioceptive_obs[:, :, 13+58]
+        flipped_proprioceptive_obs[:, :, 20+58] =  proprioceptive_obs[:, :, 14+58]
+        flipped_proprioceptive_obs[:, :, 21+58] = -proprioceptive_obs[:, :, 15+58]
         
-        flipped_proprioceptive_obs[:, :, 22+54] =  proprioceptive_obs[:, :, 22+54] # base lin vel x
-        flipped_proprioceptive_obs[:, :, 23+54] = -proprioceptive_obs[:, :, 23+54] # base lin vel y
-        flipped_proprioceptive_obs[:, :, 24+54] =  proprioceptive_obs[:, :, 24+54] # base lin vel z
+        flipped_proprioceptive_obs[:, :, 22+70+1+1+1+1+11] =  proprioceptive_obs[:, :, 22+70+1+1+1+1+11] # base lin vel x
+        flipped_proprioceptive_obs[:, :, 23+70+1+1+1+1+11] = -proprioceptive_obs[:, :, 23+70+1+1+1+1+11] # base lin vel y
+        flipped_proprioceptive_obs[:, :, 24+70+1+1+1+1+11] =  proprioceptive_obs[:, :, 24+70+1+1+1+1+11] # base lin vel z
 
         return flipped_proprioceptive_obs.view(-1, self.actor_critic.num_one_step_critic_obs * self.actor_critic.critic_history_length).detach()
     
@@ -451,3 +558,48 @@ class HIMPPO:
         flipped_actions[:, 10] =  actions[:, 4]        # 10 "right_ankle_pitch_joint",
         flipped_actions[:, 11] = -actions[:, 5]        # 11 "right_ankle_roll_joint",
         return flipped_actions.detach()
+    
+    # def get_elbow_angle(self,obs):
+    #     proprioceptive_obs = torch.clone(obs[:, :self.actor_critic.num_one_step_critic_obs * self.actor_critic.critic_history_length])
+    #     proprioceptive_obs = proprioceptive_obs.view(-1, self.actor_critic.critic_history_length, self.actor_critic.num_one_step_critic_obs)
+    #     # print("proprioceptive_obs.shape",proprioceptive_obs.shape)
+    #     elbow_shape_angle = proprioceptive_obs[:,:,97]
+    #     # print(elbow_shape_angle)
+    #     return elbow_shape_angle
+
+    def set_teacher(self, teacher_actor_critic, keep_loco_weight=2.0, keep_loco_dims=15, freeze_std_dims=12):
+        self.teacher_actor_critic = teacher_actor_critic
+        self.teacher_actor_critic.to(self.device)
+        self.teacher_actor_critic.eval()
+        for p in self.teacher_actor_critic.parameters():
+            p.requires_grad = False
+        self.keep_loco_weight = keep_loco_weight
+        self.keep_loco_dims = keep_loco_dims
+        self.freeze_std_dims = freeze_std_dims
+
+    def _kl_diag_gauss(self, mu_s, sig_s, mu_t, sig_t, eps=1e-8):
+        """ KL( N(mu_s, sig_s^2) || N(mu_t, sig_t^2) ), 对角高斯，返回 (B,) """
+    
+        # 将 mu 和 sig 截断并分离，以防止它们用于反向传播时不必要的计算图
+        mu_s = mu_s.detach()
+        sig_s = sig_s.detach()
+        mu_t = mu_t.detach()
+        sig_t = sig_t.detach()
+    
+        var_s = sig_s * sig_s
+        var_t = sig_t * sig_t
+        kl = 0.5 * (
+        (var_s + (mu_s - mu_t).pow(2)) / (var_t + eps)
+        - 1.0
+        + 2.0 * torch.log((sig_t + eps) / (sig_s + eps))
+        )
+    
+        return kl.sum(dim=-1)  # (B,)
+    
+    def plot_action_variability(self):
+        # 绘制训练过程中每个 epoch 的动作标准差变化
+        plt.plot(self.action_std_list)
+        plt.xlabel('Epoch')
+        plt.ylabel('Action Standard Deviation')
+        plt.title('Action Variability (Std) Over Time')
+        plt.show()

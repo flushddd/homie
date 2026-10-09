@@ -40,7 +40,7 @@ from rsl_rl.runners import HIMOnPolicyRunner
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed, parse_sim_params
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
-
+import copy
 class TaskRegistry():
     def __init__(self):
         self.task_classes = {}
@@ -149,10 +149,34 @@ class TaskRegistry():
         resume = args.resume
         if resume:
             # load previously trained model
-            resume_path = "./example_model.pt"
+            resume_path ="/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Mar30_16-12-23_policy_grasp_first_step/model_11000.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Mar17_11-19-36_policy_grasp_without_waist23/model_12600.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr02_09-37-11_policy_grasp_first_step/model_11000.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr04_00-14-27_policy_grasp_first_step/model_8000.pt"
+            resume_path =   "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Mar02_23-10-30_policy_grasp_without_waist23/model_6200.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr06_11-12-44_policy_grasp_first_step/model_800.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr07_13-45-39_policy_grasp_first_step/model_6200.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Mar19_11-22-43_policy_grasp_without_waist23/model_15000.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr09_00-15-49_policy_grasp_first_step/model_9400.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr10_13-09-39_policy_grasp_first_step/model_11000.pt"
+            resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr23_16-27-31_policy_grasp_second_step/model_12400.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/Apr30_00-20-20_policy_grasp_third_step/model_15000.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/May08_15-57-35_policy_grasp_second_step/model_12400.pt"
+            # resume_path = "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/logs/May20_23-48-05_policy_grasp_third_step/model_20000.pt"
             print(f"Loading model from: {resume_path}")
             runner.load(resume_path)
+            teacher = args.teacher   
+            if teacher :
+                teacher_ac = copy.deepcopy(runner.alg.actor_critic)
+                teacher_ac.eval()
+                for p in teacher_ac.parameters():
+                    p.requires_grad = False
+
+            #   只锁腿12维，冻结腿std探索
+                runner.alg.set_teacher(teacher_ac, keep_loco_weight=2.0, keep_loco_dims=15, freeze_std_dims=15)
+                print("Teacher set. Locomotion will be locked during waist training.")
         return runner, train_cfg
+    
 
 # make global task registry
 task_registry = TaskRegistry()

@@ -32,8 +32,10 @@ from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
 from .base.legged_robot import LeggedRobot
 
 from legged_gym.envs.g1.g1_29dof_config import G1RoughCfg, G1RoughCfgPPO
+from legged_gym.envs.g1.g1_inspire_wiast_config import G1_Inspire_Waist_RoughCfg,G1_Inspire_Waist_RoughCfgPPO
 import os
 
 from legged_gym.utils.task_registry import task_registry
 
 task_registry.register( "g1", LeggedRobot, G1RoughCfg(), G1RoughCfgPPO() )
+task_registry.register( "g1_inspire_waist", LeggedRobot, G1_Inspire_Waist_RoughCfg(), G1_Inspire_Waist_RoughCfgPPO() )

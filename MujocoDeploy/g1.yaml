@@ -1,6 +1,6 @@
 # Policy and model paths
 policy_path: "{LEGGED_GYM_ROOT_DIR}/logs/exported/policies/policy.pt"
-xml_path: "{LEGGED_GYM_ROOT_DIR}/resources/robots/g1_description/g1.xml"
+xml_path: "/home/eisr/goal/OpenHomie/HomieRL/legged_gym/resources/robots/g1_inspire_description_waist/g1_29dof_rev_1_0_with_inspire_hand_FTPfinger.xml"
 
 # Simulation parameters
 simulation_duration: 60.0
@@ -10,13 +10,13 @@ control_decimation: 10
 # PD gains
 # PD gains
 kps: [100, 100, 100, 150, 40, 40,
-     100, 100, 100, 150, 40, 40]
+     100, 100, 100, 150, 40, 40,300,300,300]
 kds: [2.0, 2.0, 2.0, 4.0, 2.0, 2.0,
-     2.0, 2.0, 2.0, 4.0, 2.0, 2.0]
+     2.0, 2.0, 2.0, 4.0, 2.0, 2.0,5.0,5.0,5.0]
 
 # Default joint angles for legs
 default_angles: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
-                 -0.1, 0.0, 0.0, 0.3, -0.2, 0.0]
+                 -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,0.0,0.0,0.0]
 # Scaling factors
 ang_vel_scale: 0.25
 dof_pos_scale: 1.0
@@ -25,10 +25,18 @@ action_scale: 0.25
 cmd_scale: [2.0, 2.0, 0.25]
 
 # Number of actions and observations
-num_actions: 12
-num_obs: 456  # 76 * 6 (observation dimension * history length)
+num_actions: 23
+num_obs: 642  # 76 * 6 (observation dimension * history length)
 obs_history_len: 6
+
+is_target : 0
+is_waist : 1
+is_target_height : 1
+
+target_position : [0.5,0.08,0.05]
+
 
 # Initial commands
 cmd_init: [0.0, 0.0, 0.0]
-height_cmd: 0.34
+height_cmd: 0.74
+

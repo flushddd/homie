@@ -76,12 +76,16 @@ class HIMOnPolicyRunner:
                                                         self.env.actor_history_length,
                                                         self.env.critic_history_length,
                                                         self.env.num_lower_dof,
+                                                        # comp_input_dim = 33,
+                                                        # comp_hidden_dims = [128,256],
+                                                        # comp_output_dim =2,
+                                                        # comp_use_norm = False,
                                                         **self.policy_cfg).to(self.device)
         alg_class = eval(self.cfg["algorithm_class_name"]) # HIMPPO
         self.alg: HIMPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
-
+        # self.pelvis_obs_shape = 33
         # init storage and model
         self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_lower_dof])
 
@@ -143,6 +147,12 @@ class HIMOnPolicyRunner:
                     next_critic_obs = critic_obs.clone().detach()
                     next_critic_obs[termination_ids] = termination_privileged_obs.clone().detach()
 
+                        # ===== pelvis compensation data =====
+                    # comp_obs, comp_target, comp_mask = self.env.get_pelvis_comp_data()
+                    # self.alg.transition.comp_obs = comp_obs.to(self.device)
+                    # self.alg.transition.comp_target = comp_target.to(self.device)
+                    # self.alg.transition.comp_mask = comp_mask.to(self.device)
+
                     self.alg.process_env_step(rewards, dones, infos, next_critic_obs)
                 
                     if self.log_dir is not None:
@@ -164,7 +174,7 @@ class HIMOnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
                 
-            mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_actor_sym_loss, mean_critic_sym_loss = self.alg.update()
+            mean_value_loss, mean_surrogate_loss, mean_estimation_loss, mean_swap_loss, mean_actor_sym_loss, mean_critic_sym_loss,mean_loss_keep= self.alg.update()#mean_elbow_loss
             stop = time.time()
             learn_time = stop - start
             if self.log_dir is not None:
@@ -201,6 +211,11 @@ class HIMOnPolicyRunner:
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/Estimation Loss', locs['mean_estimation_loss'], locs['it'])
+        # self.writer.add_scalar('Loss/Pelvis Loss', locs['mean_pelvis_comp_loss'], locs['it'])
+        # self.writer.add_scalar('Loss/Pelvis x Loss', locs['mean_pelvis_dx_err'], locs['it'])
+        # self.writer.add_scalar('Loss/Pelvis y Loss', locs['mean_pelvis_dy_err'], locs['it'])
+        # self.writer.add_scalar('Loss/Pelvis z Loss', locs['mean_pelvis_dz_err'], locs['it'])
+        self.writer.add_scalar('Loss/Keep Loss', locs['mean_loss_keep'], locs['it'])
         self.writer.add_scalar('Loss/Swap Loss', locs['mean_swap_loss'], locs['it'])
         self.writer.add_scalar('Loss/Actor Sym Loss', locs['mean_actor_sym_loss'], locs['it'])
         self.writer.add_scalar('Loss/Critic Sym Loss', locs['mean_critic_sym_loss'], locs['it'])
@@ -226,6 +241,11 @@ class HIMOnPolicyRunner:
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                           f"""{'Estimation loss:':>{pad}} {locs['mean_estimation_loss']:.4f}\n"""
+                          f"""{'Keep loss:':>{pad}} {locs['mean_loss_keep']:.4f}\n"""
+                        #   f"""{'Pelvis loss:':>{pad}} {locs['mean_pelvis_comp_loss']:.4f}\n"""
+                        #   f"""{'Pelvis dx err:':>{pad}} {locs['mean_pelvis_dx_err']:.4f}\n"""
+                        #   f"""{'Pelvis dy err:':>{pad}} {locs['mean_pelvis_dy_err']:.4f}\n"""
+                        #   f"""{'Pelvis dz err:':>{pad}} {locs['mean_pelvis_dz_err']:.4f}\n"""
                           f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
                           f"""{'Mean actor sym loss:':>{pad}} {locs['mean_actor_sym_loss']:.4f}\n"""
                           f"""{'Mean critic sym loss:':>{pad}} {locs['mean_critic_sym_loss']:.4f}\n"""
@@ -242,6 +262,7 @@ class HIMOnPolicyRunner:
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
                           f"""{'Estimation loss:':>{pad}} {locs['mean_estimation_loss']:.4f}\n"""
+                          f"""{'Keep loss:':>{pad}} {locs['mean_loss_keep']:.4f}\n"""
                           f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
                           f"""{'Mean actor sym loss:':>{pad}} {locs['mean_actor_sym_loss']:.4f}\n"""
                           f"""{'Mean critic sym loss:':>{pad}} {locs['mean_critic_sym_loss']:.4f}\n"""

@@ -44,6 +44,7 @@ class LeggedRobotCfg(BaseConfig):
         env_spacing = 3.  # not used with heightfields/trimeshes 
         send_timeouts = True # send time out information to the algorithm
         episode_length_s = 20 # episode length in seconds
+        is_trainning = True
 
     class terrain:
         mesh_type = 'trimesh' # "heightfield" # none, plane, heightfield or trimesh
@@ -83,6 +84,14 @@ class LeggedRobotCfg(BaseConfig):
             ang_vel_yaw = [-3.14, 3.14]    # min max [rad/s]
             heading = [-3.14, 3.14]
 
+    class target:
+        num_set=4
+        class ranges:
+            target_x = [  ]
+            target_y = [  ]
+            target_z = [  ]
+            yaw_angle = [  ]
+
     class init_state:
         pos = [0.0, 0.0, 1.] # x,y,z [m]
         rot = [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
@@ -108,6 +117,7 @@ class LeggedRobotCfg(BaseConfig):
         file = ""
         name = "legged_robot"  # actor name
         foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
+        hand_name = "None"
         penalize_contacts_on = []
         terminate_after_contacts_on = []
         curriculum_joints = []
@@ -219,8 +229,8 @@ class LeggedRobotCfg(BaseConfig):
     # viewer camera:
     class viewer:
         ref_env = 0
-        pos = [10, 0, 6]  # [m]
-        lookat = [11., 5, 3.]  # [m]
+        pos = [-3, -3, 2]  # [m]
+        lookat = [7., 7, 3.]  # [m]
 
     class sim:
         dt =  1/200

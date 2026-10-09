@@ -167,6 +167,7 @@ def get_args():
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--teacher", "action": "store_true", "default": False,  "help": "teacher study"},
     ]
     # parse arguments
     args = gymutil.parse_arguments(
@@ -202,8 +203,7 @@ class PolicyExporterHIM(torch.nn.Module):
         parts = self.estimator(obs_history)
         vel, z = parts[..., :3], parts[..., 3:]
         z = F.normalize(z, dim=-1, p=2.0)
-        
-        return self.actor(torch.cat((obs_history[:, -76:], vel, z), dim=1))
+        return self.actor(torch.cat((obs_history[:, -107:], vel, z), dim=1))
 
     def export(self, path):
         os.makedirs(path, exist_ok=True)

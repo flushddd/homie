@@ -1,0 +1,139 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "HomieRL mjlab: Train (1 env + Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "HOMIE_TRAIN_VISER": "1"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--env.scene.num-envs",
+        "1",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Train (1 env)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--env.scene.num-envs",
+        "1",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Train (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Smoke Train (64)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--env.scene.num-envs",
+        "64",
+        "--agent.max-iterations",
+        "5",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: TensorBoard",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "tensorboard.main",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "args": [
+        "--logdir",
+        "logs/rsl_rl/homie_g1",
+        "--port",
+        "6007",
+        "--bind_all"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Play (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.play",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--num-envs",
+        "1",
+        "--viewer",
+        "viser",
+        "--checkpoint-file",
+        "${input:homieCheckpoint}"
+      ]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "HomieRL mjlab: Train + TensorBoard",
+      "configurations": [
+        "HomieRL mjlab: Train (4096)",
+        "HomieRL mjlab: TensorBoard"
+      ],
+      "stopAll": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "homieCheckpoint",
+      "type": "promptString",
+      "description": "Path to checkpoint (e.g. logs/rsl_rl/homie_g1/<run>/model_200.pt)",
+      "default": "logs/rsl_rl/homie_g1/"
+    }
+  ]
+}

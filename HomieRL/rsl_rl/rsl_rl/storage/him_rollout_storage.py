@@ -128,10 +128,9 @@ class HIMRolloutStorage:
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
-        indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device)
-
+        indices = torch.randperm(num_mini_batches*mini_batch_size, requires_grad=False, device=self.device) #100 4 588 
         observations = self.observations.flatten(0, 1)
-        if self.privileged_observations is not None:
+        if self.privileged_observations is not None:# 400 588
             critic_observations = self.privileged_observations.flatten(0, 1)
             next_critic_observations = self.next_privileged_observations.flatten(0, 1)
         else:
