@@ -225,7 +225,7 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     },
   )
 
-  # ---- Rewards: paper G1RoughCfg / g1_29dof_config scales (no reach/waist) ----
+  # ---- Rewards: Homie inspire-waist scales (reach_* deferred; waist via is_height) ----
   cfg.rewards = {
     "tracking_x_vel": RewardTermCfg(
       func=homie_mdp.tracking_x_vel,
@@ -278,6 +278,14 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "base_height_target": 0.74,
         "asset_cfg": SceneEntityCfg("robot", joint_names=(".*_knee_joint",)),
       },
+    ),
+    "deviation_roll_joint": RewardTermCfg(
+      func=homie_mdp.deviation_roll_joint, weight=1e-5
+    ),
+    "deviation_waist_joint": RewardTermCfg(
+      func=homie_mdp.deviation_waist_joint,
+      weight=-4e-3,
+      params={"command_name": "twist"},
     ),
     "dof_acc": RewardTermCfg(func=homie_mdp.dof_acc_l2, weight=-2.5e-7),
     "dof_pos_limits": RewardTermCfg(func=vel_mdp.joint_pos_limits, weight=-2.0),

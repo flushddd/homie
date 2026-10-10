@@ -1,7 +1,8 @@
-"""HOMIE paper G1 rewards, aligned with HomieRL ``G1RoughCfg`` / ``legged_robot``.
+"""HOMIE G1 rewards, aligned with HomieRL ``g1_inspire_wiast_config`` / ``legged_robot``.
 
-Intentionally excludes loco-manipulation extras from the evolved inspire-waist
-stack (reach_*, waist_*, target_height masks). Those belong to a later phase.
+``reach_*`` stay omitted until EE targets exist. Waist terms use height-only
+envs (``is_height_env``) as Homie's ``is_waist`` gate; ``need_waist`` /
+``extend_dist`` default to 0 without the reach stack.
 """
 
 from __future__ import annotations
@@ -17,6 +18,87 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
+
+# Homie ``g1.urdf`` joint velocity limits (rad/s), keyed by bare joint name.
+_HOMIE_DOF_VEL_LIMITS: dict[str, float] = {
+  "left_hip_pitch_joint": 32.0,
+  "left_hip_roll_joint": 20.0,
+  "left_hip_yaw_joint": 32.0,
+  "left_knee_joint": 20.0,
+  "left_ankle_pitch_joint": 37.0,
+  "left_ankle_roll_joint": 37.0,
+  "right_hip_pitch_joint": 32.0,
+  "right_hip_roll_joint": 20.0,
+  "right_hip_yaw_joint": 32.0,
+  "right_knee_joint": 20.0,
+  "right_ankle_pitch_joint": 37.0,
+  "right_ankle_roll_joint": 37.0,
+  "waist_yaw_joint": 32.0,
+  "waist_roll_joint": 37.0,
+  "waist_pitch_joint": 37.0,
+  "left_shoulder_pitch_joint": 37.0,
+  "left_shoulder_roll_joint": 37.0,
+  "left_shoulder_yaw_joint": 37.0,
+  "left_elbow_joint": 37.0,
+  "left_wrist_roll_joint": 37.0,
+  "left_wrist_pitch_joint": 22.0,
+  "left_wrist_yaw_joint": 22.0,
+  "right_shoulder_pitch_joint": 37.0,
+  "right_shoulder_roll_joint": 37.0,
+  "right_shoulder_yaw_joint": 37.0,
+  "right_elbow_joint": 37.0,
+  "right_wrist_roll_joint": 37.0,
+  "right_wrist_pitch_joint": 22.0,
+  "right_wrist_yaw_joint": 22.0,
+}
+
+
+def _bare_name(name: str) -> str:
+  return name.split("/")[-1]
+
+
+def _joint_vel_limits(asset: Entity, device: torch.device | str) -> torch.Tensor:
+  """Per-joint Homie URDF velocity limits in ``asset.joint_names`` order."""
+  cache_attr = "_homie_joint_vel_limits"
+  cached = getattr(asset, cache_attr, None)
+  if cached is not None and cached.device == torch.device(device):
+    return cached
+  vals = [
+    _HOMIE_DOF_VEL_LIMITS.get(_bare_name(n), 37.0) for n in asset.joint_names
+  ]
+  out = torch.tensor(vals, dtype=torch.float, device=device)
+  setattr(asset, cache_attr, out)
+  return out
+
+
+def _actuator_effort_limits(asset: Entity, device: torch.device | str) -> torch.Tensor:
+  """Per-actuator effort limits in ``asset.actuator_names`` / force order."""
+  cache_attr = "_homie_actuator_effort_limits"
+  cached = getattr(asset, cache_attr, None)
+  if cached is not None and cached.device == torch.device(device):
+    return cached
+  name_to_effort: dict[str, float] = {}
+  for act in asset.actuators:
+    effort = getattr(act.cfg, "effort_limit", None)
+    if effort is None:
+      continue
+    for n in act.target_names:
+      name_to_effort[_bare_name(n)] = float(effort)
+  vals = [
+    name_to_effort.get(_bare_name(n), float("inf")) for n in asset.actuator_names
+  ]
+  out = torch.tensor(vals, dtype=torch.float, device=device)
+  setattr(asset, cache_attr, out)
+  return out
+
+
+def _is_height_env(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  """Homie ``is_waist`` proxy: height-only command envs."""
+  term = env.command_manager.get_term(command_name)
+  is_height = getattr(term, "is_height_env", None)
+  if is_height is None:
+    return torch.zeros(env.num_envs, device=env.device)
+  return is_height.float()
 
 
 def _command_height_target(
@@ -205,6 +287,80 @@ def deviation_knee_joint(
   )
 
 
+def deviation_roll_joint(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg(
+    "robot", joint_names=("waist_roll_joint",)
+  ),
+) -> torch.Tensor:
+  """Homie ``_reward_deviation_roll_joint`` (per-env sum)."""
+  asset: Entity = env.scene[asset_cfg.name]
+  asset_cfg.resolve(env.scene)
+  roll = asset.data.joint_pos[:, asset_cfg.joint_ids]
+  return torch.sum(-torch.exp(torch.abs(roll) * 5.0), dim=-1)
+
+
+def deviation_waist_joint(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+  asset_cfg: SceneEntityCfg = SceneEntityCfg(
+    "robot", joint_names=("waist_pitch_joint",)
+  ),
+) -> torch.Tensor:
+  """Homie ``_reward_deviation_waist_joint`` without reach stack.
+
+  Uses ``is_height_env`` as ``is_waist``. ``need_waist`` / ``extend_dist`` /
+  ``is_reachable`` are 0 until EE targets exist → ``zero_loss`` +
+  ``first_step_loss`` only.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  asset_cfg.resolve(env.scene)
+  waist_mask = _is_height_env(env, command_name)
+  need_waist = torch.zeros(env.num_envs, device=env.device)
+  reach_mask = torch.zeros(env.num_envs, device=env.device)
+  extend_dist = torch.zeros(env.num_envs, device=env.device)
+
+  q = asset.data.joint_pos[:, asset_cfg.joint_ids]
+  limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
+  q_min = limits[..., 0]
+  q_max = limits[..., 1]
+  joint_deviation = (q - q_min) / (q_max - q_min + 1e-6)
+
+  l = 0.2
+  x = torch.clamp(
+    extend_dist / l,
+    0.0,
+    torch.sin(torch.tensor(0.52, device=env.device)),
+  )
+  speed_xy = torch.linalg.norm(asset.data.root_link_lin_vel_b[:, :2], dim=-1)
+  gate_stop = torch.exp(-(speed_xy / 0.02).pow(2))
+  target_waist = torch.clamp(torch.asin(x) / 0.52, 0.0, 1.0) * 0.5 + 0.5
+  waist_vel = asset.data.joint_vel[:, asset_cfg.joint_ids].squeeze(-1).abs()
+  gate_waist = 0.6 + 0.4 * torch.clamp(waist_vel / 0.01, 0.0, 1.0)
+  loss_dist = gate_stop * gate_waist * (extend_dist / 0.15).pow(2)
+
+  waist_loss = (
+    torch.relu(target_waist.unsqueeze(-1) - joint_deviation)
+    * waist_mask.unsqueeze(-1)
+    * (1.0 - reach_mask).unsqueeze(-1)
+    * need_waist.unsqueeze(-1)
+    * 130.5
+  )
+  zero_loss = (
+    torch.abs(joint_deviation - 0.5)
+    * (1.0 - need_waist).unsqueeze(-1)
+    * waist_mask.unsqueeze(-1)
+    * 0.55
+  )
+  dist_loss = (
+    loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * need_waist.unsqueeze(-1) * 2.2
+  )
+  first_step_loss = (
+    torch.abs(joint_deviation - 0.5) * (1.0 - waist_mask).unsqueeze(-1) * 0.01
+  )
+  return torch.sum(waist_loss + zero_loss + dist_loss + first_step_loss, dim=-1)
+
+
 def dof_acc_l2(
   env: ManagerBasedRlEnv,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -226,11 +382,9 @@ def dof_vel_limits(
   soft_ratio: float = 0.80,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
+  """Homie ``_reward_dof_vel_limits``: soft URDF velocity overflow."""
   asset: Entity = env.scene[asset_cfg.name]
-  # MuJoCo joint velocity limits if present; else skip soft gate via large bound.
-  limits = getattr(asset.data, "joint_vel_limits", None)
-  if limits is None:
-    return torch.zeros(env.num_envs, device=env.device)
+  limits = _joint_vel_limits(asset, env.device)
   return torch.sum(
     (torch.abs(asset.data.joint_vel) - limits * soft_ratio).clip(min=0.0), dim=-1
   )
@@ -249,10 +403,13 @@ def torque_limits(
   soft_ratio: float = 0.95,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-  """Soft torque-limit penalty; inactive if actuator force limits are unavailable."""
-  del soft_ratio, asset_cfg
-  # mjlab does not yet expose per-actuator effort limits on EntityData.
-  return torch.zeros(env.num_envs, device=env.device)
+  """Homie ``_reward_torque_limits``: soft actuator effort overflow."""
+  asset: Entity = env.scene[asset_cfg.name]
+  limits = _actuator_effort_limits(asset, env.device)
+  return torch.sum(
+    (torch.abs(asset.data.actuator_force) - limits * soft_ratio).clip(min=0.0),
+    dim=-1,
+  )
 
 
 def joint_power(
@@ -314,6 +471,16 @@ def _contact_forces(
   sensor: ContactSensor = env.scene.sensors[sensor_name]
   assert sensor.data.force is not None
   return sensor.data.force  # [N, F, 3]
+
+
+def _foot_grf_z(
+  env: ManagerBasedRlEnv, sensor_name: str = "feet_ground_contact"
+) -> torch.Tensor:
+  """Upward foot GRF (+Z when standing), Homie / Isaac convention.
+
+  mjlab ``reduce=netforce`` reports world-frame force with negative Z in stance.
+  """
+  return -_contact_forces(env, sensor_name)[:, :, 2]
 
 
 def _in_contact(
@@ -489,9 +656,10 @@ def feet_stumble(
   env: ManagerBasedRlEnv,
   sensor_name: str = "feet_ground_contact",
 ) -> torch.Tensor:
+  """Homie ``_reward_feet_stumble``: lateral GRF > 3× vertical."""
   forces = _contact_forces(env, sensor_name)
   lateral = torch.norm(forces[:, :, :2], dim=-1)
-  vertical = torch.abs(forces[:, :, 2])
+  vertical = _foot_grf_z(env, sensor_name).abs()
   return torch.any(lateral > 3.0 * vertical, dim=-1).float()
 
 
@@ -526,11 +694,12 @@ def contact_momentum(
     "robot", site_names=("left_foot", "right_foot")
   ),
 ) -> torch.Tensor:
+  """Homie ``_reward_contact_momentum`` (soft foot strike)."""
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  forces = _contact_forces(env, sensor_name)
+  fz = _foot_grf_z(env, sensor_name)
   vz = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, 2]
-  mom = torch.clip(vz, max=0.0) * torch.clip(forces[:, :, 2] - 50.0, min=0.0)
+  mom = torch.clip(vz, max=0.0) * torch.clip(fz - 50.0, min=0.0)
   return torch.sum(mom, dim=-1)
 
 
@@ -553,9 +722,9 @@ def stand_still(
   base_height_target: float = 0.74,
   stand_height_threshold: float = 0.735,
 ) -> torch.Tensor:
-  forces = _contact_forces(env, sensor_name)
-  # Homie: count feet with low vertical force as "not firmly planted".
-  light = (forces[:, :, 2] < 0.1).float().sum(dim=-1)
+  # Homie: count feet with low upward GRF as "not firmly planted".
+  fz = _foot_grf_z(env, sensor_name)
+  light = (fz < 0.1).float().sum(dim=-1)
   h_target = _command_height_target(env, command_name, base_height_target)
   gate = (h_target >= stand_height_threshold).float()
   cmd = env.command_manager.get_command(command_name)
