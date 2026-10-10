@@ -222,7 +222,13 @@ class TwistHeightCommand(UniformVelocityCommand):
     # Height slider always wins when the GUI exists (no need to toggle Enable).
     if self._height_abs_slider is not None:
       abs_h = float(self._height_abs_slider.value)
-      self.height_command[idx] = abs_h - float(self.cfg.base_height_target)
+      h_off = abs_h - float(self.cfg.base_height_target)
+      self.height_command[idx] = h_off
+      # Keep idle-wipe / standing flags consistent with the slider.
+      squatting = abs(h_off) > 1e-3
+      self.is_height_env[idx] = squatting
+      if squatting:
+        self.is_standing_env[idx] = True
     # Velocity: Enable ON → follow sliders; Enable OFF → force zero (stand still).
     # Previously Enable OFF left random train velocities, so the robot kept walking.
     if self._joystick_active():

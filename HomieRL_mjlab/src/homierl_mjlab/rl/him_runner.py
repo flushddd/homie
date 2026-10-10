@@ -37,8 +37,8 @@ class HomieOnPolicyRunner:
     him_cfg = train_cfg.get("him", {})
     self.actor_history_length = int(him_cfg.get("actor_history_length", 6))
     self.critic_history_length = int(him_cfg.get("critic_history_length", 1))
-    self.num_steps_per_env = int(train_cfg.get("num_steps_per_env", 24))
-    self.save_interval = int(train_cfg.get("save_interval", 50))
+    self.num_steps_per_env = int(train_cfg.get("num_steps_per_env", 50))
+    self.save_interval = int(train_cfg.get("save_interval", 200))
     self.upload_model = bool(train_cfg.get("upload_model", False))
 
     self.adapter = HomieHistoryAdapter(
@@ -49,10 +49,10 @@ class HomieOnPolicyRunner:
     self.env = self.adapter
 
     policy_hidden = tuple(
-      train_cfg.get("actor", {}).get("hidden_dims", (512, 256, 128))
+      train_cfg.get("actor", {}).get("hidden_dims", (512, 256, 256))
     )
     critic_hidden = tuple(
-      train_cfg.get("critic", {}).get("hidden_dims", (512, 256, 128))
+      train_cfg.get("critic", {}).get("hidden_dims", (512, 256, 256))
     )
     init_noise = float(
       train_cfg.get("actor", {})
@@ -84,14 +84,14 @@ class HomieOnPolicyRunner:
       lam=float(alg_cfg.get("lam", 0.95)),
       value_loss_coef=float(alg_cfg.get("value_loss_coef", 1.0)),
       entropy_coef=float(alg_cfg.get("entropy_coef", 0.01)),
-      learning_rate=float(alg_cfg.get("learning_rate", 3e-4)),
+      learning_rate=float(alg_cfg.get("learning_rate", 1e-3)),
       max_grad_norm=float(alg_cfg.get("max_grad_norm", 1.0)),
       use_clipped_value_loss=bool(alg_cfg.get("use_clipped_value_loss", True)),
       schedule=str(alg_cfg.get("schedule", "adaptive")),
       desired_kl=float(alg_cfg.get("desired_kl", 0.01)),
       device=self.device,
-      symmetry_scale=float(him_cfg.get("symmetry_scale", 0.5)),
-      max_learning_rate=float(him_cfg.get("max_learning_rate", 1e-3)),
+      symmetry_scale=float(him_cfg.get("symmetry_scale", 1.0)),
+      max_learning_rate=float(him_cfg.get("max_learning_rate", 1e-2)),
       min_learning_rate=float(him_cfg.get("min_learning_rate", 1e-5)),
     )
 

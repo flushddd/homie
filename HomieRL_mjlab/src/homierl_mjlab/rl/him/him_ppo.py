@@ -30,9 +30,9 @@ class HIMPPO:
     schedule: str = "adaptive",
     desired_kl: float = 0.01,
     device: str = "cpu",
-    symmetry_scale: float = 1.0,
+    symmetry_scale: float = 1.0,  # Homie G1_*CfgPPO.algorithm.symmetry_scale
     num_dof: int = 29,
-    max_learning_rate: float = 1e-3,
+    max_learning_rate: float = 1e-2,  # Homie adaptive clamp
     min_learning_rate: float = 1e-5,
   ):
     self.device = device

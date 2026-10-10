@@ -191,6 +191,7 @@ def deviation_knee_joint(
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
   h_target = _command_height_target(env, command_name, base_height_target)
+  # Homie: height_error = root_states[:,2] - h_target
   height_error = asset.data.root_link_pos_w[:, 2] - h_target
 
   q = asset.data.joint_pos[:, asset_cfg.joint_ids]

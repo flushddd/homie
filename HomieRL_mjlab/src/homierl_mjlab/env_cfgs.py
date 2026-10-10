@@ -87,12 +87,14 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
-  # ---- Commands: twist + height ----
+  # ---- Commands: twist + height (Homie ranges + resampling_time=4s) ----
+  # Standing / height / vel bands are applied in TwistHeightCommand._resample_command
+  # (Homie set_x schedule). rel_standing_envs unused after that overwrite.
   cfg.commands = {
     "twist": homie_mdp.TwistHeightCommandCfg(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
-      rel_standing_envs=0.1,
+      rel_standing_envs=0.0,
       rel_heading_envs=0.0,
       heading_command=False,
       debug_vis=True,
@@ -107,51 +109,65 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
-  # ---- Observations (Homie-like; history stacked by Homie runner adapter) ----
+  # ---- Observations (Homie ``compute_observations`` + ``_get_noise_scale_vec``) ----
+  # Pipeline: compute → noise → scale. Homie adds noise on already-scaled obs;
+  # equivalent here: noise on raw with amplitude = noise_scale / obs_scale inverse
+  # arranged as noise_raw = Homie_noise_scale, then scale = Homie obs_scale
+  # (see noise_vec = noise_scales * level * obs_scales on scaled channels).
   actor_terms = {
+    # Homie: commands get zero noise; twist scaled by (lin_vel, lin_vel, ang_vel).
     "command_twist": ObservationTermCfg(
       func=homie_mdp.twist_command_xy_yaw,
       params={
         "command_name": "twist",
-        "scale": (2.0, 2.0, 0.5),  # Homie obs_scales lin_vel/ang_vel
+        "scale": (2.0, 2.0, 0.5),
       },
-      noise=Unoise(n_min=-0.1, n_max=0.1),
     ),
     "command_height": ObservationTermCfg(
       func=homie_mdp.height_command,
       params={
         "command_name": "twist",
-        "absolute": True,  # Homie observes absolute meters, not offset
+        "absolute": True,
         "base_height_target": 0.74,
       },
-      noise=Unoise(n_min=-0.05, n_max=0.05),
     ),
+    # Homie: noise_scales.ang_vel=0.5, obs_scales.ang_vel=0.5
+    # → noise on raw ±0.5, then *0.5 (matches ±0.25 on scaled obs).
     "base_ang_vel": ObservationTermCfg(
       func=vel_mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_ang_vel"},
-      noise=Unoise(n_min=-0.2, n_max=0.2),
+      noise=Unoise(n_min=-0.5, n_max=0.5),
+      scale=0.5,
     ),
+    # Homie: noise_scales.gravity=0.05 (no obs scale).
     "projected_gravity": ObservationTermCfg(
       func=vel_mdp.projected_gravity,
       noise=Unoise(n_min=-0.05, n_max=0.05),
     ),
+    # Homie: noise_scales.dof_pos=0.02, obs_scales.dof_pos=1.0
     "joint_pos": ObservationTermCfg(
       func=vel_mdp.joint_pos_rel,
       params={"biased": True},
       noise=Unoise(n_min=-0.02, n_max=0.02),
+      scale=1.0,
     ),
+    # Homie: noise_scales.dof_vel=2.0, obs_scales.dof_vel=0.05
+    # → noise on raw ±2.0, then *0.05 (matches ±0.1 on scaled obs).
     "joint_vel": ObservationTermCfg(
       func=vel_mdp.joint_vel_rel,
-      noise=Unoise(n_min=-1.5, n_max=1.5),
+      noise=Unoise(n_min=-2.0, n_max=2.0),
+      scale=0.05,
     ),
     "actions": ObservationTermCfg(func=vel_mdp.last_action),
   }
   critic_terms = {
     **actor_terms,
-    "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel),
+    "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel, scale=1.0),
+    # Homie critic appends base_lin_vel * obs_scales.lin_vel (2.0).
     "base_lin_vel": ObservationTermCfg(
       func=vel_mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_lin_vel"},
+      scale=2.0,
     ),
   }
   cfg.observations = {
@@ -167,9 +183,35 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
   }
 
-  # ---- Events ----
+  # ---- Events (Homie domain_rand + push) ----
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = geom_names
+  # Homie friction_range = [0.1, 3.0]
+  cfg.events["foot_friction"].params["ranges"] = (0.1, 3.0)
   cfg.events["base_com"].params["asset_cfg"].body_names = ("torso_link",)
+  # Homie body_displacement_range ≈ ±0.1 on torso COM.
+  cfg.events["base_com"].params["ranges"] = {
+    0: (-0.1, 0.1),
+    1: (-0.1, 0.1),
+    2: (-0.1, 0.1),
+  }
+
+  # Homie ``_push_robots``: only lin vel xy ±0.5, interval 4s.
+  cfg.events["push_robot"] = EventTermCfg(
+    func=vel_mdp.push_by_setting_velocity,
+    mode="interval",
+    interval_range_s=(4.0, 4.0),
+    params={
+      "velocity_range": {
+        "x": (-0.5, 0.5),
+        "y": (-0.5, 0.5),
+      },
+    },
+  )
+
+  # Homie initial_joint_pos_scale [0.8, 1.2] + offset [-0.1, 0.1] around default.
+  # Approximate with offset range; scale randomization is not a first-class mjlab API.
+  cfg.events["reset_robot_joints"].params["position_range"] = (-0.1, 0.1)
+  cfg.events["reset_robot_joints"].params["velocity_range"] = (0.0, 0.0)
 
   # Phase-1: no upper-body pose curriculum; PD holds waist/arms at default.
   cfg.events.pop("init_upper_curriculum", None)
@@ -177,7 +219,7 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events.pop("reset_upper_curriculum", None)
   cfg.events["hold_upper_default"] = EventTermCfg(
     func=homie_mdp.hold_joints_at_default,
-    mode="reset",
+    mode="step",
     params={
       "asset_cfg": SceneEntityCfg("robot", joint_names=UPPER_JOINT_NAMES),
     },
@@ -328,7 +370,7 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
       params={"sensor_name": "feet_ground_contact", "command_name": "twist"},
     ),
     "joint_tracking_error": RewardTermCfg(
-      func=homie_mdp.joint_tracking_error, weight=-0.1
+      func=homie_mdp.joint_tracking_error, weight=-0.05  # Homie scales
     ),
     "feet_slip": RewardTermCfg(
       func=homie_mdp.feet_slip_homie,
@@ -380,7 +422,8 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "command_name": "twist",
         "velocity_stages": [
           {"step": 0, "lin_vel_x": (-0.8, 1.2), "ang_vel_z": (-0.8, 0.8)},
-          {"step": 5000 * 24, "lin_vel_x": (-1.0, 1.5), "ang_vel_z": (-1.0, 1.0)},
+          # 5000 iters * Homie num_steps_per_env=50
+          {"step": 5000 * 50, "lin_vel_x": (-1.0, 1.5), "ang_vel_z": (-1.0, 1.0)},
         ],
       },
     ),

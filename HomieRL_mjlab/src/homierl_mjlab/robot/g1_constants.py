@@ -232,7 +232,8 @@ HOMIE_ARTICULATION = EntityArticulationInfoCfg(
     HOMIE_ACTUATOR_WRIST_ROLL,
     HOMIE_ACTUATOR_WRIST_PY,
   ),
-  soft_joint_pos_limit_factor=0.9,
+  # Homie ``rewards.soft_dof_pos_limit = 0.975``
+  soft_joint_pos_limit_factor=0.975,
 )
 
 # Foot sphere collisions from the inspire XML (4 per foot after naming).

@@ -99,8 +99,8 @@ class HIMActorCritic(nn.Module):
                         actor_history_length,
                         critic_history_length,
                         num_actions=19,
-                        actor_hidden_dims=[512, 256, 128],
-                        critic_hidden_dims=[512, 256, 128],
+                        actor_hidden_dims=[512, 256, 256],
+                        critic_hidden_dims=[512, 256, 256],
                         activation='elu',
                         init_noise_std=1.0,
                         **kwargs):

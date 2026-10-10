@@ -11,7 +11,10 @@
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
-        "HOMIE_TRAIN_VISER": "1"
+        "HOMIE_TRAIN_VISER": "1",
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
       },
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1",
@@ -32,6 +35,11 @@
       "cwd": "${workspaceFolder}/HomieRL_mjlab",
       "console": "integratedTerminal",
       "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1",
         "--env.scene.num-envs",
@@ -51,6 +59,11 @@
       "cwd": "${workspaceFolder}/HomieRL_mjlab",
       "console": "integratedTerminal",
       "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1",
         "--env.scene.num-envs",
@@ -70,6 +83,11 @@
       "cwd": "${workspaceFolder}/HomieRL_mjlab",
       "console": "integratedTerminal",
       "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1",
         "--env.scene.num-envs",
@@ -90,6 +108,10 @@
       "module": "tensorboard.main",
       "cwd": "${workspaceFolder}/HomieRL_mjlab",
       "console": "integratedTerminal",
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}"
+      },
       "args": [
         "--logdir",
         "logs/rsl_rl/homie_g1",
@@ -107,6 +129,11 @@
       "cwd": "${workspaceFolder}/HomieRL_mjlab",
       "console": "integratedTerminal",
       "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1",
         "--num-envs",
