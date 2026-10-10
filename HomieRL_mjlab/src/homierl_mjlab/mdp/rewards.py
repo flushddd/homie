@@ -443,12 +443,26 @@ def joint_tracking_error(
 
 def action_vanish(
   env: ManagerBasedRlEnv,
-  clip: float = 1.0,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-  """Penalize raw actions outside [-clip, clip] (Homie action_vanish)."""
+  """Homie ``_reward_action_vanish``: overflow past joint-limit action bounds.
+
+  Bounds are ``(q_lim - q_default) / action_scale`` for each controlled joint.
+  The previous hardcoded ``±1`` clip blocked squat (knee needs |a| up to ~10).
+  """
+  asset: Entity = env.scene[asset_cfg.name]
   actions = env.action_manager.action
-  upper = torch.clip(actions - clip, min=0.0)
-  lower = torch.clip(-clip - actions, min=0.0)
+  term = env.action_manager.get_term("joint_pos")
+  joint_ids = term.target_ids
+  scale = term.scale
+  if not torch.is_tensor(scale):
+    scale = torch.as_tensor(scale, device=env.device, dtype=actions.dtype)
+  default = asset.data.default_joint_pos[:, joint_ids]
+  limits = asset.data.soft_joint_pos_limits[:, joint_ids]  # [N, J, 2]
+  action_max = (limits[..., 1] - default) / scale
+  action_min = (limits[..., 0] - default) / scale
+  upper = torch.clip(actions - action_max, min=0.0)
+  lower = torch.clip(action_min - actions, min=0.0)
   return torch.sum(upper + lower, dim=-1)
 
 

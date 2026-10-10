@@ -32,15 +32,15 @@ def homie_g1_him_runner_cfg() -> HomieRlOnPolicyRunnerCfg:
   """Align with Homie ``G1_Inspire_Waist_RoughCfgPPO`` / ``LeggedRobotCfgPPO``."""
   return HomieRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
-      # Homie ``LeggedRobotCfgPPO.policy.actor_hidden_dims``
-      hidden_dims=(512, 256, 256),
+      # Pre-alignment mjlab size (Homie paper cfg uses 512/256/256).
+      hidden_dims=(512, 256, 128),
       distribution_cfg={
         "class_name": "GaussianDistribution",
         "init_std": 1.0,
         "std_type": "scalar",
       },
     ),
-    critic=RslRlModelCfg(hidden_dims=(512, 256, 256)),
+    critic=RslRlModelCfg(hidden_dims=(512, 256, 128)),
     algorithm=RslRlPpoAlgorithmCfg(
       entropy_coef=0.01,
       learning_rate=1e-3,  # Homie LeggedRobotCfgPPO.algorithm
