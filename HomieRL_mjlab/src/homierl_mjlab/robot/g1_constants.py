@@ -120,7 +120,7 @@ HOMIE_INIT_STATE = EntityCfg.InitialStateCfg(
   joint_vel={".*": 0.0},
 )
 
-# Policy actions: 12 lower-limb joints only.
+# Policy actions phase-1: 12 lower-limb joints only.
 LEG_JOINT_NAMES = (
   ".*_hip_yaw_joint",
   ".*_hip_roll_joint",
@@ -130,12 +130,16 @@ LEG_JOINT_NAMES = (
   ".*_ankle_roll_joint",
 )
 
+# Policy actions phase-2: 12 legs + 3 waist (Homie lower 15).
+LOCO_JOINT_NAMES = LEG_JOINT_NAMES + WAIST_JOINT_NAMES
+
 UPPER_JOINT_NAMES = WAIST_JOINT_NAMES + ARM_JOINT_NAMES
 
 KNEE_JOINT_NAMES = (".*_knee_joint",)
 
 # Homie action_scale = 0.25 on default joint offsets.
 HOMIE_LEG_ACTION_SCALE: float = 0.25
+HOMIE_ACTION_SCALE: float = 0.25
 
 # Homie ``g1_inspire_wiast_config.control`` stiffness / damping [N·m/rad].
 # Grouped by identical (kp, kd); effort/armature keep Unitree motor specs.
@@ -323,12 +327,14 @@ __all__ = [
   "FEET_COLLISION",
   "FOOT_COLLISION_GEOM_NAMES",
   "G1_ACTION_SCALE",
+  "HOMIE_ACTION_SCALE",
   "HOMIE_ARTICULATION",
   "HOMIE_INIT_STATE",
   "HOMIE_LEG_ACTION_SCALE",
   "INSPIRE_WAIST_XML",
   "KNEE_JOINT_NAMES",
   "LEG_JOINT_NAMES",
+  "LOCO_JOINT_NAMES",
   "UPPER_JOINT_NAMES",
   "WAIST_JOINT_NAMES",
   "get_g1_robot_cfg",

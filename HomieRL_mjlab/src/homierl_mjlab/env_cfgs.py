@@ -21,15 +21,89 @@ from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from homierl_mjlab import mdp as homie_mdp
 from homierl_mjlab.robot.g1_constants import (
+  ARM_JOINT_NAMES,
   FOOT_COLLISION_GEOM_NAMES,
+  HOMIE_ACTION_SCALE,
   HOMIE_LEG_ACTION_SCALE,
   LEG_JOINT_NAMES,
+  LOCO_JOINT_NAMES,
   UPPER_JOINT_NAMES,
   get_g1_robot_cfg,
 )
 
-def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
-  """Paper HOMIE G1 flat terrain: walk / squat + upper-body pose curriculum."""
+
+def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
+  """Phase-1: PD-hold waist+arms. Phase-2: policy waist; arms held at default."""
+  cfg.events.pop("init_upper_curriculum", None)
+  cfg.events.pop("upper_body_curriculum", None)
+  cfg.events.pop("reset_upper_curriculum", None)
+  cfg.events.pop("hold_upper_default", None)
+  cfg.events.pop("hold_waist_default", None)
+  cfg.events.pop("hold_arms_default", None)
+
+  if int(phase) <= 1:
+    cfg.events["hold_upper_default"] = EventTermCfg(
+      func=homie_mdp.hold_joints_at_default,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=UPPER_JOINT_NAMES),
+      },
+    )
+    return
+
+  # Phase-2: waist is policy-controlled; arms stay at default (grasp target → waist).
+  cfg.events["hold_arms_default"] = EventTermCfg(
+    func=homie_mdp.hold_joints_at_default,
+    mode="step",
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+    },
+  )
+
+
+def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
+  """Phase-1: 12 legs. Phase-2: 12 legs + 3 waist (Homie lower 15)."""
+  if int(phase) <= 1:
+    names = LEG_JOINT_NAMES
+    scale = HOMIE_LEG_ACTION_SCALE
+  else:
+    names = LOCO_JOINT_NAMES
+    scale = HOMIE_ACTION_SCALE
+  cfg.actions = {
+    "joint_pos": JointPositionActionCfg(
+      entity_name="robot",
+      actuator_names=names,
+      scale=scale,
+      use_default_offset=True,
+    ),
+  }
+
+
+def _configure_phase_commands_and_obs(
+  cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
+) -> None:
+  """Phase-2: Homie random grasp target (for waist), not arm pose curriculum."""
+  if int(phase) <= 1:
+    cfg.commands.pop("grasp", None)
+    actor_terms.pop("grasp_target", None)
+    return
+
+  cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
+    entity_name="robot",
+    resampling_time_range=(4.0, 4.0),
+    debug_vis=True,
+    base_height_target=0.74,
+  )
+  actor_terms["grasp_target"] = ObservationTermCfg(
+    func=homie_mdp.grasp_target_command,
+    params={"command_name": "grasp"},
+  )
+
+
+def homie_g1_flat_env_cfg(
+  play: bool = False, phase: int = 1
+) -> ManagerBasedRlEnvCfg:
+  """Paper HOMIE G1 flat: phase-1 loco/squat; phase-2 waist + grasp targets."""
   cfg = make_velocity_env_cfg()
 
   cfg.sim.njmax = 300
@@ -77,15 +151,8 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg, self_collision_cfg)
 
-  # ---- Actions: policy only drives 12 leg joints ----
-  cfg.actions = {
-    "joint_pos": JointPositionActionCfg(
-      entity_name="robot",
-      actuator_names=LEG_JOINT_NAMES,
-      scale=HOMIE_LEG_ACTION_SCALE,
-      use_default_offset=True,
-    ),
-  }
+  # ---- Actions: phase-1 = 12 legs; phase-2 = 12 legs + 3 waist ----
+  _configure_phase_actions(cfg, phase=phase)
 
   # ---- Commands: twist + height (Homie ranges + resampling_time=4s) ----
   # Standing / height / vel bands are applied in TwistHeightCommand._resample_command
@@ -160,6 +227,8 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     ),
     "actions": ObservationTermCfg(func=vel_mdp.last_action),
   }
+  # Grasp obs must sit after actions and before critic-only lin_vel (Homie order).
+  _configure_phase_commands_and_obs(cfg, phase, actor_terms)
   critic_terms = {
     **actor_terms,
     "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel, scale=1.0),
@@ -213,17 +282,7 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   cfg.events["reset_robot_joints"].params["position_range"] = (-0.1, 0.1)
   cfg.events["reset_robot_joints"].params["velocity_range"] = (0.0, 0.0)
 
-  # Phase-1: no upper-body pose curriculum; PD holds waist/arms at default.
-  cfg.events.pop("init_upper_curriculum", None)
-  cfg.events.pop("upper_body_curriculum", None)
-  cfg.events.pop("reset_upper_curriculum", None)
-  cfg.events["hold_upper_default"] = EventTermCfg(
-    func=homie_mdp.hold_joints_at_default,
-    mode="step",
-    params={
-      "asset_cfg": SceneEntityCfg("robot", joint_names=UPPER_JOINT_NAMES),
-    },
-  )
+  _configure_phase_events(cfg, phase=phase)
 
   # ---- Rewards: Homie inspire-waist scales (reach_* deferred; waist via is_height) ----
   cfg.rewards = {
@@ -409,6 +468,17 @@ def homie_g1_flat_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         "sensor_name": "feet_ground_contact",
         "command_name": "twist",
         "base_height_target": 0.74,
+      },
+    ),
+    # Zero-velocity stand: penalize base sway (front-back / side rock).
+    "stand_sway": RewardTermCfg(
+      func=homie_mdp.stand_sway,
+      weight=-1.0,
+      params={
+        "command_name": "twist",
+        "cmd_threshold": 0.1,
+        "base_height_target": 0.74,
+        "stand_height_threshold": 0.735,
       },
     ),
   }

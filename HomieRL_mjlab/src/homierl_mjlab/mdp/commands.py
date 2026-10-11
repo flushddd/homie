@@ -84,24 +84,74 @@ class TwistHeightCommand(UniformVelocityCommand):
     """Viser height slider is present — take over height from random/standing logic."""
     return self._height_abs_slider is not None
 
+  def _get_grasp(self):
+    """Optional phase-2 grasp term (Homie is_target / is_waist)."""
+    try:
+      return self._env.command_manager.get_term("grasp")
+    except Exception:  # noqa: BLE001
+      return None
+
   def _resample_command(self, env_ids: torch.Tensor) -> None:
     super()._resample_command(env_ids)
 
-    # Homie schedule (legged_robot._resample_commands):
-    #   set_x < 1/3  → height-only (vel=0, squat offset)
-    #   set_x > 1/2  → velocity-only (height offset=0)
-    #   else         → idle (vel=0, height offset=0)
-    # Always apply — Viser compute() overrides the viewed env each step.
+    # Homie ``_resample_commands`` (legged_robot):
+    #   set_x < 1/3  → height band
+    #   set_x > 1/2  → velocity band
+    #   else         → idle
+    #   set_y < 1/3  → model_h; else model_target → is_target_height
+    # Vel/height further gated by (1-is_target)*(1-is_waist) / is_waist.
     n = len(env_ids)
+    if n == 0:
+      return
     set_x = torch.rand(n, device=self.device)
+    set_y = torch.rand(n, device=self.device)
     is_height = set_x < (1.0 / 3.0)
     is_vel = set_x > 0.5
+    model_h = set_y < (1.0 / 3.0)
+    model_target = ~model_h
+    is_target_height = model_target & is_height
+
+    grasp = self._get_grasp()
+    if grasp is not None:
+      grasp._refresh_curriculum()
+      # Keep Homie buffers in sync for height gating / obs.
+      grasp.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
+      is_t = grasp.is_target[env_ids].squeeze(-1) > 0.5
+      is_w = grasp.is_waist[env_ids].squeeze(-1) > 0.5
+      # Homie: vel *= is_vel * (1-is_target) * (1-is_waist)
+      allow_vel = is_vel & (~is_t) & (~is_w)
+      self.is_standing_env[env_ids] = ~allow_vel
+      self.is_height_env[env_ids] = False
+      self.vel_command_b[env_ids[~allow_vel]] = 0.0
+      self.vel_command_w[env_ids[~allow_vel]] = 0.0
+      # Homie heading_command=False height:
+      #   offset * is_height * (1-is_target) * is_waist * (1-is_target_height)
+      # Stored as offset (abs = base + offset).
+      r = torch.empty(n, device=self.device)
+      h_off = r.uniform_(*self.cfg.ranges.height)
+      allow_h = (
+        is_height & (~is_t) & is_w & (~is_target_height)
+      )
+      self.height_command[env_ids] = torch.where(
+        allow_h, h_off, torch.zeros_like(h_off)
+      )
+      self.is_height_env[env_ids] = allow_h
+      # Homie also refreshes target_z inside _resample_commands.
+      grasp.resample_target_z(env_ids)
+      # Waist-active envs: force stand (arm reach path is disabled).
+      if torch.any(is_w):
+        self.height_command[env_ids[is_w]] = 0.0
+        self.vel_command_b[env_ids[is_w]] = 0.0
+        self.vel_command_w[env_ids[is_w]] = 0.0
+        self.is_standing_env[env_ids[is_w]] = True
+        self.is_height_env[env_ids[is_w]] = False
+      return
+
+    # Phase-1 (no grasp): original set_x bands.
     self.is_height_env[env_ids] = is_height
-    # Keep vel at 0 for height-only + idle (parent _update_command honors this).
     self.is_standing_env[env_ids] = ~is_vel
     self.vel_command_b[env_ids[~is_vel]] = 0.0
     self.vel_command_w[env_ids[~is_vel]] = 0.0
-
     r = torch.empty(n, device=self.device)
     h_off = r.uniform_(*self.cfg.ranges.height)
     self.height_command[env_ids] = torch.where(

@@ -1,6 +1,7 @@
 """MDP terms for HomieRL_mjlab."""
 
 from .commands import TwistHeightCommand, TwistHeightCommandCfg
+from .curriculum import CurriculumScheduler
 from .events import (
   get_curriculum_ratio,
   hold_joints_at_default,
@@ -8,7 +9,8 @@ from .events import (
   reset_upper_body_curriculum,
   update_upper_body_pose_curriculum,
 )
-from .observations import height_command, twist_command_xy_yaw
+from .grasp_commands import GraspTargetCommand, GraspTargetCommandCfg
+from .observations import grasp_target_command, height_command, twist_command_xy_yaw
 from .rewards import (
   action_vanish,
   ang_vel_xy,
@@ -37,6 +39,7 @@ from .rewards import (
   orientation,
   smoothness_second_order,
   stand_still,
+  stand_sway,
   torque_limits,
   torques_l2,
   tracking_ang_vel,
@@ -46,6 +49,9 @@ from .rewards import (
 )
 
 __all__ = [
+  "CurriculumScheduler",
+  "GraspTargetCommand",
+  "GraspTargetCommandCfg",
   "TwistHeightCommand",
   "TwistHeightCommandCfg",
   "action_vanish",
@@ -68,6 +74,7 @@ __all__ = [
   "feet_slip_homie",
   "feet_stumble",
   "get_curriculum_ratio",
+  "grasp_target_command",
   "height_command",
   "hold_joints_at_default",
   "init_upper_body_curriculum",
@@ -80,6 +87,7 @@ __all__ = [
   "reset_upper_body_curriculum",
   "smoothness_second_order",
   "stand_still",
+  "stand_sway",
   "torque_limits",
   "torques_l2",
   "tracking_ang_vel",

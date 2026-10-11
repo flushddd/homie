@@ -300,25 +300,39 @@ def deviation_roll_joint(
   return torch.sum(-torch.exp(torch.abs(roll) * 5.0), dim=-1)
 
 
+def _grasp_term(env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"):
+  try:
+    return env.command_manager.get_term(grasp_command_name)
+  except Exception:  # noqa: BLE001
+    return None
+
+
 def deviation_waist_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
+  grasp_command_name: str = "grasp",
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot", joint_names=("waist_pitch_joint",)
   ),
 ) -> torch.Tensor:
-  """Homie ``_reward_deviation_waist_joint`` without reach stack.
+  """Homie ``_reward_deviation_waist_joint``.
 
-  Uses ``is_height_env`` as ``is_waist``. ``need_waist`` / ``extend_dist`` /
-  ``is_reachable`` are 0 until EE targets exist → ``zero_loss`` +
-  ``first_step_loss`` only.
+  Prefer live grasp-target flags (``is_waist`` / ``need_waist`` / ``extend_dist``).
+  Falls back to height-only proxy when grasp command is absent (phase-1).
   """
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  waist_mask = _is_height_env(env, command_name)
-  need_waist = torch.zeros(env.num_envs, device=env.device)
-  reach_mask = torch.zeros(env.num_envs, device=env.device)
-  extend_dist = torch.zeros(env.num_envs, device=env.device)
+  grasp = _grasp_term(env, grasp_command_name)
+  if grasp is not None:
+    waist_mask = grasp.is_waist.squeeze(-1)
+    need_waist = grasp.need_waist.squeeze(-1)
+    reach_mask = grasp.is_reachable.squeeze(-1)
+    extend_dist = grasp.extend_dist.squeeze(-1)
+  else:
+    waist_mask = _is_height_env(env, command_name)
+    need_waist = torch.zeros(env.num_envs, device=env.device)
+    reach_mask = torch.zeros(env.num_envs, device=env.device)
+    extend_dist = torch.zeros(env.num_envs, device=env.device)
 
   q = asset.data.joint_pos[:, asset_cfg.joint_ids]
   limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
@@ -744,3 +758,27 @@ def stand_still(
   cmd = env.command_manager.get_command(command_name)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < 0.1).float()
   return light * gate * zero_cmd
+
+
+def stand_sway(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  cmd_threshold: float = 0.1,
+  base_height_target: float = 0.74,
+  stand_height_threshold: float = 0.735,
+) -> torch.Tensor:
+  """Penalize base sway when velocity command is ~0 at stand height.
+
+  Uses body-frame lin_vel_xy^2 + ang_vel_xy^2. Gated so walking / squat
+  height tracking are not over-penalized.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  cmd = env.command_manager.get_command(command_name)
+  zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < cmd_threshold).float()
+  h_target = _command_height_target(env, command_name, base_height_target)
+  stand = (h_target >= stand_height_threshold).float()
+  gate = zero_cmd * stand
+  lin_xy = torch.sum(torch.square(asset.data.root_link_lin_vel_b[:, :2]), dim=-1)
+  ang_xy = torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=-1)
+  return (lin_xy + ang_xy) * gate

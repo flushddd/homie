@@ -39,3 +39,11 @@ def twist_command_xy_yaw(
   cmd = env.command_manager.get_command(command_name)
   s = torch.tensor(scale, device=cmd.device, dtype=cmd.dtype)
   return cmd[:, :3] * s
+
+
+def grasp_target_command(
+  env: ManagerBasedRlEnv,
+  command_name: str = "grasp",
+) -> torch.Tensor:
+  """Homie waist-grasp obs: ``[is_target, is_waist, extend_dist, tx, ty, tz, arm]``."""
+  return env.command_manager.get_command(command_name)

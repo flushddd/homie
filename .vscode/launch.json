@@ -101,6 +101,36 @@
       ]
     },
     {
+      "name": "HomieRL mjlab: Train Phase2 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase2",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.resume",
+        "True",
+        "--agent.load-run",
+        "2026-10-10_16-30-36",
+        "--agent.load-checkpoint",
+        "model_11000.pt",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
       "name": "HomieRL mjlab: TensorBoard",
       "type": "debugpy",
       "request": "launch",
@@ -161,6 +191,18 @@
       "type": "promptString",
       "description": "Path to checkpoint (e.g. logs/rsl_rl/homie_g1/<run>/model_200.pt)",
       "default": "logs/rsl_rl/homie_g1/"
+    },
+    {
+      "id": "homiePhase1Run",
+      "type": "promptString",
+      "description": "Phase-1 run folder name under logs/rsl_rl/homie_g1/",
+      "default": "2026-10-10_16-30-36"
+    },
+    {
+      "id": "homiePhase1Ckpt",
+      "type": "promptString",
+      "description": "Phase-1 checkpoint filename",
+      "default": "model_11000.pt"
     }
   ]
 }

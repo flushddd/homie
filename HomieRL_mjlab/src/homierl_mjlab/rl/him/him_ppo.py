@@ -62,6 +62,14 @@ class HIMPPO:
     self.max_grad_norm = max_grad_norm
     self.use_clipped_value_loss = use_clipped_value_loss
 
+    # Phase-2 teacher lock (Homie ``him_ppo mean+kl`` / ``set_teacher``).
+    self.teacher_actor_critic: HIMActorCritic | None = None
+    self.keep_loco_weight = 0.0
+    self.keep_loco_dims = 12
+    self.freeze_std_dims = 12
+    self.stand_height = 0.74
+    self.keep_height_tol = 0.02
+
     # Build left-right joint permutation for G1 naming convention.
     self._joint_perm: list[int] | None = None
     self._joint_sign: list[float] | None = None
@@ -195,6 +203,27 @@ class HIMPPO:
       sigma_batch = self.actor_critic.action_std
       entropy_batch = self.actor_critic.entropy
 
+      # ---- Phase-2: mean + KL keep toward stage-1 teacher (Homie mean+kl) ----
+      loss_keep = torch.zeros((), device=self.device)
+      if self.teacher_actor_critic is not None and self.keep_loco_weight > 0:
+        with torch.no_grad():
+          _ = self.teacher_actor_critic.act(obs_batch)
+          teacher_mu = self.teacher_actor_critic.action_mean
+          teacher_sigma = self.teacher_actor_critic.action_std
+        k = min(int(self.keep_loco_dims), mu_batch.shape[-1], teacher_mu.shape[-1])
+        loco_mask = self._loco_mask(obs_batch)
+        mask_count = loco_mask.sum().clamp(min=1.0)
+        diff = (mu_batch[:, :k] - teacher_mu[:, :k]) * loco_mask.unsqueeze(-1)
+        # Keep student grads on mean + KL (Homie detaches student KL → no KL grad).
+        kl = self._kl_diag_gauss(
+          mu_batch[:, :k],
+          sigma_batch[:, :k],
+          teacher_mu[:, :k],
+          teacher_sigma[:, :k],
+          detach_student=False,
+        ) * loco_mask
+        loss_keep = (kl.sum() + (diff * diff).sum()) / (mask_count * float(k))
+
       # Adaptive LR via KL.
       if self.desired_kl is not None and self.schedule == "adaptive":
         with torch.inference_mode():
@@ -216,6 +245,11 @@ class HIMPPO:
             )
           for pg in self.optimizer.param_groups:
             pg["lr"] = self.learning_rate
+
+      # Estimator update before policy loss (Homie order).
+      estimation_loss, swap_loss = self.actor_critic.update_estimator(
+        obs_batch, next_critic_obs_batch, lr=self.learning_rate
+      )
 
       ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
       surrogate = -torch.squeeze(advantages_batch) * ratio
@@ -255,16 +289,21 @@ class HIMPPO:
         - self.entropy_coef * entropy_batch.mean()
         + actor_sym_loss
         + critic_sym_loss
+        + self.keep_loco_weight * loss_keep
       )
 
       self.optimizer.zero_grad()
       loss.backward()
+      # Freeze exploration noise on locked loco dims (Homie freeze_std).
+      if (
+        self.teacher_actor_critic is not None
+        and hasattr(self.actor_critic, "std")
+        and self.actor_critic.std.grad is not None
+        and self.freeze_std_dims > 0
+      ):
+        self.actor_critic.std.grad[: self.freeze_std_dims].zero_()
       nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
       self.optimizer.step()
-
-      estimation_loss, swap_loss = self.actor_critic.update_estimator(
-        obs_batch, next_critic_obs_batch, lr=self.learning_rate
-      )
 
       mean_value_loss += value_loss.item()
       mean_surrogate_loss += surrogate_loss.item()
@@ -272,6 +311,7 @@ class HIMPPO:
       mean_swap_loss += swap_loss
       mean_actor_sym_loss += float(actor_sym_loss.detach())
       mean_critic_sym_loss += float(critic_sym_loss.detach())
+      mean_loss_keep += float(loss_keep.detach())
 
     num_updates = self.num_learning_epochs * self.num_mini_batches
     self.storage.clear()
@@ -282,7 +322,7 @@ class HIMPPO:
       mean_swap_loss / num_updates,
       mean_actor_sym_loss / num_updates,
       mean_critic_sym_loss / num_updates,
-      mean_loss_keep,
+      mean_loss_keep / num_updates,
     )
 
   # ---- symmetry helpers (Homie obs layout) ----
@@ -307,12 +347,13 @@ class HIMPPO:
       for i in range(n):
         out[..., q0 + i] = sign[i] * step[..., q0 + perm[i]]
         out[..., q0 + n + i] = sign[i] * step[..., q0 + n + perm[i]]
-    # actions (12 legs) — assume [L6 | R6] pitch,roll,yaw,knee,ap,ar
+    # actions: 12 legs (+ optional 3 waist). Assume leg block [L6 | R6].
     a0 = 10 + 2 * n
-    if step.shape[-1] >= a0 + 12:
-      out[..., a0 : a0 + 12] = self.flip_actions(step[..., a0 : a0 + 12])
-    if with_lin_vel and step.shape[-1] >= a0 + 12 + 3:
-      lv = a0 + 12
+    n_act = int(self.actor_critic.num_actions)
+    if step.shape[-1] >= a0 + n_act:
+      out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
+    if with_lin_vel and step.shape[-1] >= a0 + n_act + 3:
+      lv = a0 + n_act
       out[..., lv + 1] = -step[..., lv + 1]
     return out
 
@@ -331,7 +372,7 @@ class HIMPPO:
     return y.reshape(obs.shape[0], h * d)
 
   def flip_actions(self, actions: torch.Tensor) -> torch.Tensor:
-    """Mirror 12 leg actions along the last dimension."""
+    """Mirror leg (+ waist) actions. Legs: [L6|R6]; waist yaw/roll sign-flip."""
     flat = actions.reshape(-1, actions.shape[-1])
     out = torch.zeros_like(flat)
     out[:, 0] = flat[:, 6]
@@ -346,4 +387,77 @@ class HIMPPO:
     out[:, 9] = flat[:, 3]
     out[:, 10] = flat[:, 4]
     out[:, 11] = -flat[:, 5]
+    if flat.shape[-1] >= 15:
+      # waist_yaw, waist_roll, waist_pitch
+      out[:, 12] = -flat[:, 12]
+      out[:, 13] = -flat[:, 13]
+      out[:, 14] = flat[:, 14]
+    if flat.shape[-1] > 15:
+      out[:, 15:] = flat[:, 15:]
     return out.reshape(actions.shape)
+
+  def set_teacher(
+    self,
+    teacher_actor_critic: HIMActorCritic,
+    keep_loco_weight: float = 2.0,
+    keep_loco_dims: int = 12,
+    freeze_std_dims: int = 12,
+    stand_height: float = 0.74,
+    keep_height_tol: float = 0.02,
+  ) -> None:
+    """Freeze a phase-1 copy and enable mean+KL loco lock (Homie ``set_teacher``)."""
+    self.teacher_actor_critic = teacher_actor_critic
+    self.teacher_actor_critic.to(self.device)
+    self.teacher_actor_critic.eval()
+    for p in self.teacher_actor_critic.parameters():
+      p.requires_grad = False
+    self.keep_loco_weight = float(keep_loco_weight)
+    self.keep_loco_dims = int(keep_loco_dims)
+    self.freeze_std_dims = int(freeze_std_dims)
+    self.stand_height = float(stand_height)
+    self.keep_height_tol = float(keep_height_tol)
+    print(
+      f"[INFO] Teacher lock ON: weight={self.keep_loco_weight}, "
+      f"dims={self.keep_loco_dims}, freeze_std={self.freeze_std_dims}"
+    )
+
+  def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
+    """Homie keep mask: lock loco only when NOT in waist/grasp mode.
+
+    Phase-2 one-step ends with grasp ``[is_target, is_waist, ...]``. Phase-1
+    falls back to near-stand absolute height.
+    """
+    d = int(self.actor_critic.num_one_step_obs)
+    h = int(self.actor_critic.actor_history_length)
+    n_act = int(self.actor_critic.num_actions)
+    proprio = 10 + 2 * int(self.num_dof)
+    base = (h - 1) * d
+    if d >= proprio + n_act + 2:
+      is_waist = obs_batch[:, base + proprio + n_act + 1]
+      return (is_waist < 0.5).float()
+    height = obs_batch[:, base + 3]
+    return (torch.abs(height - self.stand_height) < self.keep_height_tol).float()
+
+  @staticmethod
+  def _kl_diag_gauss(
+    mu_s: torch.Tensor,
+    sig_s: torch.Tensor,
+    mu_t: torch.Tensor,
+    sig_t: torch.Tensor,
+    eps: float = 1e-8,
+    detach_student: bool = False,
+  ) -> torch.Tensor:
+    """KL(N(mu_s,sig_s^2) || N(mu_t,sig_t^2)) for diagonal Gaussians, shape (B,)."""
+    if detach_student:
+      mu_s = mu_s.detach()
+      sig_s = sig_s.detach()
+    mu_t = mu_t.detach()
+    sig_t = sig_t.detach()
+    var_s = sig_s * sig_s
+    var_t = sig_t * sig_t
+    kl = 0.5 * (
+      (var_s + (mu_s - mu_t).pow(2)) / (var_t + eps)
+      - 1.0
+      + 2.0 * torch.log((sig_t + eps) / (sig_s + eps))
+    )
+    return kl.sum(dim=-1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import statistics
 import time
@@ -183,7 +184,37 @@ class HomieOnPolicyRunner:
     self._viser_server = None
     self._viser_scene = None
 
+  def _clone_actor_critic(self) -> HIMActorCritic:
+    """Clone AC weights safely (``deepcopy`` fails if Normal distribution is set)."""
+    student = self.alg.actor_critic
+    student.distribution = None
+    teacher = copy.deepcopy(student)
+    teacher.load_state_dict(student.state_dict())
+    return teacher
+
+  def _maybe_setup_teacher(self) -> None:
+    """After resume load: clone student → frozen teacher (Homie task_registry)."""
+    him_cfg = self.cfg.get("him", {}) or {}
+    phase = int(him_cfg.get("phase", 1))
+    use_teacher = bool(him_cfg.get("use_teacher", phase >= 2))
+    if not use_teacher or phase < 2:
+      return
+    if self.alg.teacher_actor_critic is not None:
+      return
+    teacher = self._clone_actor_critic()
+    self.alg.set_teacher(
+      teacher,
+      keep_loco_weight=float(him_cfg.get("keep_loco_weight", 2.0)),
+      keep_loco_dims=int(him_cfg.get("keep_loco_dims", 12)),
+      freeze_std_dims=int(him_cfg.get("freeze_std_dims", 12)),
+      stand_height=float(him_cfg.get("stand_height", 0.74)),
+      keep_height_tol=float(him_cfg.get("keep_height_tol", 0.02)),
+    )
+
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    # Homie: load phase-1 ckpt → deepcopy as teacher → continue training.
+    self._maybe_setup_teacher()
+
     if self._train_viser_enabled():
       self._start_train_viser()
 
@@ -459,13 +490,185 @@ class HomieOnPolicyRunner:
     }
     torch.save(payload, path)
 
+  @staticmethod
+  def _remap_one_step_in_weight(
+    old_w: torch.Tensor,
+    *,
+    old_one: int,
+    new_one: int,
+    hist: int,
+    old_act: int,
+    new_act: int,
+    old_trailing: int = 0,
+    new_trailing: int = 0,
+  ) -> torch.Tensor:
+    """Copy Linear-in weights when actions / post-action obs grow.
+
+    Layout: ``[proprio | actions | trailing]``. New action dims and new
+    trailing prefix (e.g. grasp) stay zero; old trailing is kept at the end.
+    """
+    if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
+      return old_w
+    proprio = old_one - old_act - old_trailing
+    if new_one != proprio + new_act + new_trailing or proprio < 0:
+      return old_w
+    new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
+    for t in range(hist):
+      o0 = t * old_one
+      n0 = t * new_one
+      new_w[:, n0 : n0 + proprio] = old_w[:, o0 : o0 + proprio]
+      new_w[:, n0 + proprio : n0 + proprio + old_act] = old_w[
+        :, o0 + proprio : o0 + proprio + old_act
+      ]
+      if old_trailing > 0:
+        new_w[:, n0 + new_one - old_trailing : n0 + new_one] = old_w[
+          :, o0 + old_one - old_trailing : o0 + old_one
+        ]
+    return new_w
+
+  def _expand_phase1_to_phase2_state_dict(
+    self, loaded_sd: dict
+  ) -> dict[str, torch.Tensor]:
+    """Map phase-1 weights onto phase-2 (more actions + grasp obs)."""
+    ac = self.alg.actor_critic
+    cur = ac.state_dict()
+    new_act = int(ac.num_actions)
+    old_act = int(loaded_sd["std"].shape[0]) if "std" in loaded_sd else 12
+    hist_a = int(ac.actor_history_length)
+    hist_c = int(ac.critic_history_length)
+    new_one = int(ac.num_one_step_obs)
+    new_one_c = int(ac.num_one_step_critic_obs)
+    enc = loaded_sd.get("estimator.encoder.0.weight")
+    if enc is not None and enc.ndim == 2 and hist_a > 0:
+      old_one = int(enc.shape[1] // hist_a)
+    else:
+      old_one = new_one - (new_act - old_act)
+    # Actor trailing = grasp extras; critic trailing = grasp + lin_vel.
+    actor_new_trail = new_one - (old_one - old_act + new_act)
+    actor_old_trail = 0
+    critic_old_trail = 3
+    critic_new_trail = new_one_c - (old_one - old_act + new_act)
+    old_one_c = old_one + critic_old_trail
+    if actor_new_trail < 0 or critic_new_trail < critic_old_trail:
+      print("[WARN] unexpected obs expand sizes; falling back to strict-compatible keys")
+      actor_new_trail = max(actor_new_trail, 0)
+      critic_new_trail = max(critic_new_trail, critic_old_trail)
+
+    latent = 3 + int(getattr(ac, "dynamic_latent_dim", 32))
+    print(
+      f"[INFO] Remap obs/act: one_step {old_one}->{new_one}, "
+      f"act {old_act}->{new_act}, grasp_trail={actor_new_trail}"
+    )
+
+    out: dict[str, torch.Tensor] = {}
+    for key, src in loaded_sd.items():
+      if key not in cur:
+        continue
+      dst_shape = cur[key].shape
+      if src.shape == dst_shape:
+        out[key] = src
+        continue
+
+      if key == "std" and src.ndim == 1 and dst_shape[0] > src.shape[0]:
+        std = cur[key].clone()
+        std[: src.shape[0]] = src
+        out[key] = std
+        continue
+      if (
+        key.endswith("weight")
+        and src.ndim == 2
+        and dst_shape[0] > src.shape[0]
+        and dst_shape[1] == src.shape[1]
+      ):
+        w = cur[key].clone()
+        w[: src.shape[0]] = src
+        out[key] = w
+        continue
+      if key.endswith("bias") and src.ndim == 1 and dst_shape[0] > src.shape[0]:
+        b = cur[key].clone()
+        b[: src.shape[0]] = src
+        out[key] = b
+        continue
+
+      if key.startswith("estimator.encoder.0.weight"):
+        out[key] = self._remap_one_step_in_weight(
+          src,
+          old_one=old_one,
+          new_one=new_one,
+          hist=hist_a,
+          old_act=old_act,
+          new_act=new_act,
+          old_trailing=actor_old_trail,
+          new_trailing=actor_new_trail,
+        )
+        continue
+      if key.startswith("estimator.target.0.weight"):
+        out[key] = self._remap_one_step_in_weight(
+          src,
+          old_one=old_one,
+          new_one=new_one,
+          hist=1,
+          old_act=old_act,
+          new_act=new_act,
+          old_trailing=actor_old_trail,
+          new_trailing=actor_new_trail,
+        )
+        continue
+      if key == "actor.0.weight" and src.ndim == 2:
+        w = cur[key].clone()
+        remapped = self._remap_one_step_in_weight(
+          src[:, :old_one],
+          old_one=old_one,
+          new_one=new_one,
+          hist=1,
+          old_act=old_act,
+          new_act=new_act,
+          old_trailing=actor_old_trail,
+          new_trailing=actor_new_trail,
+        )
+        w[:, :new_one] = remapped
+        if src.shape[1] >= old_one + latent and w.shape[1] >= new_one + latent:
+          w[:, new_one : new_one + latent] = src[:, old_one : old_one + latent]
+        out[key] = w
+        continue
+      if key == "critic.0.weight" and src.ndim == 2:
+        out[key] = self._remap_one_step_in_weight(
+          src,
+          old_one=old_one_c,
+          new_one=new_one_c,
+          hist=hist_c,
+          old_act=old_act,
+          new_act=new_act,
+          old_trailing=critic_old_trail,
+          new_trailing=critic_new_trail,
+        )
+        continue
+
+      print(
+        f"[WARN] skip incompatible ckpt key {key}: "
+        f"{tuple(src.shape)} -> {tuple(dst_shape)}"
+      )
+    return out
+
   def load(self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location=None):
     del load_cfg
     loaded = torch.load(path, map_location=map_location or self.device, weights_only=False)
-    self.alg.actor_critic.load_state_dict(loaded["model_state_dict"], strict=strict)
-    if "optimizer_state_dict" in loaded:
+    loaded_sd = loaded["model_state_dict"]
+    cur_sd = self.alg.actor_critic.state_dict()
+    need_expand = any(
+      k in loaded_sd and loaded_sd[k].shape != cur_sd[k].shape for k in cur_sd
+    )
+    if need_expand:
+      print("[INFO] Expanding phase-1 (12-act) weights → phase-2 (15-act) network")
+      loaded_sd = self._expand_phase1_to_phase2_state_dict(loaded_sd)
+      strict = False
+    self.alg.actor_critic.load_state_dict(loaded_sd, strict=strict)
+    # Optimizer shapes may not match after expand; skip rather than crash.
+    if "optimizer_state_dict" in loaded and not need_expand:
       self.alg.optimizer.load_state_dict(loaded["optimizer_state_dict"])
-    if "estimator_optimizer_state_dict" in loaded:
+    elif need_expand:
+      print("[INFO] Skipping optimizer load after action-dim expand")
+    if "estimator_optimizer_state_dict" in loaded and not need_expand:
       self.alg.actor_critic.estimator.optimizer.load_state_dict(
         loaded["estimator_optimizer_state_dict"]
       )
