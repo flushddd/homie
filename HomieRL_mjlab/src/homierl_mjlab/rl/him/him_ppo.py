@@ -372,7 +372,7 @@ class HIMPPO:
     return y.reshape(obs.shape[0], h * d)
 
   def flip_actions(self, actions: torch.Tensor) -> torch.Tensor:
-    """Mirror leg (+ waist) actions. Legs: [L6|R6]; waist yaw/roll sign-flip."""
+    """Mirror leg (+ waist) actions. Legs: [L6|R6]; waist roll sign-flip, pitch keep."""
     flat = actions.reshape(-1, actions.shape[-1])
     out = torch.zeros_like(flat)
     out[:, 0] = flat[:, 6]
@@ -387,13 +387,17 @@ class HIMPPO:
     out[:, 9] = flat[:, 3]
     out[:, 10] = flat[:, 4]
     out[:, 11] = -flat[:, 5]
-    if flat.shape[-1] >= 15:
-      # waist_yaw, waist_roll, waist_pitch
+    if flat.shape[-1] == 14:
+      # phase-2: waist_roll, waist_pitch (yaw held, not in action)
+      out[:, 12] = -flat[:, 12]
+      out[:, 13] = flat[:, 13]
+    elif flat.shape[-1] >= 15:
+      # Homie lower-15 layout: yaw, roll, pitch
       out[:, 12] = -flat[:, 12]
       out[:, 13] = -flat[:, 13]
       out[:, 14] = flat[:, 14]
-    if flat.shape[-1] > 15:
-      out[:, 15:] = flat[:, 15:]
+      if flat.shape[-1] > 15:
+        out[:, 15:] = flat[:, 15:]
     return out.reshape(actions.shape)
 
   def set_teacher(

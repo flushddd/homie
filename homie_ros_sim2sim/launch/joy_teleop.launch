@@ -1,0 +1,9 @@
+<launch>
+  <arg name="python" default="$(env HOME)/OpenHomie/HomieRL_mjlab/.venv/bin/python"/>
+  <arg name="config" default="$(find homie_ros_sim2sim)/config/joy_teleop.yaml"/>
+
+  <rosparam file="$(arg config)" command="load" ns="homie_joy_cmd"/>
+
+  <node pkg="homie_ros_sim2sim" type="joy_cmd_node" name="homie_joy_cmd" output="screen"
+        launch-prefix="$(arg python)"/>
+</launch>

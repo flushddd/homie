@@ -1,0 +1,50 @@
+<launch>
+  <!--
+    Homie ROS sim2sim (kuavo_ros_control style):
+      mujoco_sim  publishes /homie/sensors_data to rl_policy
+      rl_policy   publishes /homie/joint_cmd to mujoco_sim
+      teleop via /cmd_vel and /homie/height_cmd
+  -->
+  <arg name="phase" default="1"/>
+  <arg name="policy_path" default="$(find homie_ros_sim2sim)/policies/g1_phase1.onnx"/>
+  <arg name="xml_path" default="$(env HOME)/OpenHomie/HomieRL/legged_gym/resources/robots/g1_inspire_description_waist/g1_29dof_rev_1_0_with_inspire_hand_FTP.xml"/>
+  <arg name="use_viewer" default="true"/>
+  <arg name="keyboard" default="true"/>
+  <arg name="joystick" default="false"/>
+
+  <arg name="phase_config" default="$(find homie_ros_sim2sim)/config/g1_phase1.yaml"/>
+  <arg name="python" default="$(env HOME)/OpenHomie/HomieRL_mjlab/.venv/bin/python"/>
+
+  <env name="PYTHONPATH" value="$(env HOME)/OpenHomie/HomieRL_mjlab/src:$(env PYTHONPATH)"/>
+
+  <include file="$(find homie_ros_sim2sim)/launch/mujoco_sim.launch">
+    <arg name="xml_path" value="$(arg xml_path)"/>
+    <arg name="use_viewer" value="$(arg use_viewer)"/>
+    <arg name="python" value="$(arg python)"/>
+  </include>
+
+  <include file="$(find homie_ros_sim2sim)/launch/policy.launch">
+    <arg name="phase" value="$(arg phase)"/>
+    <arg name="policy_path" value="$(arg policy_path)"/>
+    <arg name="phase_config" value="$(arg phase_config)"/>
+    <arg name="python" value="$(arg python)"/>
+  </include>
+
+  <group if="$(arg joystick)">
+    <include file="$(find homie_ros_sim2sim)/launch/joy_teleop.launch">
+      <arg name="python" value="$(arg python)"/>
+    </include>
+  </group>
+
+  <group if="$(arg keyboard)">
+    <node pkg="homie_ros_sim2sim" type="keyboard_cmd_node"
+          name="homie_keyboard_cmd" output="screen"
+          launch-prefix="$(arg python)">
+      <param name="height_min" value="0.25"/>
+      <param name="height_max" value="0.85"/>
+      <param name="height_cmd" value="0.74"/>
+    </node>
+  </group>
+</launch>
+
+

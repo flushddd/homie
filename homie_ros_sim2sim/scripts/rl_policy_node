@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""RL policy node — ONNX-first (HomieDeploy / kuavo style).
+
+Preferred:
+  policy_path:=.../g1_phase1.onnx   (onnxruntime)
+
+Fallbacks:
+  model_*.pt   HomieRL_mjlab HIM checkpoint
+  policy.pt    TorchScript (legacy MujocoDeploy)
+
+Topics:
+  sub /homie/sensors_data, /cmd_vel, /homie/height_cmd
+  pub /homie/joint_cmd
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Dict, List, Optional
+
+import numpy as np
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float64, Header
+
+from homie_ros_sim2sim.joint_map import (
+    G1_BODY_JOINT_NAMES,
+    PHASE1_ACTION_JOINTS,
+    PHASE2_ACTION_JOINTS,
+)
+from homie_ros_sim2sim.mjlab_obs import build_mjlab_one_step
+from homie_ros_sim2sim.msg import HomieJointCmd, HomieSensorsData
+from homie_ros_sim2sim.onnx_policy import OnnxPolicy
+
+
+def _ext(path: str) -> str:
+    return os.path.splitext(path)[1].lower()
+
+
+class RlPolicyNode:
+    def __init__(self) -> None:
+        self.policy_path = rospy.get_param("~policy_path")
+        self.control_dt = float(rospy.get_param("~control_dt", 0.02))
+        self.action_scale = float(rospy.get_param("~action_scale", 0.25))
+        self.phase = int(rospy.get_param("~phase", 1))
+        self.clip_actions = float(rospy.get_param("~clip_actions", 100.0))
+        self.device = rospy.get_param("~device", "cpu")
+
+        self.joint_names: List[str] = list(
+            rospy.get_param("~joint_names", list(G1_BODY_JOINT_NAMES))
+        )
+        default_map: Dict[str, float] = dict(rospy.get_param("~default_joint_angles", {}))
+        kp_map: Dict[str, float] = dict(rospy.get_param("~stiffness", {}))
+        kd_map: Dict[str, float] = dict(rospy.get_param("~damping", {}))
+
+        if self.phase >= 2:
+            self.action_joints = tuple(
+                rospy.get_param("~action_joints", list(PHASE2_ACTION_JOINTS))
+            )
+        else:
+            self.action_joints = tuple(
+                rospy.get_param("~action_joints", list(PHASE1_ACTION_JOINTS))
+            )
+
+        self.num_actions = len(self.action_joints)
+        self.n_body = len(self.joint_names)
+        self.default_q = np.array(
+            [float(default_map.get(n, 0.0)) for n in self.joint_names], dtype=np.float64
+        )
+        self.kp = np.array(
+            [float(kp_map.get(n, 100.0)) for n in self.joint_names], dtype=np.float64
+        )
+        self.kd = np.array(
+            [float(kd_map.get(n, 2.0)) for n in self.joint_names], dtype=np.float64
+        )
+        name_to_i = {n: i for i, n in enumerate(self.joint_names)}
+        self.action_idx = [name_to_i[n] for n in self.action_joints]
+        self.hold_only = set(rospy.get_param("~hold_only_joints", ["waist_yaw_joint"]))
+
+        self.cmd_scale = list(rospy.get_param("~cmd_scale", [2.0, 2.0, 0.5]))
+        self.ang_vel_scale = float(rospy.get_param("~ang_vel_scale", 0.5))
+        self.dof_pos_scale = float(rospy.get_param("~dof_pos_scale", 1.0))
+        self.dof_vel_scale = float(rospy.get_param("~dof_vel_scale", 0.05))
+        self.hist_len = int(rospy.get_param("~obs_history_len", 6))
+        grasp_dim = int(rospy.get_param("~grasp_obs_dim", 0))
+        self.one_step = int(
+            rospy.get_param(
+                "~num_one_step_obs",
+                3 + 1 + 3 + 3 + self.n_body + self.n_body + self.num_actions + grasp_dim,
+            )
+        )
+        self.hist_dim = self.hist_len * self.one_step
+
+        self._lock = threading.Lock()
+        self._latest: Optional[HomieSensorsData] = None
+        self.cmd = np.array(
+            list(rospy.get_param("~cmd_init", [0.0, 0.0, 0.0])), dtype=np.float64
+        )
+        self.height_cmd = float(rospy.get_param("~height_cmd", 0.74))
+        self.action = np.zeros(self.num_actions, dtype=np.float32)
+
+        self._backend = "none"
+        self._onnx: Optional[OnnxPolicy] = None
+        self._him = None
+        self._jit = None
+        self._homie_obs = None
+
+        ext = _ext(self.policy_path)
+        if ext == ".onnx":
+            rospy.loginfo("Loading ONNX policy: %s (hist=%d)", self.policy_path, self.hist_dim)
+            self._onnx = OnnxPolicy(self.policy_path, hist_dim=self.hist_dim)
+            self._backend = "onnx"
+        elif ext == ".pt":
+            import torch
+            from homie_ros_sim2sim.him_loader import HimInference, load_him_policy
+
+            ck = torch.load(self.policy_path, map_location="cpu", weights_only=False)
+            if isinstance(ck, dict) and "model_state_dict" in ck:
+                rospy.logwarn(
+                    "Loading HIM .pt checkpoint (prefer exporting ONNX via export_him_onnx.py)"
+                )
+                ac, _ = load_him_policy(
+                    self.policy_path,
+                    num_actions=self.num_actions,
+                    num_one_step_obs=self.one_step,
+                    actor_history_length=self.hist_len,
+                    device=self.device,
+                )
+                self._him = HimInference(ac, self.one_step, self.hist_len, device=self.device)
+                self._backend = "him"
+            else:
+                rospy.logwarn("Loading TorchScript .pt (legacy); prefer ONNX")
+                self._jit = torch.jit.load(self.policy_path, map_location=self.device)
+                self._jit.eval()
+                from homie_ros_sim2sim.obs_builder import HomieObsBuilder
+
+                self._homie_obs = HomieObsBuilder(
+                    {
+                        "n_body_joints": self.n_body,
+                        "num_actions": self.num_actions,
+                        "action_pad": int(rospy.get_param("~action_pad", 23)),
+                        "obs_history_len": self.hist_len,
+                        "extras_dim": int(rospy.get_param("~extras_dim", 16)),
+                        "num_obs": rospy.get_param("~num_obs", None),
+                        "ang_vel_scale": self.ang_vel_scale,
+                        "dof_pos_scale": self.dof_pos_scale,
+                        "dof_vel_scale": self.dof_vel_scale,
+                        "cmd_scale": self.cmd_scale,
+                        "is_target": 0,
+                        "is_waist": 0,
+                        "is_target_height": 0,
+                    }
+                )
+                self._backend = "jit"
+        else:
+            raise RuntimeError(f"Unsupported policy: {self.policy_path}")
+
+        self.cmd_pub = rospy.Publisher("/homie/joint_cmd", HomieJointCmd, queue_size=10)
+        rospy.Subscriber("/homie/sensors_data", HomieSensorsData, self._on_sensors, queue_size=1)
+        rospy.Subscriber("/cmd_vel", Twist, self._on_cmd_vel, queue_size=1)
+        rospy.Subscriber("/homie/height_cmd", Float64, self._on_height, queue_size=1)
+
+    def _on_sensors(self, msg: HomieSensorsData) -> None:
+        with self._lock:
+            self._latest = msg
+
+    def _on_cmd_vel(self, msg: Twist) -> None:
+        self.cmd[0] = msg.linear.x
+        self.cmd[1] = msg.linear.y
+        self.cmd[2] = msg.angular.z
+
+    def _on_height(self, msg: Float64) -> None:
+        self.height_cmd = float(msg.data)
+
+    def _sensors_to_arrays(self, msg: HomieSensorsData):
+        if msg.joint_data.name:
+            src = {n: i for i, n in enumerate(msg.joint_data.name)}
+            q = np.array([msg.joint_data.q[src[n]] for n in self.joint_names], dtype=np.float64)
+            dq = np.array(
+                [msg.joint_data.dq[src[n]] for n in self.joint_names], dtype=np.float64
+            )
+        else:
+            q = np.asarray(msg.joint_data.q[: self.n_body], dtype=np.float64)
+            dq = np.asarray(msg.joint_data.dq[: self.n_body], dtype=np.float64)
+        quat = np.asarray(msg.imu_data.quat, dtype=np.float64)
+        omega = np.asarray(msg.imu_data.gyro, dtype=np.float64)
+        return q, dq, quat, omega
+
+    def _mjlab_step(self, q, dq, quat, omega) -> np.ndarray:
+        return build_mjlab_one_step(
+            joint_q=q,
+            joint_dq=dq,
+            quat_wxyz=quat,
+            omega=omega,
+            action=self.action,
+            cmd_xy_yaw=self.cmd,
+            height_cmd=self.height_cmd,
+            default_angles=self.default_q,
+            cmd_scale=self.cmd_scale,
+            ang_vel_scale=self.ang_vel_scale,
+            dof_pos_scale=self.dof_pos_scale,
+            dof_vel_scale=self.dof_vel_scale,
+        )
+
+    def _infer_action(self, q, dq, quat, omega) -> np.ndarray:
+        if self._backend in ("onnx", "him"):
+            step = self._mjlab_step(q, dq, quat, omega)
+            if self._backend == "onnx":
+                assert self._onnx is not None
+                act = self._onnx(step)
+            else:
+                act = self._him(step)
+        else:
+            import torch
+
+            assert self._homie_obs is not None and self._jit is not None
+            single = self._homie_obs.build_single(
+                joint_q=q,
+                joint_dq=dq,
+                quat_wxyz=quat,
+                omega=omega,
+                action=self.action,
+                cmd=self.cmd,
+                height_cmd=self.height_cmd,
+                default_angles=self.default_q,
+            )
+            obs = self._homie_obs.push(single)
+            with torch.no_grad():
+                act = (
+                    self._jit(torch.from_numpy(obs).unsqueeze(0))
+                    .squeeze(0)
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+
+        act = np.clip(np.asarray(act, dtype=np.float32), -self.clip_actions, self.clip_actions)
+        if act.shape[0] != self.num_actions:
+            padded = np.zeros(self.num_actions, dtype=np.float32)
+            n = min(self.num_actions, act.shape[0])
+            padded[:n] = act[:n]
+            act = padded
+        return act
+
+    def _infer_and_publish(self) -> None:
+        with self._lock:
+            msg = self._latest
+        if msg is None:
+            return
+
+        q, dq, quat, omega = self._sensors_to_arrays(msg)
+        self.action = self._infer_action(q, dq, quat, omega)
+
+        target = self.default_q.copy()
+        for k, j in enumerate(self.action_idx):
+            target[j] = self.default_q[j] + self.action_scale * float(self.action[k])
+        for name in self.hold_only:
+            if name in self.joint_names:
+                j = self.joint_names.index(name)
+                target[j] = self.default_q[j]
+
+        out = HomieJointCmd()
+        out.header = Header(stamp=rospy.Time.now(), frame_id="pelvis")
+        out.name = list(self.joint_names)
+        out.joint_q = target.tolist()
+        out.joint_v = [0.0] * self.n_body
+        out.tau = [0.0] * self.n_body
+        out.joint_kp = self.kp.tolist()
+        out.joint_kd = self.kd.tolist()
+        out.control_mode = [0] * self.n_body
+        self.cmd_pub.publish(out)
+
+    def spin(self) -> None:
+        rate = rospy.Rate(1.0 / self.control_dt)
+        rospy.loginfo(
+            "rl_policy_node phase=%d actions=%d backend=%s dt=%.3f",
+            self.phase,
+            self.num_actions,
+            self._backend,
+            self.control_dt,
+        )
+        while not rospy.is_shutdown():
+            self._infer_and_publish()
+            rate.sleep()
+
+
+def main() -> None:
+    rospy.init_node("homie_rl_policy")
+    mjlab_src = os.path.expanduser("~/OpenHomie/HomieRL_mjlab/src")
+    if os.path.isdir(mjlab_src) and mjlab_src not in os.sys.path:
+        os.sys.path.insert(0, mjlab_src)
+    node = RlPolicyNode()
+    try:
+        node.spin()
+    except rospy.ROSInterruptException:
+        pass
+
+
+if __name__ == "__main__":
+    main()

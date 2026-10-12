@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Gamepad teleop → /cmd_vel + /homie/height_cmd (pygame, no ros-joy required).
+
+Typical Xbox mapping (hold LB to enable motion):
+  Left stick Y/X : forward / lateral
+  Right stick X  : yaw
+  Right stick Y  : height (optional)
+  A / B          : height step down / up
+  Back           : zero velocity
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float64
+
+try:
+    import pygame
+except ImportError as e:
+    raise SystemExit(
+        "pygame is required for joy_cmd_node. "
+        "Install: pip install pygame\n" + str(e)
+    )
+
+
+def _dz(v: float, deadzone: float) -> float:
+    if abs(v) < deadzone:
+        return 0.0
+    # rescale so motion starts at 0 after deadzone
+    s = (abs(v) - deadzone) / (1.0 - deadzone)
+    return math.copysign(min(1.0, s), v)
+
+
+class JoyCmdNode:
+    def __init__(self) -> None:
+        self.device_index = int(rospy.get_param("~device_index", 0))
+        self.rate_hz = float(rospy.get_param("~rate", 50.0))
+        self.deadzone = float(rospy.get_param("~deadzone", 0.08))
+        self.max_lin_x = float(rospy.get_param("~max_lin_x", 0.6))
+        self.max_lin_y = float(rospy.get_param("~max_lin_y", 0.4))
+        self.max_ang_z = float(rospy.get_param("~max_ang_z", 0.6))
+        self.height = float(rospy.get_param("~height_cmd", 0.74))
+        self.height_min = float(rospy.get_param("~height_min", 0.25))
+        self.height_max = float(rospy.get_param("~height_max", 0.85))
+        self.height_step = float(rospy.get_param("~height_step", 0.01))
+
+        self.axis_lin_y = int(rospy.get_param("~axis_lin_y", 0))
+        self.axis_lin_x = int(rospy.get_param("~axis_lin_x", 1))
+        self.axis_ang_z = int(rospy.get_param("~axis_ang_z", 3))
+        self.axis_height = int(rospy.get_param("~axis_height", 4))
+        self.invert_lin_x = bool(rospy.get_param("~invert_lin_x", True))
+        self.invert_lin_y = bool(rospy.get_param("~invert_lin_y", False))
+        self.invert_ang_z = bool(rospy.get_param("~invert_ang_z", False))
+        self.invert_height = bool(rospy.get_param("~invert_height", True))
+
+        self.btn_enable = int(rospy.get_param("~btn_enable", 4))
+        self.btn_height_down = int(rospy.get_param("~btn_height_down", 0))
+        self.btn_height_up = int(rospy.get_param("~btn_height_up", 1))
+        self.btn_estop = int(rospy.get_param("~btn_estop", 6))
+
+        pygame.init()
+        pygame.joystick.init()
+        self.js = None
+        self._wait_for_joystick()
+        self._apply_beitong_profile_if_needed()
+
+        self.vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        self.h_pub = rospy.Publisher("/homie/height_cmd", Float64, queue_size=1)
+        self._prev_btn_up = False
+        self._prev_btn_down = False
+
+    def _wait_for_joystick(self) -> None:
+        """Block until a gamepad appears (USB / BT)."""
+        warned = False
+        rate = rospy.Rate(2.0)
+        while not rospy.is_shutdown():
+            pygame.event.pump()
+            pygame.joystick.quit()
+            pygame.joystick.init()
+            n = pygame.joystick.get_count()
+            if n > 0:
+                idx = self.device_index if self.device_index < n else 0
+                if self.device_index >= n:
+                    rospy.logwarn(
+                        "device_index=%d out of range (count=%d), using 0",
+                        self.device_index,
+                        n,
+                    )
+                self.js = pygame.joystick.Joystick(idx)
+                self.js.init()
+                rospy.loginfo(
+                    "Joystick [%d]: %s (axes=%d buttons=%d hats=%d)",
+                    idx,
+                    self.js.get_name(),
+                    self.js.get_numaxes(),
+                    self.js.get_numbuttons(),
+                    self.js.get_numhats(),
+                )
+                return
+            if not warned:
+                rospy.logwarn(
+                    "No gamepad yet; plug in a controller (waiting)..."
+                )
+                warned = True
+            rate.sleep()
+        raise RuntimeError("Shutdown while waiting for gamepad")
+
+    def _apply_beitong_profile_if_needed(self) -> None:
+        """北通 A1N3 等: RX=axis2 RY=axis3, LT/RT=axis4/5 静止为 -1。"""
+        name = (self.js.get_name() if self.js is not None else "").upper()
+        if not any(k in name for k in ("BEITONG", "BETOP", "北通", "A1N3")):
+            return
+        # Only override if still on generic Xbox stick defaults that break Betop
+        if self.axis_ang_z == 3 and self.axis_height == 4:
+            self.axis_ang_z = 2
+            self.axis_height = 3
+            rospy.loginfo(
+                "Applied Beitong profile: yaw=axis2, height=axis3 (triggers ignored)"
+            )
+        else:
+            rospy.loginfo(
+                "Beitong pad detected; using yaml axes ang=%d height=%d",
+                self.axis_ang_z,
+                self.axis_height,
+            )
+
+    def _axis(self, idx: int) -> float:
+        if idx < 0 or idx >= self.js.get_numaxes():
+            return 0.0
+        return float(self.js.get_axis(idx))
+
+    def _btn(self, idx: int) -> bool:
+        if idx < 0 or idx >= self.js.get_numbuttons():
+            return False
+        return bool(self.js.get_button(idx))
+
+    def spin(self) -> None:
+        rate = rospy.Rate(self.rate_hz)
+        rospy.loginfo(
+            "joy teleop ready: hold LB(btn %d) to move | A/B height | Back zero",
+            self.btn_enable,
+        )
+        while not rospy.is_shutdown():
+            pygame.event.pump()
+
+            enable = self._btn(self.btn_enable)
+            estop = self._btn(self.btn_estop)
+
+            ax = _dz(self._axis(self.axis_lin_x), self.deadzone)
+            ay = _dz(self._axis(self.axis_lin_y), self.deadzone)
+            az = _dz(self._axis(self.axis_ang_z), self.deadzone)
+            if self.invert_lin_x:
+                ax = -ax
+            if self.invert_lin_y:
+                ay = -ay
+            if self.invert_ang_z:
+                az = -az
+
+            tw = Twist()
+            if estop:
+                tw.linear.x = tw.linear.y = tw.angular.z = 0.0
+            elif enable:
+                tw.linear.x = ax * self.max_lin_x
+                tw.linear.y = ay * self.max_lin_y
+                tw.angular.z = az * self.max_ang_z
+            else:
+                tw.linear.x = tw.linear.y = tw.angular.z = 0.0
+
+            # height stick (continuous). Skip trigger-like axes resting near ±1.
+            if self.axis_height >= 0:
+                raw_h = self._axis(self.axis_height)
+                if abs(abs(raw_h) - 1.0) < 0.02 and abs(raw_h) > 0.95:
+                    ah = 0.0  # parked trigger, ignore
+                else:
+                    ah = _dz(raw_h, self.deadzone)
+                    if self.invert_height:
+                        ah = -ah
+                if abs(ah) > 0:
+                    self.height += ah * self.height_step * (self.rate_hz / 10.0)
+
+            # discrete height buttons (edge)
+            up = self._btn(self.btn_height_up)
+            down = self._btn(self.btn_height_down)
+            if up and not self._prev_btn_up:
+                self.height += self.height_step
+            if down and not self._prev_btn_down:
+                self.height -= self.height_step
+            self._prev_btn_up = up
+            self._prev_btn_down = down
+
+            # hat / D-pad
+            if self.js.get_numhats() > 0:
+                hx, hy = self.js.get_hat(0)
+                if hy > 0:
+                    self.height += self.height_step
+                elif hy < 0:
+                    self.height -= self.height_step
+
+            self.height = max(self.height_min, min(self.height_max, self.height))
+
+            self.vel_pub.publish(tw)
+            self.h_pub.publish(Float64(data=self.height))
+            rate.sleep()
+
+
+def main() -> None:
+    rospy.init_node("homie_joy_cmd")
+    try:
+        node = JoyCmdNode()
+    except Exception as e:
+        rospy.logerr("joy_cmd_node failed: %s", e)
+        sys.exit(1)
+    try:
+        node.spin()
+    except rospy.ROSInterruptException:
+        pass
+    finally:
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    main()

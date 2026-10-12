@@ -659,7 +659,7 @@ class HomieOnPolicyRunner:
       k in loaded_sd and loaded_sd[k].shape != cur_sd[k].shape for k in cur_sd
     )
     if need_expand:
-      print("[INFO] Expanding phase-1 (12-act) weights → phase-2 (15-act) network")
+      print("[INFO] Expanding phase-1 (12-act) weights → phase-2 network")
       loaded_sd = self._expand_phase1_to_phase2_state_dict(loaded_sd)
       strict = False
     self.alg.actor_critic.load_state_dict(loaded_sd, strict=strict)

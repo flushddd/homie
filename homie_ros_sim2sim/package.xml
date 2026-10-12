@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>homie_ros_sim2sim</name>
+  <version>0.1.0</version>
+  <description>
+    ROS1 sim2sim stack for Homie/G1, inspired by kuavo_ros_control:
+    MuJoCo publishes sensors, RL policy publishes joint commands over ROS topics.
+  </description>
+  <maintainer email="flush@todo.todo">flush</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <build_depend>message_generation</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>std_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+
+  <exec_depend>message_runtime</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>roslaunch</exec_depend>
+
+  <export/>
+</package>

@@ -173,6 +173,30 @@
         "--checkpoint-file",
         "${input:homieCheckpoint}"
       ]
+    },
+    {
+      "name": "HomieRL mjlab: Play Phase2 (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.play",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase2",
+        "--num-envs",
+        "1",
+        "--viewer",
+        "viser",
+        "--checkpoint-file",
+        "${input:homiePhase2Checkpoint}"
+      ]
     }
   ],
   "compounds": [
@@ -203,6 +227,12 @@
       "type": "promptString",
       "description": "Phase-1 checkpoint filename",
       "default": "model_11000.pt"
+    },
+    {
+      "id": "homiePhase2Checkpoint",
+      "type": "promptString",
+      "description": "Phase-2 checkpoint path (e.g. logs/rsl_rl/homie_g1/<run>_phase2/model_*.pt)",
+      "default": "logs/rsl_rl/homie_g1/"
     }
   ]
 }

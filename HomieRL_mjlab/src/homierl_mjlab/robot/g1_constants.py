@@ -36,9 +36,16 @@ INSPIRE_WAIST_XML = (
   _INSPIRE_WAIST_DIR / "g1_29dof_rev_1_0_with_inspire_hand_FTP.xml"
 )
 
-# Held at default pose by PD (no policy action in phase-1).
+# Full waist set (phase-1 hold). Homie DOF order: yaw → roll → pitch.
 WAIST_JOINT_NAMES = (
   "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint",
+)
+
+# Homie ``_compute_torques``: yaw forced to init; roll/pitch from policy.
+WAIST_YAW_JOINT_NAMES = ("waist_yaw_joint",)
+WAIST_POLICY_JOINT_NAMES = (
   "waist_roll_joint",
   "waist_pitch_joint",
 )
@@ -130,8 +137,9 @@ LEG_JOINT_NAMES = (
   ".*_ankle_roll_joint",
 )
 
-# Policy actions phase-2: 12 legs + 3 waist (Homie lower 15).
-LOCO_JOINT_NAMES = LEG_JOINT_NAMES + WAIST_JOINT_NAMES
+# Phase-2 policy actions: 12 legs + roll + pitch (Homie effective control).
+# ``waist_yaw`` is PD-held at default (Homie overwrites yaw target to init).
+LOCO_JOINT_NAMES = LEG_JOINT_NAMES + WAIST_POLICY_JOINT_NAMES
 
 UPPER_JOINT_NAMES = WAIST_JOINT_NAMES + ARM_JOINT_NAMES
 
@@ -337,6 +345,8 @@ __all__ = [
   "LOCO_JOINT_NAMES",
   "UPPER_JOINT_NAMES",
   "WAIST_JOINT_NAMES",
+  "WAIST_POLICY_JOINT_NAMES",
+  "WAIST_YAW_JOINT_NAMES",
   "get_g1_robot_cfg",
   "get_inspire_waist_spec",
 ]

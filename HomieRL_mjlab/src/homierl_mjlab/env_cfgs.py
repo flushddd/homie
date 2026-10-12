@@ -28,17 +28,19 @@ from homierl_mjlab.robot.g1_constants import (
   LEG_JOINT_NAMES,
   LOCO_JOINT_NAMES,
   UPPER_JOINT_NAMES,
+  WAIST_YAW_JOINT_NAMES,
   get_g1_robot_cfg,
 )
 
 
 def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: PD-hold waist+arms. Phase-2: policy waist; arms held at default."""
+  """Phase-1: PD-hold waist+arms. Phase-2: policy roll/pitch; yaw+arms held."""
   cfg.events.pop("init_upper_curriculum", None)
   cfg.events.pop("upper_body_curriculum", None)
   cfg.events.pop("reset_upper_curriculum", None)
   cfg.events.pop("hold_upper_default", None)
   cfg.events.pop("hold_waist_default", None)
+  cfg.events.pop("hold_waist_yaw_default", None)
   cfg.events.pop("hold_arms_default", None)
 
   if int(phase) <= 1:
@@ -51,7 +53,14 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     )
     return
 
-  # Phase-2: waist is policy-controlled; arms stay at default (grasp target → waist).
+  # Homie: yaw target forced to init; arms not policy-driven in waist-only stage.
+  cfg.events["hold_waist_yaw_default"] = EventTermCfg(
+    func=homie_mdp.hold_joints_at_default,
+    mode="step",
+    params={
+      "asset_cfg": SceneEntityCfg("robot", joint_names=WAIST_YAW_JOINT_NAMES),
+    },
+  )
   cfg.events["hold_arms_default"] = EventTermCfg(
     func=homie_mdp.hold_joints_at_default,
     mode="step",
@@ -62,7 +71,7 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 
 
 def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: 12 legs. Phase-2: 12 legs + 3 waist (Homie lower 15)."""
+  """Phase-1: 12 legs. Phase-2: 12 legs + waist roll/pitch (yaw held)."""
   if int(phase) <= 1:
     names = LEG_JOINT_NAMES
     scale = HOMIE_LEG_ACTION_SCALE

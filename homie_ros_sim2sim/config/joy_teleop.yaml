@@ -1,0 +1,31 @@
+# 北通 BEITONG A1N3 (BFM Dongle) / Xbox 布局
+# 实测: axes=6 buttons=16  |  0=LX 1=LY 2=RX 3=RY 4=LT 5=RT(静止=-1)
+
+device_index: 0
+rate: 50.0
+deadzone: 0.12
+
+max_lin_x: 0.6
+max_lin_y: 0.4
+max_ang_z: 0.6
+
+height_cmd: 0.74
+height_min: 0.25
+height_max: 0.85
+height_step: 0.01
+
+# sticks
+axis_lin_y: 0          # 左摇杆 X → 左右
+axis_lin_x: 1          # 左摇杆 Y → 前后
+axis_ang_z: 2          # 右摇杆 X → 转向 (北通 A1N3)
+axis_height: 3         # 右摇杆 Y → 高度 (勿用 4/5, 那是扳机静止=-1)
+invert_lin_x: true
+invert_lin_y: false
+invert_ang_z: false
+invert_height: true
+
+# buttons (Xbox 编号: A0 B1 X2 Y3 LB4 RB5 Back6 Start7)
+btn_enable: 4          # 按住 LB 才能动
+btn_height_down: 0     # A
+btn_height_up: 1       # B
+btn_estop: 6           # Back 清零

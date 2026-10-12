@@ -1,0 +1,23 @@
+<launch>
+  <!-- Kuavo-style MuJoCo bridge: sensors_data out, joint_cmd in -->
+  <arg name="xml_path" default="$(env HOME)/OpenHomie/HomieRL/legged_gym/resources/robots/g1_inspire_description_waist/g1_29dof_rev_1_0_with_inspire_hand_FTP.xml"/>
+  <arg name="use_viewer" default="true"/>
+  <arg name="simulation_dt" default="0.002"/>
+  <arg name="sensor_rate" default="500.0"/>
+  <arg name="realtime" default="true"/>
+
+  <arg name="python" default="$(env HOME)/OpenHomie/HomieRL_mjlab/.venv/bin/python"/>
+
+  <rosparam file="$(find homie_ros_sim2sim)/config/g1_common.yaml" command="load" ns="homie_mujoco_sim"/>
+
+  <node pkg="homie_ros_sim2sim" type="mujoco_sim_node" name="homie_mujoco_sim" output="screen"
+        launch-prefix="$(arg python)">
+    <param name="xml_path" value="$(arg xml_path)"/>
+    <param name="use_viewer" value="$(arg use_viewer)"/>
+    <param name="simulation_dt" value="$(arg simulation_dt)"/>
+    <param name="sensor_rate" value="$(arg sensor_rate)"/>
+    <param name="realtime" value="$(arg realtime)"/>
+    <param name="init_pos_z" value="0.78"/>
+  </node>
+</launch>
+

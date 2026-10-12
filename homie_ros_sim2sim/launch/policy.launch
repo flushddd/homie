@@ -1,0 +1,19 @@
+<launch>
+  <arg name="phase" default="1" doc="1=legs only, 2=legs+waist roll/pitch"/>
+  <arg name="policy_path" default="$(find homie_ros_sim2sim)/policies/g1_phase1.onnx"/>
+  <arg name="phase_config" default="$(find homie_ros_sim2sim)/config/g1_phase1.yaml"/>
+  <!-- Use mjlab venv so torch + homierl_mjlab resolve -->
+  <arg name="python" default="$(env HOME)/OpenHomie/HomieRL_mjlab/.venv/bin/python"/>
+
+  <rosparam file="$(find homie_ros_sim2sim)/config/g1_common.yaml" command="load" ns="homie_rl_policy"/>
+  <rosparam file="$(arg phase_config)" command="load" ns="homie_rl_policy"/>
+
+  <env name="PYTHONPATH" value="$(env HOME)/OpenHomie/HomieRL_mjlab/src:$(env PYTHONPATH)"/>
+
+  <node pkg="homie_ros_sim2sim" type="rl_policy_node" name="homie_rl_policy" output="screen"
+        launch-prefix="$(arg python)">
+    <param name="policy_path" value="$(arg policy_path)"/>
+    <param name="phase" value="$(arg phase)"/>
+  </node>
+</launch>
+

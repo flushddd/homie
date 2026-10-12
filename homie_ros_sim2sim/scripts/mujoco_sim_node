@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""MuJoCo simulation node (kuavo mujoco_cpp analogue).
+
+Publishes:
+  /homie/sensors_data   (HomieSensorsData)
+  /homie/joint_states   (sensor_msgs/JointState)  — debug
+
+Subscribes:
+  /homie/joint_cmd      (HomieJointCmd)
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Dict, List, Optional
+
+import numpy as np
+import rospy
+from geometry_msgs.msg import Pose
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Header
+
+import mujoco
+import mujoco.viewer
+
+from homie_ros_sim2sim.joint_map import (
+    G1_BODY_JOINT_NAMES,
+    resolve_actuator_ids,
+    resolve_joint_dadr,
+    resolve_joint_qadr,
+)
+from homie_ros_sim2sim.math_utils import pd_torque
+from homie_ros_sim2sim.msg import HomieImuData, HomieJointCmd, HomieJointData, HomieSensorsData
+
+
+class MujocoSimNode:
+    def __init__(self) -> None:
+        self.xml_path = rospy.get_param("~xml_path")
+        self.sim_dt = float(rospy.get_param("~simulation_dt", 0.002))
+        self.pub_rate = float(rospy.get_param("~sensor_rate", 500.0))
+        self.use_viewer = bool(rospy.get_param("~use_viewer", True))
+        self.realtime = bool(rospy.get_param("~realtime", True))
+
+        joint_names = list(rospy.get_param("~joint_names", list(G1_BODY_JOINT_NAMES)))
+        default_map: Dict[str, float] = dict(rospy.get_param("~default_joint_angles", {}))
+        kp_map: Dict[str, float] = dict(rospy.get_param("~stiffness", {}))
+        kd_map: Dict[str, float] = dict(rospy.get_param("~damping", {}))
+
+        self.joint_names = joint_names
+        self.n = len(joint_names)
+
+        rospy.loginfo("Loading MJCF: %s", self.xml_path)
+        self.model = mujoco.MjModel.from_xml_path(self.xml_path)
+        self.model.opt.timestep = self.sim_dt
+        self.data = mujoco.MjData(self.model)
+
+        self.qadr = resolve_joint_qadr(self.model, joint_names)
+        self.dadr = resolve_joint_dadr(self.model, joint_names)
+        self.act_ids = resolve_actuator_ids(self.model, joint_names)
+
+        self.default_q = np.array(
+            [float(default_map.get(n, 0.0)) for n in joint_names], dtype=np.float64
+        )
+        self.hold_kp = np.array(
+            [float(kp_map.get(n, 100.0)) for n in joint_names], dtype=np.float64
+        )
+        self.hold_kd = np.array(
+            [float(kd_map.get(n, 2.0)) for n in joint_names], dtype=np.float64
+        )
+
+        # Command buffer (thread-safe)
+        self._lock = threading.Lock()
+        self.cmd_q = self.default_q.copy()
+        self.cmd_dq = np.zeros(self.n, dtype=np.float64)
+        self.cmd_tau = np.zeros(self.n, dtype=np.float64)
+        self.cmd_kp = self.hold_kp.copy()
+        self.cmd_kd = self.hold_kd.copy()
+        self.cmd_mode = np.zeros(self.n, dtype=np.int32)  # 0=PD
+        self._have_cmd = False
+
+        # Place robot at default pose
+        self.data.qpos[0:3] = [
+            float(rospy.get_param("~init_pos_x", 0.0)),
+            float(rospy.get_param("~init_pos_y", 0.0)),
+            float(rospy.get_param("~init_pos_z", 0.78)),
+        ]
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        for i, adr in enumerate(self.qadr):
+            self.data.qpos[adr] = self.default_q[i]
+        mujoco.mj_forward(self.model, self.data)
+
+        self.sensors_pub = rospy.Publisher(
+            "/homie/sensors_data", HomieSensorsData, queue_size=10
+        )
+        self.js_pub = rospy.Publisher("/homie/joint_states", JointState, queue_size=10)
+        self.cmd_sub = rospy.Subscriber(
+            "/homie/joint_cmd", HomieJointCmd, self._on_cmd, queue_size=10
+        )
+
+        self._stop = False
+
+    def _on_cmd(self, msg: HomieJointCmd) -> None:
+        name_to_idx = {n: i for i, n in enumerate(self.joint_names)}
+        with self._lock:
+            if msg.name:
+                for i, name in enumerate(msg.name):
+                    if name not in name_to_idx:
+                        continue
+                    j = name_to_idx[name]
+                    if i < len(msg.joint_q):
+                        self.cmd_q[j] = msg.joint_q[i]
+                    if i < len(msg.joint_v):
+                        self.cmd_dq[j] = msg.joint_v[i]
+                    if i < len(msg.tau):
+                        self.cmd_tau[j] = msg.tau[i]
+                    if i < len(msg.joint_kp):
+                        self.cmd_kp[j] = msg.joint_kp[i]
+                    if i < len(msg.joint_kd):
+                        self.cmd_kd[j] = msg.joint_kd[i]
+                    if i < len(msg.control_mode):
+                        self.cmd_mode[j] = msg.control_mode[i]
+            else:
+                # positional: same order as joint_names
+                n = min(self.n, len(msg.joint_q))
+                self.cmd_q[:n] = msg.joint_q[:n]
+                if len(msg.joint_v) >= n:
+                    self.cmd_dq[:n] = msg.joint_v[:n]
+                if len(msg.tau) >= n:
+                    self.cmd_tau[:n] = msg.tau[:n]
+                if len(msg.joint_kp) >= n:
+                    self.cmd_kp[:n] = msg.joint_kp[:n]
+                if len(msg.joint_kd) >= n:
+                    self.cmd_kd[:n] = msg.joint_kd[:n]
+                if len(msg.control_mode) >= n:
+                    self.cmd_mode[:n] = msg.control_mode[:n]
+            self._have_cmd = True
+
+    def _read_state(self):
+        q = np.array([self.data.qpos[a] for a in self.qadr], dtype=np.float64)
+        dq = np.array([self.data.qvel[a] for a in self.dadr], dtype=np.float64)
+        quat = self.data.qpos[3:7].copy()
+        omega = self.data.qvel[3:6].copy()
+        # approximate linear acc from free-joint (not filtered)
+        acc = self.data.qacc[0:3].copy() if self.data.qacc.shape[0] >= 3 else np.zeros(3)
+        base_pos = self.data.qpos[0:3].copy()
+        return q, dq, quat, omega, acc, base_pos
+
+    def _apply_ctrl(self, q: np.ndarray, dq: np.ndarray) -> np.ndarray:
+        with self._lock:
+            cmd_q = self.cmd_q.copy()
+            cmd_dq = self.cmd_dq.copy()
+            cmd_tau = self.cmd_tau.copy()
+            kp = self.cmd_kp.copy()
+            kd = self.cmd_kd.copy()
+            mode = self.cmd_mode.copy()
+            have = self._have_cmd
+
+        if not have:
+            cmd_q = self.default_q
+            kp = self.hold_kp
+            kd = self.hold_kd
+            mode[:] = 0
+
+        tau = np.zeros(self.n, dtype=np.float64)
+        pd_mask = mode == 0
+        tau[pd_mask] = pd_torque(
+            cmd_q[pd_mask], q[pd_mask], kp[pd_mask], cmd_dq[pd_mask], dq[pd_mask], kd[pd_mask]
+        )
+        tau[~pd_mask] = cmd_tau[~pd_mask]
+
+        for i, aid in enumerate(self.act_ids):
+            self.data.ctrl[aid] = tau[i]
+        return tau
+
+    def _publish(self, q, dq, quat, omega, acc, base_pos, tau) -> None:
+        now = rospy.Time.now()
+        msg = HomieSensorsData()
+        msg.header = Header(stamp=now, frame_id="pelvis")
+        msg.sensor_time = now
+
+        jd = HomieJointData()
+        jd.name = list(self.joint_names)
+        jd.q = q.tolist()
+        jd.dq = dq.tolist()
+        jd.tau_est = tau.tolist()
+        msg.joint_data = jd
+
+        imu = HomieImuData()
+        imu.quat = quat.tolist()
+        imu.gyro = omega.tolist()
+        imu.acc = acc.tolist()
+        msg.imu_data = imu
+
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = base_pos
+        pose.orientation.w = quat[0]
+        pose.orientation.x = quat[1]
+        pose.orientation.y = quat[2]
+        pose.orientation.z = quat[3]
+        msg.base_pose = pose
+
+        self.sensors_pub.publish(msg)
+
+        js = JointState()
+        js.header = msg.header
+        js.name = list(self.joint_names)
+        js.position = q.tolist()
+        js.velocity = dq.tolist()
+        js.effort = tau.tolist()
+        self.js_pub.publish(js)
+
+    def spin(self) -> None:
+        period = 1.0 / self.pub_rate
+        steps_per_pub = max(1, int(round(period / self.sim_dt)))
+
+        def loop_body(viewer=None):
+            next_wall = time.perf_counter()
+            while not rospy.is_shutdown() and not self._stop:
+                if viewer is not None and not viewer.is_running():
+                    break
+                for _ in range(steps_per_pub):
+                    q, dq, quat, omega, acc, base_pos = self._read_state()
+                    tau = self._apply_ctrl(q, dq)
+                    mujoco.mj_step(self.model, self.data)
+                self._publish(q, dq, quat, omega, acc, base_pos, tau)
+                if viewer is not None:
+                    viewer.sync()
+                if self.realtime:
+                    next_wall += steps_per_pub * self.sim_dt
+                    sleep_t = next_wall - time.perf_counter()
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+                    else:
+                        next_wall = time.perf_counter()
+
+        if self.use_viewer:
+            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+                loop_body(viewer)
+        else:
+            loop_body(None)
+
+
+def main() -> None:
+    rospy.init_node("homie_mujoco_sim")
+    node = MujocoSimNode()
+    rospy.loginfo("homie_mujoco_sim ready (kuavo-style sensors/cmd bridge)")
+    try:
+        node.spin()
+    except rospy.ROSInterruptException:
+        pass
+
+
+if __name__ == "__main__":
+    main()

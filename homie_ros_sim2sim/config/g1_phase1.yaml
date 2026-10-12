@@ -1,0 +1,36 @@
+# Phase-1 mjlab HIM: 12-DOF legs, one-step obs = 80, history = 6.
+phase: 1
+obs_mode: mjlab
+action_scale: 0.25
+control_dt: 0.02
+obs_history_len: 6
+num_one_step_obs: 80
+# mjlab env_cfgs scales
+ang_vel_scale: 0.5
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+cmd_scale: [2.0, 2.0, 0.5]
+cmd_init: [0.0, 0.0, 0.0]
+height_cmd: 0.74
+clip_actions: 100.0
+grasp_obs_dim: 0
+hold_only_joints: []
+action_joints:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+
+# Prefer ONNX (HomieDeploy / kuavo style):
+#   python scripts/export_him_onnx.py \
+#     --checkpoint .../model_11000.pt \
+#     --output $(rospack find homie_ros_sim2sim)/policies/g1_phase1.onnx
+# policy_path: .../policies/g1_phase1.onnx

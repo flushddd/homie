@@ -15,7 +15,7 @@ register_mjlab_task(
   runner_cls=HomieOnPolicyRunner,
 )
 
-# Phase-2: 15-act (legs+waist), Homie grasp targets for waist, teacher mean/KL.
+# Phase-2: 14-act (legs+roll/pitch; yaw held), waist grasp targets, teacher mean/KL.
 # Resume a phase-1 checkpoint so ``learn()`` can clone it as teacher.
 register_mjlab_task(
   task_id="Mjlab-Homie-Flat-Unitree-G1-Phase2",
