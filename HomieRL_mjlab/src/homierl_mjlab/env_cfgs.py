@@ -496,7 +496,7 @@ def homie_g1_flat_env_cfg(
         "base_height_target": 0.74,
       },
     ),
-    # Zero-velocity stand: base sway + waist joint rocking (vel/pose).
+    # Zero-velocity stand: base sway + waist-pitch rocking (vel/pose).
     "stand_sway": RewardTermCfg(
       func=homie_mdp.stand_sway,
       weight=-1.0,
@@ -509,11 +509,7 @@ def homie_g1_flat_env_cfg(
         "waist_pos_weight": 0.25,
         "waist_cfg": SceneEntityCfg(
           "robot",
-          joint_names=(
-            "waist_yaw_joint",
-            "waist_roll_joint",
-            "waist_pitch_joint",
-          ),
+          joint_names=("waist_pitch_joint",),
         ),
       },
     ),
