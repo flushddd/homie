@@ -91,21 +91,33 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 def _configure_phase_commands_and_obs(
   cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
 ) -> None:
-  """Phase-2: Homie random grasp target (for waist), not arm pose curriculum."""
+  """Phase-2 grasp trail; both phases append 10-D container geometry at the end."""
   if int(phase) <= 1:
     cfg.commands.pop("grasp", None)
     actor_terms.pop("grasp_target", None)
-    return
+  else:
+    cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 4.0),
+      debug_vis=True,
+      base_height_target=0.74,
+    )
+    actor_terms["grasp_target"] = ObservationTermCfg(
+      func=homie_mdp.grasp_target_command,
+      params={"command_name": "grasp"},
+    )
 
-  cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
+  # Always last in actor/critic obs (after actions / grasp).
+  # Fixed 10-D container zeros in phase-1/2 (slot reserved; no signal yet).
+  cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
     entity_name="robot",
-    resampling_time_range=(4.0, 4.0),
-    debug_vis=True,
-    base_height_target=0.74,
+    randomize=False,
+    fixed_values=(0.0,) * 10,
+    debug_vis=False,
   )
-  actor_terms["grasp_target"] = ObservationTermCfg(
-    func=homie_mdp.grasp_target_command,
-    params={"command_name": "grasp"},
+  actor_terms["container_geom"] = ObservationTermCfg(
+    func=homie_mdp.container_geometry_command,
+    params={"command_name": "container"},
   )
 
 
@@ -236,18 +248,23 @@ def homie_g1_flat_env_cfg(
     ),
     "actions": ObservationTermCfg(func=vel_mdp.last_action),
   }
-  # Grasp obs must sit after actions and before critic-only lin_vel (Homie order).
+  # Grasp (phase-2) then container (10-D) after actions; critic adds lin_vel last.
   _configure_phase_commands_and_obs(cfg, phase, actor_terms)
   critic_terms = {
     **actor_terms,
     "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel, scale=1.0),
     # Homie critic appends base_lin_vel * obs_scales.lin_vel (2.0).
+    # Keep after proprio; container stays at actor tail via shared actor_terms.
     "base_lin_vel": ObservationTermCfg(
       func=vel_mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_lin_vel"},
       scale=2.0,
     ),
   }
+  # Re-append container so it remains the final critic term after lin_vel.
+  if "container_geom" in critic_terms:
+    c_term = critic_terms.pop("container_geom")
+    critic_terms["container_geom"] = c_term
   cfg.observations = {
     "actor": ObservationGroupCfg(
       terms=actor_terms,
@@ -479,7 +496,7 @@ def homie_g1_flat_env_cfg(
         "base_height_target": 0.74,
       },
     ),
-    # Zero-velocity stand: penalize base sway (front-back / side rock).
+    # Zero-velocity stand: base sway + waist joint rocking (vel/pose).
     "stand_sway": RewardTermCfg(
       func=homie_mdp.stand_sway,
       weight=-1.0,
@@ -488,6 +505,16 @@ def homie_g1_flat_env_cfg(
         "cmd_threshold": 0.1,
         "base_height_target": 0.74,
         "stand_height_threshold": 0.735,
+        "waist_vel_weight": 1.0,
+        "waist_pos_weight": 0.25,
+        "waist_cfg": SceneEntityCfg(
+          "robot",
+          joint_names=(
+            "waist_yaw_joint",
+            "waist_roll_joint",
+            "waist_pitch_joint",
+          ),
+        ),
       },
     ),
   }

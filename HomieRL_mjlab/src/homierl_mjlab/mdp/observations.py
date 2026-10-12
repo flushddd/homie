@@ -47,3 +47,23 @@ def grasp_target_command(
 ) -> torch.Tensor:
   """Homie waist-grasp obs: ``[is_target, is_waist, extend_dist, tx, ty, tz, arm]``."""
   return env.command_manager.get_command(command_name)
+
+
+def container_geometry_command(
+  env: ManagerBasedRlEnv,
+  command_name: str = "container",
+  scale: tuple[float, ...] | None = None,
+) -> torch.Tensor:
+  """10-D container geometry at obs tail.
+
+  ``[x_c, y_c, z_b, s_x, s_y, h_c, b_rect, b_circle, t_wall, t_bottom]``.
+  Shape flags stay in {0,1}; optional per-dim ``scale`` multiplies the vector
+  (train/deploy must match). Default: identity (meters / raw flags).
+  """
+  cmd = env.command_manager.get_command(command_name)
+  if scale is None:
+    return cmd
+  s = torch.tensor(scale, device=cmd.device, dtype=cmd.dtype)
+  if s.numel() != cmd.shape[-1]:
+    raise ValueError(f"container scale len {s.numel()} != cmd dim {cmd.shape[-1]}")
+  return cmd * s

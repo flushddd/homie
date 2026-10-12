@@ -9,6 +9,7 @@ from .rl_cfg import homie_g1_him_runner_cfg
 # Phase-1: legs-only + PD-hold upper body (loco / squat).
 register_mjlab_task(
   task_id="Mjlab-Homie-Flat-Unitree-G1",
+  # Phase-1 actor one-step: proprio+12 act+10 container = 90.
   env_cfg=homie_g1_flat_env_cfg(phase=1),
   play_env_cfg=homie_g1_flat_env_cfg(play=True, phase=1),
   rl_cfg=homie_g1_him_runner_cfg(phase=1),

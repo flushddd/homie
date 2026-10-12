@@ -436,7 +436,10 @@ class HIMPPO:
     n_act = int(self.actor_critic.num_actions)
     proprio = 10 + 2 * int(self.num_dof)
     base = (h - 1) * d
-    if d >= proprio + n_act + 2:
+    trail = d - proprio - n_act
+    # Grasp (7) sits right after actions; container-only trail is exactly 10.
+    # Phase-2 trail = grasp(7) + container(10) = 17.
+    if trail >= 7 and trail != 10:
       is_waist = obs_batch[:, base + proprio + n_act + 1]
       return (is_waist < 0.5).float()
     height = obs_batch[:, base + 3]

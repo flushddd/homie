@@ -764,14 +764,25 @@ def stand_sway(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  waist_cfg: SceneEntityCfg = SceneEntityCfg(
+    "robot",
+    joint_names=(
+      "waist_yaw_joint",
+      "waist_roll_joint",
+      "waist_pitch_joint",
+    ),
+  ),
   cmd_threshold: float = 0.1,
   base_height_target: float = 0.74,
   stand_height_threshold: float = 0.735,
+  waist_vel_weight: float = 1.0,
+  waist_pos_weight: float = 0.25,
 ) -> torch.Tensor:
-  """Penalize base sway when velocity command is ~0 at stand height.
+  """Penalize base + waist sway when velocity command is ~0 at stand height.
 
-  Uses body-frame lin_vel_xy^2 + ang_vel_xy^2. Gated so walking / squat
-  height tracking are not over-penalized.
+  Base: body-frame lin_vel_xy^2 + ang_vel_xy^2.
+  Waist: joint_vel^2 (来回晃动) + deviation from default pose^2.
+  Gated so walking / squat height tracking are not over-penalized.
   """
   asset: Entity = env.scene[asset_cfg.name]
   cmd = env.command_manager.get_command(command_name)
@@ -781,4 +792,16 @@ def stand_sway(
   gate = zero_cmd * stand
   lin_xy = torch.sum(torch.square(asset.data.root_link_lin_vel_b[:, :2]), dim=-1)
   ang_xy = torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=-1)
-  return (lin_xy + ang_xy) * gate
+
+  waist_cfg.resolve(env.scene)
+  w_ids = waist_cfg.joint_ids
+  waist_vel = torch.sum(torch.square(asset.data.joint_vel[:, w_ids]), dim=-1)
+  default_q = asset.data.default_joint_pos[:, w_ids]
+  waist_pos = torch.sum(torch.square(asset.data.joint_pos[:, w_ids] - default_q), dim=-1)
+
+  return (
+    lin_xy
+    + ang_xy
+    + float(waist_vel_weight) * waist_vel
+    + float(waist_pos_weight) * waist_pos
+  ) * gate

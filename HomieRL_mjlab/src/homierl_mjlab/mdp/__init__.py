@@ -9,8 +9,14 @@ from .events import (
   reset_upper_body_curriculum,
   update_upper_body_pose_curriculum,
 )
+from .container_commands import ContainerGeometryCommand, ContainerGeometryCommandCfg
 from .grasp_commands import GraspTargetCommand, GraspTargetCommandCfg
-from .observations import grasp_target_command, height_command, twist_command_xy_yaw
+from .observations import (
+  container_geometry_command,
+  grasp_target_command,
+  height_command,
+  twist_command_xy_yaw,
+)
 from .rewards import (
   action_vanish,
   ang_vel_xy,
@@ -49,6 +55,8 @@ from .rewards import (
 )
 
 __all__ = [
+  "ContainerGeometryCommand",
+  "ContainerGeometryCommandCfg",
   "CurriculumScheduler",
   "GraspTargetCommand",
   "GraspTargetCommandCfg",
@@ -57,6 +65,7 @@ __all__ = [
   "action_vanish",
   "ang_vel_xy",
   "contact_momentum",
+  "container_geometry_command",
   "deviation_ankle_joint",
   "deviation_hip_joint",
   "deviation_knee_joint",

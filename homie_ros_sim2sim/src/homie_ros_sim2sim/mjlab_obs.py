@@ -24,8 +24,10 @@ def build_mjlab_one_step(
     dof_pos_scale: float = 1.0,
     dof_vel_scale: float = 0.05,
     grasp_extras: Optional[np.ndarray] = None,
+    container_extras: Optional[np.ndarray] = None,
+    container_dim: int = 0,
 ) -> np.ndarray:
-    """Phase-1 one-step = 80; phase-2 appends grasp trail after actions."""
+    """Phase-1 one-step = 80+10 container; phase-2 adds grasp before container."""
     qj = (joint_q - default_angles) * dof_pos_scale
     dqj = joint_dq * dof_vel_scale
     grav = get_gravity_orientation(quat_wxyz)
@@ -43,6 +45,10 @@ def build_mjlab_one_step(
     ]
     if grasp_extras is not None and len(grasp_extras) > 0:
         parts.append(np.asarray(grasp_extras, dtype=np.float32).reshape(-1))
+    if container_extras is not None and len(container_extras) > 0:
+        parts.append(np.asarray(container_extras, dtype=np.float32).reshape(-1))
+    elif container_dim > 0:
+        parts.append(np.zeros(container_dim, dtype=np.float32))
     return np.concatenate(parts, axis=0)
 
 

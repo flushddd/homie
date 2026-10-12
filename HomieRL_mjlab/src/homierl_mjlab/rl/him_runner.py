@@ -501,16 +501,20 @@ class HomieOnPolicyRunner:
     new_act: int,
     old_trailing: int = 0,
     new_trailing: int = 0,
+    old_trailing_end_offset: int = 0,
   ) -> torch.Tensor:
     """Copy Linear-in weights when actions / post-action obs grow.
 
-    Layout: ``[proprio | actions | trailing]``. New action dims and new
-    trailing prefix (e.g. grasp) stay zero; old trailing is kept at the end.
+    Layout: ``[proprio | actions | trailing]``. New slots stay zero.
+    ``old_trailing_end_offset`` shifts the old trailing block away from the
+    new vector end (e.g. 10 leaves room for container after lin_vel).
     """
     if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
       return old_w
     proprio = old_one - old_act - old_trailing
     if new_one != proprio + new_act + new_trailing or proprio < 0:
+      return old_w
+    if old_trailing_end_offset < 0 or old_trailing + old_trailing_end_offset > new_trailing:
       return old_w
     new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
     for t in range(hist):
@@ -521,7 +525,8 @@ class HomieOnPolicyRunner:
         :, o0 + proprio : o0 + proprio + old_act
       ]
       if old_trailing > 0:
-        new_w[:, n0 + new_one - old_trailing : n0 + new_one] = old_w[
+        n_end = n0 + new_one - old_trailing_end_offset
+        new_w[:, n_end - old_trailing : n_end] = old_w[
           :, o0 + old_one - old_trailing : o0 + old_one
         ]
     return new_w
@@ -543,21 +548,25 @@ class HomieOnPolicyRunner:
       old_one = int(enc.shape[1] // hist_a)
     else:
       old_one = new_one - (new_act - old_act)
-    # Actor trailing = grasp extras; critic trailing = grasp + lin_vel.
+    # Trailing after actions: grasp (phase-2) + container(10); critic also has lin_vel.
     actor_new_trail = new_one - (old_one - old_act + new_act)
     actor_old_trail = 0
-    critic_old_trail = 3
+    critic_old_trail = 3  # base_lin_vel only on legacy phase-1 critic
     critic_new_trail = new_one_c - (old_one - old_act + new_act)
     old_one_c = old_one + critic_old_trail
+    # Container (10) sits at the very end of critic; keep old lin_vel just before it.
+    container_trail = 10 if critic_new_trail >= critic_old_trail + 10 else 0
     if actor_new_trail < 0 or critic_new_trail < critic_old_trail:
       print("[WARN] unexpected obs expand sizes; falling back to strict-compatible keys")
       actor_new_trail = max(actor_new_trail, 0)
       critic_new_trail = max(critic_new_trail, critic_old_trail)
+      container_trail = 0
 
     latent = 3 + int(getattr(ac, "dynamic_latent_dim", 32))
     print(
       f"[INFO] Remap obs/act: one_step {old_one}->{new_one}, "
-      f"act {old_act}->{new_act}, grasp_trail={actor_new_trail}"
+      f"act {old_act}->{new_act}, trail={actor_new_trail}, "
+      f"critic_trail={critic_new_trail}"
     )
 
     out: dict[str, torch.Tensor] = {}
@@ -641,6 +650,7 @@ class HomieOnPolicyRunner:
           new_act=new_act,
           old_trailing=critic_old_trail,
           new_trailing=critic_new_trail,
+          old_trailing_end_offset=container_trail,
         )
         continue
 
@@ -659,7 +669,7 @@ class HomieOnPolicyRunner:
       k in loaded_sd and loaded_sd[k].shape != cur_sd[k].shape for k in cur_sd
     )
     if need_expand:
-      print("[INFO] Expanding phase-1 (12-act) weights → phase-2 network")
+      print("[INFO] Expanding checkpoint weights to current obs/action dims")
       loaded_sd = self._expand_phase1_to_phase2_state_dict(loaded_sd)
       strict = False
     self.alg.actor_critic.load_state_dict(loaded_sd, strict=strict)
@@ -667,7 +677,7 @@ class HomieOnPolicyRunner:
     if "optimizer_state_dict" in loaded and not need_expand:
       self.alg.optimizer.load_state_dict(loaded["optimizer_state_dict"])
     elif need_expand:
-      print("[INFO] Skipping optimizer load after action-dim expand")
+      print("[INFO] Skipping optimizer load after obs/action-dim expand")
     if "estimator_optimizer_state_dict" in loaded and not need_expand:
       self.alg.actor_critic.estimator.optimizer.load_state_dict(
         loaded["estimator_optimizer_state_dict"]
