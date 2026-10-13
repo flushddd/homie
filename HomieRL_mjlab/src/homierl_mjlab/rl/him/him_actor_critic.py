@@ -180,6 +180,8 @@ class HIMActorCritic(nn.Module):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args = False
+        # Match Homie / runner clip_actions; also caps NaN recovery.
+        self.action_mean_clip = 100.0
 
     @staticmethod
     # not used at the moment
@@ -187,6 +189,53 @@ class HIMActorCritic(nn.Module):
         [torch.nn.init.orthogonal_(module.weight, gain=scales[idx]) for idx, module in
          enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
 
+    def _sanitize_action_mean(self, action_mean: torch.Tensor) -> torch.Tensor:
+        """Replace non-finite values and clamp to keep Normal(loc) valid."""
+        if not torch.isfinite(action_mean).all():
+            # One-time warn per blow-up burst (throttle via attribute).
+            if not getattr(self, "_warned_nonfinite_mean", False):
+                n_bad = int((~torch.isfinite(action_mean)).sum().item())
+                print(
+                    f"[WARN] actor mean non-finite ({n_bad} elems); "
+                    "nan_to_num + clamp applied"
+                )
+                self._warned_nonfinite_mean = True
+            action_mean = torch.nan_to_num(
+                action_mean, nan=0.0, posinf=self.action_mean_clip, neginf=-self.action_mean_clip
+            )
+        else:
+            self._warned_nonfinite_mean = False
+        return action_mean.clamp(-self.action_mean_clip, self.action_mean_clip)
+
+    def _actor_forward(self, obs_history: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            vel, dynamic_latent = self.estimator(
+                obs_history[:, 0 : self.actor_proprioceptive_obs_length]
+            )
+        if self.actor_use_height:
+            terrain_latent = self.terrain_encoder(
+                obs_history[
+                    :, -(self.num_height_points + self.num_one_step_obs) :
+                ]
+            )
+            actor_input = torch.cat(
+                (
+                    obs_history[
+                        :,
+                        -(self.num_height_points + self.num_one_step_obs) : -self.num_height_points,
+                    ],
+                    vel,
+                    dynamic_latent,
+                    terrain_latent,
+                ),
+                dim=-1,
+            )
+        else:
+            actor_input = torch.cat(
+                (obs_history[:, -self.num_one_step_obs :], vel, dynamic_latent),
+                dim=-1,
+            )
+        return self._sanitize_action_mean(self.actor(actor_input))
 
     def reset(self, dones=None):
         pass
@@ -207,15 +256,10 @@ class HIMActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, obs_history):
-        with torch.no_grad():
-            vel, dynamic_latent = self.estimator(obs_history[:, 0:self.actor_proprioceptive_obs_length])
-        if self.actor_use_height:
-            terrain_latent = self.terrain_encoder(obs_history[:,-(self.num_height_points + self.num_one_step_obs):])
-            actor_input = torch.cat((obs_history[:,-(self.num_height_points + self.num_one_step_obs):-self.num_height_points], vel, dynamic_latent, terrain_latent), dim=-1)
-        else:
-            actor_input = torch.cat((obs_history[:,-self.num_one_step_obs:], vel, dynamic_latent), dim=-1)
-        action_mean = self.actor(actor_input)
-        self.distribution = Normal(action_mean, action_mean*0. + self.std)
+        action_mean = self._actor_forward(obs_history)
+        # Keep std positive; expand to batch for broadcasting safety.
+        std = self.std.clamp(min=1e-4).expand_as(action_mean)
+        self.distribution = Normal(action_mean, std, validate_args=False)
 
     def act(self, obs_history=None, **kwargs):
         self.update_distribution(obs_history)
@@ -225,19 +269,11 @@ class HIMActorCritic(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, obs_history, observations=None):
-        with torch.no_grad():
-            vel, dynamic_latent = self.estimator(obs_history[:, 0:self.actor_proprioceptive_obs_length])
-        if self.actor_use_height:
-            terrain_latent = self.terrain_encoder(obs_history[:,-(self.num_height_points + self.num_one_step_obs):])
-            actor_input = torch.cat((obs_history[:,-(self.num_height_points + self.num_one_step_obs):-self.num_height_points], vel, dynamic_latent, terrain_latent), dim=-1)
-        else:
-            actor_input = torch.cat((obs_history[:,-self.num_one_step_obs:], vel, dynamic_latent), dim=-1)
-        action_mean = self.actor(actor_input)
-        return action_mean
+        return self._actor_forward(obs_history)
 
     def evaluate(self, critic_observations, **kwargs):
         value = self.critic(critic_observations)
-        return value
+        return torch.nan_to_num(value, nan=0.0, posinf=1e6, neginf=-1e6)
     
     def update_estimator(self, obs_history, next_critic_obs, lr=None):
         return self.estimator.update(obs_history[:, 0:self.actor_proprioceptive_obs_length], next_critic_obs[:, 0:self.critic_proprioceptive_obs_length], lr)

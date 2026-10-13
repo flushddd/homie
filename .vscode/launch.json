@@ -131,6 +131,66 @@
       ]
     },
     {
+      "name": "HomieRL mjlab: Resume Phase1 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.resume",
+        "True",
+        "--agent.load-run",
+        "${input:homieResumeRun}",
+        "--agent.load-checkpoint",
+        "${input:homieResumeCkpt}",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Resume Phase2 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase2",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.resume",
+        "True",
+        "--agent.load-run",
+        "${input:homieResumePhase2Run}",
+        "--agent.load-checkpoint",
+        "${input:homieResumePhase2Ckpt}",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
       "name": "HomieRL mjlab: TensorBoard",
       "type": "debugpy",
       "request": "launch",
@@ -207,6 +267,14 @@
         "HomieRL mjlab: TensorBoard"
       ],
       "stopAll": true
+    },
+    {
+      "name": "HomieRL mjlab: Resume Phase1 + TensorBoard",
+      "configurations": [
+        "HomieRL mjlab: Resume Phase1 (4096)",
+        "HomieRL mjlab: TensorBoard"
+      ],
+      "stopAll": true
     }
   ],
   "inputs": [
@@ -227,6 +295,30 @@
       "type": "promptString",
       "description": "Phase-1 checkpoint filename",
       "default": "model_11000.pt"
+    },
+    {
+      "id": "homieResumeRun",
+      "type": "promptString",
+      "description": "Phase-1 run folder to resume (under logs/rsl_rl/homie_g1/)",
+      "default": "2026-10-10_16-30-36"
+    },
+    {
+      "id": "homieResumeCkpt",
+      "type": "promptString",
+      "description": "Checkpoint to resume (prefer pre-crash, e.g. model_9000.pt)",
+      "default": "model_9000.pt"
+    },
+    {
+      "id": "homieResumePhase2Run",
+      "type": "promptString",
+      "description": "Phase-2 run folder to resume (under logs/rsl_rl/homie_g1/)",
+      "default": "2026-10-11_17-12-56_phase2"
+    },
+    {
+      "id": "homieResumePhase2Ckpt",
+      "type": "promptString",
+      "description": "Phase-2 checkpoint filename",
+      "default": "model_18800.pt"
     },
     {
       "id": "homiePhase2Checkpoint",

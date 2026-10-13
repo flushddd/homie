@@ -142,7 +142,10 @@ class HIMPPO:
 
   def process_env_step(self, rewards, dones, infos, next_critic_obs):
     self.transition.next_critic_observations = next_critic_obs.clone()
-    self.transition.rewards = rewards.clone()
+    # Guard against reward spikes / NaNs that later poison value targets.
+    self.transition.rewards = torch.nan_to_num(
+      rewards, nan=0.0, posinf=100.0, neginf=-100.0
+    ).clamp(-100.0, 100.0)
     self.transition.dones = dones
 
     if self.use_flip:

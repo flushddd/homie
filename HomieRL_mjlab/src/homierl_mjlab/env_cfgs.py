@@ -497,9 +497,10 @@ def homie_g1_flat_env_cfg(
       },
     ),
     # Zero-velocity stand: base sway + waist-pitch rocking (vel/pose).
+    # Weight kept moderate; raw term is already clamped to avoid PPO blow-ups.
     "stand_sway": RewardTermCfg(
       func=homie_mdp.stand_sway,
-      weight=-1.0,
+      weight=-0.5,
       params={
         "command_name": "twist",
         "cmd_threshold": 0.1,

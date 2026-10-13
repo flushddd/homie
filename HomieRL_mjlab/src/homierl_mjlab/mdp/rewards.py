@@ -774,30 +774,41 @@ def stand_sway(
   waist_vel_weight: float = 1.0,
   waist_pos_weight: float = 0.25,
 ) -> torch.Tensor:
-  """Penalize base + waist-pitch sway when velocity command is ~0 at stand height.
+  """Penalize base + waist-pitch sway when velocity command is ~0.
 
   Base: body-frame lin_vel_xy^2 + ang_vel_xy^2.
   Waist pitch: joint_vel^2 (前后晃动) + deviation from default pose^2.
-  Gated so walking / squat height tracking are not over-penalized.
+  Gated by zero-cmd only (applies during stand and squat when vx/vy/yaw≈0).
   """
   asset: Entity = env.scene[asset_cfg.name]
   cmd = env.command_manager.get_command(command_name)
+  # Gate only on ~zero vel cmd (your change): also active while squatting.
+  # ``stand_height_threshold`` / ``base_height_target`` kept for cfg compat.
+  _ = (base_height_target, stand_height_threshold)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < cmd_threshold).float()
-  h_target = _command_height_target(env, command_name, base_height_target)
-  stand = (h_target >= stand_height_threshold).float()
-  gate = zero_cmd 
+  gate = zero_cmd
+
   lin_xy = torch.sum(torch.square(asset.data.root_link_lin_vel_b[:, :2]), dim=-1)
   ang_xy = torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=-1)
 
   waist_cfg.resolve(env.scene)
   w_ids = waist_cfg.joint_ids
-  waist_vel = torch.sum(torch.square(asset.data.joint_vel[:, w_ids]), dim=-1)
+  # Clamp so a single spike cannot NaN PPO value targets.
+  waist_vel = torch.sum(
+    torch.square(asset.data.joint_vel[:, w_ids].clamp(-20.0, 20.0)), dim=-1
+  )
   default_q = asset.data.default_joint_pos[:, w_ids]
-  waist_pos = torch.sum(torch.square(asset.data.joint_pos[:, w_ids] - default_q), dim=-1)
+  waist_pos = torch.sum(
+    torch.square(
+      (asset.data.joint_pos[:, w_ids] - default_q).clamp(-1.5, 1.5)
+    ),
+    dim=-1,
+  )
 
-  return (
-    lin_xy
-    + ang_xy
+  out = (
+    lin_xy.clamp(max=25.0)
+    + ang_xy.clamp(max=25.0)
     + float(waist_vel_weight) * waist_vel
     + float(waist_pos_weight) * waist_pos
   ) * gate
+  return torch.nan_to_num(out, nan=0.0, posinf=25.0, neginf=0.0)
