@@ -496,8 +496,7 @@ def homie_g1_flat_env_cfg(
         "base_height_target": 0.74,
       },
     ),
-    # Zero-velocity stand: base sway + waist-pitch rocking (vel/pose).
-    # Weight kept moderate; raw term is already clamped to avoid PPO blow-ups.
+    # Zero-velocity: base sway + waist-pitch rocking.
     "stand_sway": RewardTermCfg(
       func=homie_mdp.stand_sway,
       weight=-0.5,
@@ -511,6 +510,21 @@ def homie_g1_flat_env_cfg(
         "waist_cfg": SceneEntityCfg(
           "robot",
           joint_names=("waist_pitch_joint",),
+        ),
+      },
+    ),
+    # Non-zero motion cmd: penalize waist-roll lateral rocking.
+    "loco_waist_roll_sway": RewardTermCfg(
+      func=homie_mdp.loco_waist_roll_sway,
+      weight=-0.5,
+      params={
+        "command_name": "twist",
+        "cmd_threshold": 0.1,
+        "waist_vel_weight": 1.0,
+        "waist_pos_weight": 0.5,
+        "waist_cfg": SceneEntityCfg(
+          "robot",
+          joint_names=("waist_roll_joint",),
         ),
       },
     ),

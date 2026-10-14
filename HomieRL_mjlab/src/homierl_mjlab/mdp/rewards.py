@@ -812,3 +812,43 @@ def stand_sway(
     + float(waist_pos_weight) * waist_pos
   ) * gate
   return torch.nan_to_num(out, nan=0.0, posinf=25.0, neginf=0.0)
+
+
+def loco_waist_roll_sway(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+  waist_cfg: SceneEntityCfg = SceneEntityCfg(
+    "robot",
+    joint_names=("waist_roll_joint",),
+  ),
+  cmd_threshold: float = 0.1,
+  waist_vel_weight: float = 1.0,
+  waist_pos_weight: float = 0.5,
+) -> torch.Tensor:
+  """Penalize waist-roll rocking while there is a non-zero motion command.
+
+  Complements ``stand_sway`` (pitch @ zero-cmd): when walking / turning,
+  discourage lateral waist roll oscillation (joint_vel^2 + pose error^2).
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  cmd = env.command_manager.get_command(command_name)
+  moving = (torch.norm(cmd[:, :3], dim=-1) >= cmd_threshold).float()
+
+  waist_cfg.resolve(env.scene)
+  w_ids = waist_cfg.joint_ids
+  waist_vel = torch.sum(
+    torch.square(asset.data.joint_vel[:, w_ids].clamp(-20.0, 20.0)), dim=-1
+  )
+  default_q = asset.data.default_joint_pos[:, w_ids]
+  waist_pos = torch.sum(
+    torch.square(
+      (asset.data.joint_pos[:, w_ids] - default_q).clamp(-1.5, 1.5)
+    ),
+    dim=-1,
+  )
+
+  out = (
+    float(waist_vel_weight) * waist_vel + float(waist_pos_weight) * waist_pos
+  ) * moving
+  return torch.nan_to_num(out, nan=0.0, posinf=25.0, neginf=0.0)
