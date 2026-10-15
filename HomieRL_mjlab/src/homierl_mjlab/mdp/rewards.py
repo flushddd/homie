@@ -106,9 +106,28 @@ def _command_height_target(
   command_name: str,
   base_height_target: float,
 ) -> torch.Tensor:
-  """Absolute base-height target from twist+height command channel 3."""
+  """Absolute base-height target (Homie ``tracking_base_height`` / ``lin_vel_z``).
+
+  Default: ``base + twist_height_offset``.
+  When grasp ``is_target_height``: ``h_ref`` from body-frame ``target_z``::
+
+      h_ref = clamp(target_z + 0.64, 0.25, 0.74)  if target_z < 0 else 0.74
+  """
   cmd = env.command_manager.get_command(command_name)
-  return base_height_target + cmd[:, 3]
+  h = base_height_target + cmd[:, 3]
+  grasp = _grasp_term(env)
+  if grasp is None:
+    return h
+  mask = grasp.is_target_height.squeeze(-1) > 0.5
+  if not torch.any(mask):
+    return h
+  tz = grasp.target_position[:, 2]
+  h_ref = torch.where(
+    tz < 0.0,
+    torch.clamp(tz + 0.64, min=0.25, max=0.74),
+    torch.full_like(tz, float(base_height_target)),
+  )
+  return torch.where(mask, h_ref, h)
 
 
 def _foot_site_ids(asset: Entity) -> list[int]:
@@ -364,7 +383,7 @@ def deviation_waist_joint(
     torch.abs(joint_deviation - 0.5)
     * (1.0 - need_waist).unsqueeze(-1)
     * waist_mask.unsqueeze(-1)
-    * 0.55
+    * 0.59
   )
   dist_loss = (
     loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * need_waist.unsqueeze(-1) * 2.2
@@ -763,6 +782,7 @@ def stand_still(
 def stand_sway(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
+  grasp_command_name: str = "grasp",
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
   waist_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot",
@@ -774,11 +794,11 @@ def stand_sway(
   waist_vel_weight: float = 1.0,
   waist_pos_weight: float = 0.25,
 ) -> torch.Tensor:
-  """Penalize base + waist-pitch sway when velocity command is ~0.
+  """Penalize base (+ optional waist-pitch) sway when velocity command is ~0.
 
-  Base: body-frame lin_vel_xy^2 + ang_vel_xy^2.
-  Waist pitch: joint_vel^2 (前后晃动) + deviation from default pose^2.
-  Gated by zero-cmd only (applies during stand and squat when vx/vy/yaw≈0).
+  Base: body-frame lin_vel_xy^2 + ang_vel_xy^2 (always; helps balance).
+  Waist pitch: only when **not** in grasp waist mode — otherwise this term
+  fights ``deviation_waist_joint`` (TB: stand_sway≈-0.8 vs waist≈-4e-4).
   """
   asset: Entity = env.scene[asset_cfg.name]
   cmd = env.command_manager.get_command(command_name)
@@ -804,12 +824,21 @@ def stand_sway(
     ),
     dim=-1,
   )
+  # Gate: 有腰目标的环境 (is_waist) 不罚腰 pitch；无罚底座晃动保平衡。
+  grasp = _grasp_term(env, grasp_command_name)
+  if grasp is not None:
+    not_waist = (grasp.is_waist.squeeze(-1) < 0.5).float()
+  else:
+    not_waist = torch.ones(env.num_envs, device=env.device)
 
   out = (
     lin_xy.clamp(max=25.0)
     + ang_xy.clamp(max=25.0)
-    + float(waist_vel_weight) * waist_vel
-    + float(waist_pos_weight) * waist_pos
+    + (
+      float(waist_vel_weight) * waist_vel
+      + float(waist_pos_weight) * waist_pos
+    )
+    * not_waist
   ) * gate
   return torch.nan_to_num(out, nan=0.0, posinf=25.0, neginf=0.0)
 

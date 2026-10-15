@@ -573,5 +573,9 @@ def homie_g1_flat_env_cfg(
     twist = cfg.commands["twist"]
     twist.resampling_time_range = (1e9, 1e9)
     twist.rel_standing_envs = 0.0
+    # Phase-2: freeze grasp resample so Viser target_x/y/z owns the viewed env.
+    grasp = cfg.commands.get("grasp")
+    if grasp is not None:
+      grasp.resampling_time_range = (1e9, 1e9)
 
   return cfg

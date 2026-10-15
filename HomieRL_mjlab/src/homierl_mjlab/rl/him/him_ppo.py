@@ -217,13 +217,14 @@ class HIMPPO:
         loco_mask = self._loco_mask(obs_batch)
         mask_count = loco_mask.sum().clamp(min=1.0)
         diff = (mu_batch[:, :k] - teacher_mu[:, :k]) * loco_mask.unsqueeze(-1)
-        # Keep student grads on mean + KL (Homie detaches student KL → no KL grad).
+        # Homie ``_kl_diag_gauss`` detaches student → KL has no grad; mean L2
+        # carries the keep signal (selective on non-waist envs).
         kl = self._kl_diag_gauss(
           mu_batch[:, :k],
           sigma_batch[:, :k],
           teacher_mu[:, :k],
           teacher_sigma[:, :k],
-          detach_student=False,
+          detach_student=True,
         ) * loco_mask
         loss_keep = (kl.sum() + (diff * diff).sum()) / (mask_count * float(k))
 
@@ -428,22 +429,21 @@ class HIMPPO:
       f"dims={self.keep_loco_dims}, freeze_std={self.freeze_std_dims}"
     )
 
-  def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
-    """Homie keep mask: lock loco only when NOT in waist/grasp mode.
+  # Phase-2 one-step actor layout (29-DoF G1 + 14-act + grasp7 + container10):
+  #   twist3|h1|ang3|grav3|q29|dq29|a14|grasp7|container10  → d=99
+  #   grasp = [is_target, is_waist, ...] → is_waist at index 83
+  # Homie used a hard index (``obs[:, 99]``); we do the same for the last history step.
+  _IS_WAIST_ONE_STEP_IDX = 83
 
-    Phase-2 one-step ends with grasp ``[is_target, is_waist, ...]``. Phase-1
-    falls back to near-stand absolute height.
-    """
+  def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
+    """Homie keep mask: lock loco only when NOT in waist mode (``is_waist < 0.5``)."""
     d = int(self.actor_critic.num_one_step_obs)
     h = int(self.actor_critic.actor_history_length)
-    n_act = int(self.actor_critic.num_actions)
-    proprio = 10 + 2 * int(self.num_dof)
     base = (h - 1) * d
-    trail = d - proprio - n_act
-    # Grasp (7) sits right after actions; container-only trail is exactly 10.
-    # Phase-2 trail = grasp(7) + container(10) = 17.
-    if trail >= 7 and trail != 10:
-      is_waist = obs_batch[:, base + proprio + n_act + 1]
+    idx = self._IS_WAIST_ONE_STEP_IDX
+    if d > idx:
+      # Last history frame, fixed slot (e.g. flat index 5*99+83=578 when h=6).
+      is_waist = obs_batch[:, base + idx]
       return (is_waist < 0.5).float()
     height = obs_batch[:, base + 3]
     return (torch.abs(height - self.stand_height) < self.keep_height_tol).float()

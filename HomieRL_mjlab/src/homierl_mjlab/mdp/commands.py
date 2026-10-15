@@ -136,15 +136,10 @@ class TwistHeightCommand(UniformVelocityCommand):
         allow_h, h_off, torch.zeros_like(h_off)
       )
       self.is_height_env[env_ids] = allow_h
-      # Homie also refreshes target_z inside _resample_commands.
-      grasp.resample_target_z(env_ids)
-      # Waist-active envs: force stand (arm reach path is disabled).
-      if torch.any(is_w):
-        self.height_command[env_ids[is_w]] = 0.0
-        self.vel_command_b[env_ids[is_w]] = 0.0
-        self.vel_command_w[env_ids[is_w]] = 0.0
-        self.is_standing_env[env_ids[is_w]] = True
-        self.is_height_env[env_ids[is_w]] = False
+      # Homie refreshes target_z inside _resample_commands:
+      #   z = U(pos_z) * is_height * is_target_height + 0.3
+      grasp.resample_target_z(env_ids, is_height=is_height, is_target_height=is_target_height)
+      # Homie zeros vel on waist / target, but keeps height sample above.
       return
 
     # Phase-1 (no grasp): original set_x bands.
