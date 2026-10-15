@@ -1,94 +1,102 @@
 <br>
 <p align="center">
-<h1 align="center"><strong>HOMIE: Humanoid Loco-Manipulation with Isomorphic Exoskeleton Cockpit (RL)</strong></h1>
+<h1 align="center"><strong>Bend-Grasper</strong></h1>
+<h3 align="center">Target-Conditioned Whole-Body Control for Cross-Reach-Domain Humanoid Grasping</h3>
   <p align="center">
-    <a href='https://www.qingweiben.com' target='_blank'>Qingwei Ben*</a>, <a href='https://trap-1.github.io/' target='_blank'>Feiyu Jia*</a>, <a href='https://scholar.google.com/citations?user=kYrUfMoAAAAJ&hl=zh-CN' target='_blank'>Jia Zeng</a>, <a href='https://jtdong.com/' target='_blank'>Junting Dong</a>, <a href='https://dahua.site/' target='_blank'>Dahua Lin</a>, <a href='https://oceanpang.github.io/' target='_blank'>Jiangmiao Pang</a>
-    <br>
-    * Equal Controlbution
-    <br>
-    Shanghai Artificial Intelligence Laboratory & The Chinese University of Hong Kong
-    <br>
+    zijieliu
   </p>
 </p>
 
 <div id="top" align="center">
 
-[![arXiv](https://img.shields.io/badge/arXiv-2502.13013-orange)](https://arxiv.org/abs/2502.13013)
-[![](https://img.shields.io/badge/Project-%F0%9F%9A%80-pink)](https://homietele.github.io/)
-[![](https://img.shields.io/badge/Youtube-🎬-red)](https://www.youtube.com/watch?v=FxkGmjyMc5g&feature=youtu.be)
-<!-- [![](https://img.shields.io/badge/bilibili-📹-blue)]() -->
+<!-- badges: add links when paper / project page are public -->
+<!-- [![arXiv](https://img.shields.io/badge/arXiv-xxxx.xxxxx-orange)](https://arxiv.org/abs/) -->
 
-
-## 🤖 [Demo](https://www.youtube.com/watch?v=FxkGmjyMc5g&feature=youtu.be)
-
-[![demo](teaser.png "demo")]()
+<img src="./assets/poster.png" alt="Bend-Grasper poster" width="100%">
 
 </div>
 
-
-## 🔥 News
-
-- \[2025-02\] We release the [paper](https://arxiv.org/abs/2502.13013) and demos of HOMIE.
-- \[2025-02\] We open all of the resources of HOMIE
-
-## 📋 Contents
-
-- [🏠 About](#-about)
-- [🔥 News](#-news)
-- [📚 Usage](#-usage)
-- [📝 TODO List](#-todo)
-- [🔗 Citation](#-citation)
-- [📄 License](#-license)
-- [👏 Acknowledgements](#-acknowledgements)
-
 ## 🏠 About
-<img src="./overview.png" alt="framework" width="100%" style="position: relative;">
-<a name="-about"></a>
-This repository is an official implementation of "HOMIE: Humanoid Loco-Manipulation with Isomorphic Exoskeleton Cockpit", which is a novel humanoid teleoperation cockpit composed of a humanoid loco-manipulation policy and an exoskeleton-based hardware system. 
 
-HOMIE enables a single operator to precisely and efficiently control a humanoid robot's full-body movements for diverse loco-manipulation tasks. Integrated into simulation environments, our cockpit also enables seamless teleoperation in virtual settings. Specifically, we introduce three core techniques to our RL-based training framework: upper-body pose curriculum, height tracking reward, and symmetry utilization. These components collectively enhance the robot's physical agility, enabling robust walking, rapid squatting to any required heights, and stable balance maintenance during dynamic upper-body movements, thereby significantly expanding the robot's operational workspace beyond existing solutions. Unlike previous whole-body control methods that depend on motion priors derived from motion capture (MoCap) data, our framework eliminates this dependency, resulting in a more efficient pipeline. 
+Humanoid robots need whole-body coordination to grasp targets beyond the arm’s reachable workspace under different postures. Learning high-dimensional loco-manipulation policies while keeping accurate end-effector tracking remains challenging.
 
-Our hardware system features isomorphic exoskeleton arms, a pair of motion-sensing gloves, and a pedal. The pedal design for locomotion command acquisition liberates the operator's upper body, enabling simultaneous acquisition of upper-body poses. Since the exoskeleton arms are isomorphic to the controlled robot and each glove has 15 degrees of freedom (DoF), which is more than most existing dexterous hands, we can directly set upper-body joint positions from the exoskeleton readings, dispensing with IK and achieving faster and more accurate teleoperation. Moreover, our gloves can be detached from the arms, allowing them to be reused in systems isomorphic to different robots. The total cost of the hardware system is only \$0.5k, which is significantly lower than that of MoCap devices.
+**Bend-Grasper** is a target-conditioned whole-body control framework for humanoid **bending, squatting, and grasping**. A three-stage curriculum progressively learns locomotion, postural compensation, and end-effector control. With geometric reachability compensation, the robot actively uses whole-body motion to extend its manipulation workspace; a residual end-effector module improves grasp accuracy under dynamic posture changes.
 
-This repository contains three key components of HOMIE:
+<img src="./assets/framework.png" alt="Bend-Grasper framework" width="100%">
 
-* **HomieRL**: A novel reinforcement learning (RL)-based training framework that enables different kinds of humanoid robots to walk and squat robustly under any continuously changing upper-body poses.
-* **HomieHardware**: It contains all necessary files to reimplement our hardware system, including design files, PCB principle files, and keil code for PCBs. (You are required to fill in a form to get such resources. NOTE: Please make sure that you use your actual name and actual institution when filling the form. People without a valid name or institution will not be considered as appropriate to have access to the resources in order to protect our knowledge priviledge. Individuals without any institutions may contact the authors directly.)
-* **HomieDeploy**: It contains all deployment code for both PC that connected to our hardware system and the Unitree G1 with Dex3 hands.
+<p align="center"><em>Overview of the Bend-Grasper framework</em></p>
 
-We separate these parts into three different sub-directories, you can view them as three independent repositories. Each sub-directory has its own README, which describes their usage ways and functions. HOMIE is fully open-sourced, however, ***it is strictly forbidden to use HOMIE for any commercial purposes***.
+### Key contributions
 
-## 📚 Usage
-<a name="-usage"></a>
+1. **Target-conditioned whole-body policy** — jointly controls locomotion, waist bending, and arm reaching with target position and reachability in the observation.
+2. **Geometric reachability compensation** — estimates whether the target is reachable and drives compensatory squat / torso bend to extend the workspace.
+3. **Three-stage RL curriculum** with selective policy inheritance (selective KL + action-mean consistency) for stable skill acquisition.
 
-### Prerequisites
+### Three-stage learning
 
-We recommend to use our code under the following environment:
+| Stage | Focus | Policy |
+|:-----:|-------|--------|
+| **1** | Stable locomotion & height / squat tracking | Lower-limb actor |
+| **2** | Waist bending + geometric reachability compensation; selective inheritance from stage 1 | Lower-body (legs + waist) student |
+| **3** | Arm reaching + residual end-effector refinement | Whole-body student |
 
-- Ubuntu 20.04/22.04 Operating System
-- IsaacGym Preview 4.0
-  - NVIDIA GPU (RTX 2070 or higher)
-  - NVIDIA GPU Driver (recommended version 535.183)
-- Conda
-  - Python 3.8
-- Hardware
-  - Unitree G1 with Dex3 Hands
-  - Realsense D455 * 1
-  - Realsense D435 * 2
-### Installation
-You should first clone this repository to your Ubuntu computer by running:
+This codebase builds on [OpenHomie / HOMIE](https://github.com/InternRobotics/OpenHomie) (loco-manipulation + isomorphic exoskeleton cockpit) and extends it toward bend-grasp whole-body control in MuJoCo ([mjlab](https://github.com/mujocolab/mjlab)).
+
+## 📊 Results
+
+Cross-height / cross-distance grasping and sequential whole-body grasp rollouts in MuJoCo:
+
+<p align="center">
+  <img src="./assets/results_cross_height.png" alt="Cross-height and cross-distance grasping" width="48%">
+  &nbsp;
+  <img src="./assets/results_sequence.png" alt="Sequential whole-body grasping" width="48%">
+</p>
+
+<p align="center"><em>Left: grasping across height \(z\) and distance \(x\). Right: sequential whole-body grasping.</em></p>
+
+Compared with lower-body-only control, whole-body Bend-Grasper keeps higher success and lower mean end-effector error as target distance grows (e.g. at \(x=0.62\,\mathrm{m}\): lower-body ≈ 0% success vs whole-body ≈ 70%).
+
+## 📋 Repository layout
+
+| Path | Description |
+|------|-------------|
+| [`HomieRL_mjlab/`](./HomieRL_mjlab) | **Primary training stack** — HOMIE-style G1 on mjlab (MuJoCo Warp), phase-1 / phase-2 (waist) curriculum, HIM-PPO |
+| [`HomieRL/`](./HomieRL) | Original IsaacGym HOMIE training (legacy) |
+| [`HomieDeploy/`](./HomieDeploy) | PC + Unitree G1 deployment |
+| [`HomieHardware/`](./HomieHardware) | Exoskeleton / glove / pedal hardware resources |
+| [`homie_ros_sim2sim/`](./homie_ros_sim2sim) | ROS sim2sim bridge |
+| [`MujocoDeploy/`](./MujocoDeploy) | MuJoCo deployment helpers |
+
+Each sub-directory has its own README for install and run details.
+
+## 📚 Quick start (mjlab)
+
+```bash
+git clone https://github.com/flushddd/homie.git
+cd homie/HomieRL_mjlab
+uv sync
 ```
-https://github.com/OpenRobotLab/Homie.git
+
+**Train** (Cursor / VS Code: Run and Debug → phase configs, or):
+
+```bash
+./scripts/launch_train.sh
+./scripts/launch_tensorboard.sh   # http://localhost:6007
 ```
-Then you can follow the README.md in each sub-repostory to install all three parts or just one of them.
 
-If you have any questions about the usage of this repository, please feel free to drop an e-mail at **elgceben@gmail.com**, we will respond to it as soon as possible. Or, you can join our discussion wechat group (However, it has over 200 people now, if you would like to join, please add wechat: elgceben with info like "I want to join HOMIE discussion wechat group")
+**Play:**
 
+```bash
+uv run play Mjlab-Homie-Flat-Unitree-G1-Phase2 \
+  --num-envs 1 --viewer viser \
+  --checkpoint-file logs/rsl_rl/homie_g1/<run>/model_*.pt
+```
 
+See [`HomieRL_mjlab/README.md`](./HomieRL_mjlab/README.md) for phase-1 / phase-2 resume, teacher lock, and environment notes.
 
 ## 🔗 Citation
 
-If you find our work helpful, please cite:
+If you use this work, please cite Bend-Grasper (bibtex TBD) and the upstream HOMIE paper:
 
 ```bibtex
 @article{ben2025homie,
@@ -99,25 +107,13 @@ If you find our work helpful, please cite:
 }
 ```
 
-</details>
-
-## 📝 TODO List
-
-- \[x\] Release the paper with demos.
-- \[x\] Release all necessary code.
-- \[ \] Release training code for more robots.
-- \[ \] Upgrade the low-level control policy for more complex terrains and more robots.
-
 ## 📄 License
 
-All code of HOMIE is under the <a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/">Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License </a><a rel="license" href="http://creativecommons.org/licenses/by-nc-sa/4.0/"><img alt="Creative Commons License" style="border-width:0" src="https://i.creativecommons.org/l/by-nc-sa/4.0/80x15.png" /></a>. It is strictly forbidden to use it for commercial purposes before asking our team.
+Code inherited from HOMIE remains under the [CC BY-NC-SA 4.0](http://creativecommons.org/licenses/by-nc-sa/4.0/) license. Commercial use is not allowed without permission from the respective authors.
 
 ## 👏 Acknowledgements
 
-
-- [RSL_RL](https://github.com/leggedrobotics/rsl_rl): We use `rsl_rl` library to train the control policies for legged robots.
-- [Legged_gym](https://github.com/leggedrobotics/rsl_rl): We use `legged_gym` library to train the control policies for legged robots.
-- [HIMLoco](https://github.com/OpenRobotLab/HIMLoco): We use `HIMLoco` library as our codebase.
-- [Walk-These-Ways](https://github.com/leggedrobotics/rsl_rl): Our robot deployment code is based on `walk-these-ways`.
-- [Unitree SDK2](https://github.com/leggedrobotics/rsl_rl): We use `Unitree SDK2` library to control the robot.
-- [HomunCulus](https://github.com/nepyope/Project-Homunculus): Our glove design refers to the principle of `HomunCulus` such as using `Hall sensors`.
+- [HOMIE / OpenHomie](https://github.com/InternRobotics/OpenHomie) — loco-manipulation cockpit and RL codebase
+- [mjlab](https://github.com/mujocolab/mjlab) — MuJoCo Warp training environment
+- [RSL_RL](https://github.com/leggedrobotics/rsl_rl) / [HIMLoco](https://github.com/OpenRobotLab/HIMLoco) — on-policy RL & HIM estimator
+- [Unitree](https://www.unitree.com/) G1 assets and SDK
