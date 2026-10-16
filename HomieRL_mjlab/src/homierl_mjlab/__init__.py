@@ -6,7 +6,7 @@ from .env_cfgs import homie_g1_flat_env_cfg
 from .rl.him_runner import HomieOnPolicyRunner
 from .rl_cfg import homie_g1_him_runner_cfg
 
-# Phase-1: legs-only + PD-hold upper body (loco / squat).
+# Phase-1: legs-only; waist PD-held; arms random-pose curriculum (Homie).
 register_mjlab_task(
   task_id="Mjlab-Homie-Flat-Unitree-G1",
   # Phase-1 actor one-step: proprio+12 act+10 container = 90.

@@ -27,14 +27,17 @@ from homierl_mjlab.robot.g1_constants import (
   HOMIE_LEG_ACTION_SCALE,
   LEG_JOINT_NAMES,
   LOCO_JOINT_NAMES,
-  UPPER_JOINT_NAMES,
+  WAIST_JOINT_NAMES,
   WAIST_YAW_JOINT_NAMES,
   get_g1_robot_cfg,
 )
 
 
 def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: PD-hold waist+arms. Phase-2: policy roll/pitch; yaw+arms held."""
+  """Phase-1: waist held; arms random-pose curriculum (Homie ``random_upper_actions``).
+
+  Phase-2: policy roll/pitch; yaw + arms PD-held.
+  """
   cfg.events.pop("init_upper_curriculum", None)
   cfg.events.pop("upper_body_curriculum", None)
   cfg.events.pop("reset_upper_curriculum", None)
@@ -44,12 +47,38 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
   cfg.events.pop("hold_arms_default", None)
 
   if int(phase) <= 1:
-    cfg.events["hold_upper_default"] = EventTermCfg(
+    # Homie ``legged_robot1jieduan``: waist stays default; arms get smooth
+    # random targets toward joint limits with curriculum ratio.
+    cfg.events["hold_waist_default"] = EventTermCfg(
       func=homie_mdp.hold_joints_at_default,
       mode="step",
       params={
-        "asset_cfg": SceneEntityCfg("robot", joint_names=UPPER_JOINT_NAMES),
+        "asset_cfg": SceneEntityCfg("robot", joint_names=WAIST_JOINT_NAMES),
       },
+    )
+    arm_cfg = SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES)
+    cfg.events["init_upper_curriculum"] = EventTermCfg(
+      func=homie_mdp.init_upper_body_curriculum,
+      mode="startup",
+      params={"asset_cfg": arm_cfg, "init_ratio": 0.0},
+    )
+    cfg.events["upper_body_curriculum"] = EventTermCfg(
+      func=homie_mdp.update_upper_body_pose_curriculum,
+      mode="step",
+      params={
+        "asset_cfg": arm_cfg,
+        # Homie upper_interval_s=1 → ~50 control steps at dt=0.02.
+        "upper_interval": 50,
+        "ratio_step": 0.05,
+        "warmup_steps": 0,
+        # ~one episode (20s @ 50Hz) between ratio bumps.
+        "steps_per_ratio_bump": 1000,
+      },
+    )
+    cfg.events["reset_upper_curriculum"] = EventTermCfg(
+      func=homie_mdp.reset_upper_body_curriculum,
+      mode="reset",
+      params={"asset_cfg": arm_cfg},
     )
     return
 
@@ -568,6 +597,18 @@ def homie_g1_flat_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
+    # Play: freeze random arm curriculum; hold arms at default.
+    cfg.events.pop("init_upper_curriculum", None)
+    cfg.events.pop("upper_body_curriculum", None)
+    cfg.events.pop("reset_upper_curriculum", None)
+    if "hold_arms_default" not in cfg.events:
+      cfg.events["hold_arms_default"] = EventTermCfg(
+        func=homie_mdp.hold_joints_at_default,
+        mode="step",
+        params={
+          "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+        },
+      )
     # Stop random resample / standing-zero fighting the Viser slider.
     # Keep ranges.height=(-0.5, 0) so the absolute-height slider stays movable.
     twist = cfg.commands["twist"]

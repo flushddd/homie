@@ -89,14 +89,13 @@ def update_upper_body_pose_curriculum(
   warmup_steps: int = 20_000,
   steps_per_ratio_bump: int = 5_000,
 ) -> None:
-  """Interval event: advance curriculum and set upper-body position targets.
+  """Homie ``random_upper_actions`` (legged_robot1jieduan when ``not arm_on``).
 
-  Slower than the original Homie bump schedule so locomotion can stabilize
-  before large upper-body disturbances:
-  - no ratio increase before ``warmup_steps``
-  - then ``ratio += ratio_step`` every ``steps_per_ratio_bump`` env steps
-  - sample sparse random poses toward joint limits with exponential bias
-  - interpolate toward the new target over ``upper_interval`` control steps
+  Every ``upper_interval`` steps sample a new arm target toward a random joint
+  limit with exponential bias controlled by ``ratio``; each step interpolates
+  ``current → target``. Ratio grows by ``ratio_step`` after ``warmup_steps``,
+  every ``steps_per_ratio_bump`` env steps (Homie bumps on tracking; we use a
+  fixed schedule).
   """
   state = _get_state(env)
   if state is None:
@@ -108,28 +107,37 @@ def update_upper_body_pose_curriculum(
   asset: Entity = env.scene[asset_cfg.name]
   step = int(env.common_step_counter)
 
-  # Delayed, slow curriculum ramp (prevents mid-training collapse).
   if step >= warmup_steps and steps_per_ratio_bump > 0:
     if (step - warmup_steps) % steps_per_ratio_bump == 0:
       state.ratio = min(1.0, state.ratio + ratio_step)
 
-  # Resample targets periodically.
+  # Homie: resample when ``common_step_counter % upper_interval == 0``.
   if step % upper_interval == 0:
     n = env.num_envs
     j = state.current.shape[1]
-    uu = torch.rand(n, j, device=env.device)
-    # Inverse-CDF style concentration near 0 when ratio small (paper Homie).
+    # Homie::
+    #   r = min(action_curriculum_ratio, 1)
+    #   uu ~ U(0,1)
+    #   random_upper_ratio = -1/(20*(1-r*0.99)) * log(1-uu+uu*exp(-20*(1-r*0.99)))
+    #   random_joint_ratio = random_upper_ratio * U(0,1)
+    #   action = (action_min|action_max) * random_joint_ratio
+    #   q = default + action_scale * action  ≡  default + (limit-default)*ratio
     r = min(state.ratio, 1.0)
     denom = 20.0 * (1.0 - r * 0.99) + 1e-6
-    rand_ratio = -1.0 / denom * torch.log(1.0 - uu + uu * torch.exp(torch.tensor(-denom, device=env.device)))
+    uu = torch.rand(n, j, device=env.device)
+    rand_ratio = (
+      -1.0
+      / denom
+      * torch.log(1.0 - uu + uu * torch.exp(torch.tensor(-denom, device=env.device)))
+    )
     rand_ratio = rand_ratio * torch.rand(n, j, device=env.device)
 
     lo = state.joint_pos_limits[:, 0].unsqueeze(0)
     hi = state.joint_pos_limits[:, 1].unsqueeze(0)
     default = asset.data.default_joint_pos[:, state.joint_ids]
-    # Blend from default toward a random limit-side pose.
+    # Homie: rand_pos>=0 → action_min (lo); else action_max (hi).
     side = torch.rand(n, j, device=env.device) - 0.5
-    extreme = torch.where(side >= 0, hi, lo)
+    extreme = torch.where(side >= 0.0, lo, hi)
     state.target = default + (extreme - default) * rand_ratio
     state.delta = (state.target - state.current) / float(upper_interval)
 
