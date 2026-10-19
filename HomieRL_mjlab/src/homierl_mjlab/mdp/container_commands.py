@@ -7,6 +7,8 @@ task frame fixed at episode reset: origin = initial pelvis projection on ground,
 x forward, y left, z up.
 
 Phase-1/2 use a constant vector (no randomization) matching the design doc example.
+Phase-3 can sample open-bottom square walls around the grasp target
+(``sample_around_grasp=True``); analytic SDF uses these params (no MuJoCo geoms yet).
 """
 
 from __future__ import annotations
@@ -39,12 +41,15 @@ class ContainerGeometryCommand(CommandTerm):
     self.ref_origin_xy = torch.zeros(self.num_envs, 2, device=self.device)
     self.ref_yaw = torch.zeros(self.num_envs, device=self.device)
     self.container = torch.zeros(self.num_envs, 10, device=self.device)
+    # 1 = open-bottom square walls present (phase-3).
+    self.present = torch.zeros(self.num_envs, device=self.device)
     self._fixed = torch.tensor(cfg.fixed_values, device=self.device, dtype=torch.float32)
     if self._fixed.numel() != 10:
       raise ValueError(f"fixed_values must have length 10, got {self._fixed.numel()}")
 
     self.metrics["container_rect"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["container_h"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["container_present"] = torch.zeros(self.num_envs, device=self.device)
 
   @property
   def command(self) -> torch.Tensor:
@@ -64,8 +69,12 @@ class ContainerGeometryCommand(CommandTerm):
     if len(env_ids) == 0:
       return
     self._capture_task_frame(env_ids)
+    if self.cfg.sample_around_grasp:
+      self._resample_around_grasp(env_ids)
+      return
     if not self.cfg.randomize:
       self._fill_fixed(env_ids)
+      self.present[env_ids] = 0.0
       return
 
     # Optional randomization path (disabled for phase-1/2 by default).
@@ -97,6 +106,54 @@ class ContainerGeometryCommand(CommandTerm):
     self.container[env_ids, 7] = is_circle.float()
     self.container[env_ids, 8] = t_wall
     self.container[env_ids, 9] = t_bottom
+    self.present[env_ids] = 1.0
+
+  def _resample_around_grasp(self, env_ids: torch.Tensor) -> None:
+    """Phase-3: optional open-bottom square walls around grasp target (world→task)."""
+    n = len(env_ids)
+    device = self.device
+    present = (torch.rand(n, device=device) < float(self.cfg.presence_prob)).float()
+    self.present[env_ids] = present
+
+    # Grasp target in world → task frame XY; z_b ≈ table under target.
+    grasp = self._env.command_manager.get_term("grasp")
+    tw = grasp.target_pos_w[env_ids]
+    yaw = self.ref_yaw[env_ids]
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    dx = tw[:, 0] - self.ref_origin_xy[env_ids, 0]
+    dy = tw[:, 1] - self.ref_origin_xy[env_ids, 1]
+    x_t = c * dx + s * dy
+    y_t = -s * dx + c * dy
+
+    # Container center near target with small offset; keep target inside with margin.
+    off_x = torch.empty(n, device=device).uniform_(*self.cfg.target_offset_xy)
+    off_y = torch.empty(n, device=device).uniform_(*self.cfg.target_offset_xy)
+    inner_x = torch.empty(n, device=device).uniform_(*self.cfg.inner_size_xy)
+    inner_y = torch.empty(n, device=device).uniform_(*self.cfg.inner_size_xy)
+    h_c = torch.empty(n, device=device).uniform_(*self.cfg.height)
+    t_wall = torch.empty(n, device=device).uniform_(*self.cfg.thickness)
+    margin = float(self.cfg.target_margin)
+    # Ensure target stays inside cavity with margin.
+    half_in_x = 0.5 * inner_x - margin
+    half_in_y = 0.5 * inner_y - margin
+    half_in_x = torch.clamp(half_in_x, min=0.02)
+    half_in_y = torch.clamp(half_in_y, min=0.02)
+    off_x = torch.clamp(off_x, -half_in_x, half_in_x)
+    off_y = torch.clamp(off_y, -half_in_y, half_in_y)
+    x_c = x_t - off_x
+    y_c = y_t - off_y
+    z_b = tw[:, 2] - 0.02  # slightly below target (desktop support)
+
+    self.container[env_ids, 0] = x_c * present
+    self.container[env_ids, 1] = y_c * present
+    self.container[env_ids, 2] = z_b * present
+    self.container[env_ids, 3] = inner_x * present
+    self.container[env_ids, 4] = inner_y * present
+    self.container[env_ids, 5] = h_c * present
+    self.container[env_ids, 6] = present  # b_rect
+    self.container[env_ids, 7] = 0.0  # b_circle (ellipse later)
+    self.container[env_ids, 8] = t_wall * present
+    self.container[env_ids, 9] = 0.0  # open bottom
 
   def container_pos_w(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
     if env_ids is None:
@@ -112,6 +169,7 @@ class ContainerGeometryCommand(CommandTerm):
   def _update_metrics(self) -> None:
     self.metrics["container_rect"][:] = self.container[:, 6]
     self.metrics["container_h"][:] = self.container[:, 5]
+    self.metrics["container_present"][:] = self.present
 
   def _update_command(self, env_ids: torch.Tensor | None) -> None:
     del env_ids
@@ -127,13 +185,19 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   debug_vis: bool = False
   randomize: bool = False
   fixed_values: tuple[float, ...] = field(default_factory=lambda: _FIXED_CONTAINER)
+  # Phase-3: sample open-bottom square walls around grasp (overrides randomize).
+  sample_around_grasp: bool = False
+  presence_prob: float = 0.5
+  inner_size_xy: tuple[float, float] = (0.28, 0.45)
+  target_offset_xy: tuple[float, float] = (-0.06, 0.06)
+  target_margin: float = 0.06
   # Used only if randomize=True
   pos_x: tuple[float, float] = (0.40, 0.80)
   pos_y: tuple[float, float] = (-0.30, 0.30)
   z_b: tuple[float, float] = (0.70, 0.80)
   size_xy: tuple[float, float] = (0.20, 0.50)
-  height: tuple[float, float] = (0.10, 0.30)
-  thickness: tuple[float, float] = (0.005, 0.020)
+  height: tuple[float, float] = (0.08, 0.18)
+  thickness: tuple[float, float] = (0.01, 0.025)
   circle_prob: float = 0.4
 
   def build(self, env: ManagerBasedRlEnv) -> ContainerGeometryCommand:

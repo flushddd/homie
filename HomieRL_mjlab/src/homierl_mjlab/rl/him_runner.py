@@ -209,6 +209,9 @@ class HomieOnPolicyRunner:
       freeze_std_dims=int(him_cfg.get("freeze_std_dims", 12)),
       stand_height=float(him_cfg.get("stand_height", 0.74)),
       keep_height_tol=float(him_cfg.get("keep_height_tol", 0.02)),
+      is_waist_one_step_idx=int(him_cfg.get("is_waist_one_step_idx", 83)),
+      keep_loco_always=bool(him_cfg.get("keep_loco_always", False)),
+      teacher_one_step_obs=int(him_cfg.get("teacher_one_step_obs", 0)),
     )
 
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):

@@ -37,6 +37,7 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
   """Phase-1: waist held; arms random-pose curriculum (Homie ``random_upper_actions``).
 
   Phase-2: policy roll/pitch; yaw + arms PD-held.
+  Phase-3: yaw held; arms driven by EE residual IK (no hold_arms).
   """
   cfg.events.pop("init_upper_curriculum", None)
   cfg.events.pop("upper_body_curriculum", None)
@@ -90,17 +91,18 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
       "asset_cfg": SceneEntityCfg("robot", joint_names=WAIST_YAW_JOINT_NAMES),
     },
   )
-  cfg.events["hold_arms_default"] = EventTermCfg(
-    func=homie_mdp.hold_joints_at_default,
-    mode="step",
-    params={
-      "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
-    },
-  )
+  if int(phase) < 3:
+    cfg.events["hold_arms_default"] = EventTermCfg(
+      func=homie_mdp.hold_joints_at_default,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+      },
+    )
 
 
 def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: 12 legs. Phase-2: 12 legs + waist roll/pitch (yaw held)."""
+  """Phase-1: 12 legs. Phase-2: 14 loco. Phase-3: 14 loco + 3 EE residual."""
   if int(phase) <= 1:
     names = LEG_JOINT_NAMES
     scale = HOMIE_LEG_ACTION_SCALE
@@ -115,13 +117,23 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
       use_default_offset=True,
     ),
   }
+  if int(phase) >= 3:
+    cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
+      entity_name="robot",
+      ee_delta_scale=(0.05, 0.05, 0.08),
+      ee_delta_clip=(0.06, 0.06, 0.10),
+      ik_damping=0.05,
+      max_joint_delta=0.12,
+      ik_iterations=4,
+    )
 
 
 def _configure_phase_commands_and_obs(
   cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
 ) -> None:
-  """Phase-2 grasp trail; both phases append 10-D container geometry at the end."""
-  if int(phase) <= 1:
+  """Phase-2: grasp + container10. Phase-3: grasp + SDF (no container10 in obs)."""
+  phase = int(phase)
+  if phase <= 1:
     cfg.commands.pop("grasp", None)
     actor_terms.pop("grasp_target", None)
   else:
@@ -130,30 +142,59 @@ def _configure_phase_commands_and_obs(
       resampling_time_range=(4.0, 4.0),
       debug_vis=True,
       base_height_target=0.74,
+      enable_arm_reach=(phase >= 3),
+      is_waist_prob=0.25 if phase >= 3 else 0.5,
     )
     actor_terms["grasp_target"] = ObservationTermCfg(
       func=homie_mdp.grasp_target_command,
       params={"command_name": "grasp"},
     )
 
-  # Always last in actor/critic obs (after actions / grasp).
-  # Fixed 10-D container zeros in phase-1/2 (slot reserved; no signal yet).
-  cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
-    entity_name="robot",
-    randomize=False,
-    fixed_values=(0.0,) * 10,
-    debug_vis=False,
-  )
-  actor_terms["container_geom"] = ObservationTermCfg(
-    func=homie_mdp.container_geometry_command,
-    params={"command_name": "container"},
-  )
+  if phase >= 3:
+    # Container params drive analytic SDF only — not exposed as actor obs.
+    cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 4.0),
+      sample_around_grasp=True,
+      presence_prob=0.5,
+      debug_vis=False,
+    )
+    actor_terms.pop("container_geom", None)
+    actor_terms["sdf_field"] = ObservationTermCfg(
+      func=homie_mdp.sdf_query_field,
+      params={
+        "command_name": "container",
+        "query_count": 64,
+        "d_max": 0.40,
+        "include_valid": True,
+      },
+    )
+    actor_terms["arm_clearance"] = ObservationTermCfg(
+      func=homie_mdp.arm_clearance_field,
+      params={"command_name": "container", "d_max": 0.40},
+    )
+    actor_terms["ee_target_error"] = ObservationTermCfg(
+      func=homie_mdp.ee_target_error,
+      params={"grasp_command_name": "grasp"},
+    )
+  else:
+    # Fixed 10-D container zeros in phase-1/2 (slot reserved).
+    cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
+      entity_name="robot",
+      randomize=False,
+      fixed_values=(0.0,) * 10,
+      debug_vis=False,
+    )
+    actor_terms["container_geom"] = ObservationTermCfg(
+      func=homie_mdp.container_geometry_command,
+      params={"command_name": "container"},
+    )
 
 
 def homie_g1_flat_env_cfg(
   play: bool = False, phase: int = 1
 ) -> ManagerBasedRlEnvCfg:
-  """Paper HOMIE G1 flat: phase-1 loco/squat; phase-2 waist + grasp targets."""
+  """Paper HOMIE G1 flat: phase-1 loco; phase-2 waist; phase-3 EE+SDF reach."""
   cfg = make_velocity_env_cfg()
 
   cfg.sim.njmax = 300
@@ -201,7 +242,7 @@ def homie_g1_flat_env_cfg(
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg, self_collision_cfg)
 
-  # ---- Actions: phase-1 = 12 legs; phase-2 = 12 legs + 3 waist ----
+  # ---- Actions: p1=12; p2=14 loco; p3=14 loco + 3 EE residual ----
   _configure_phase_actions(cfg, phase=phase)
 
   # ---- Commands: twist + height (Homie ranges + resampling_time=4s) ----
@@ -290,8 +331,9 @@ def homie_g1_flat_env_cfg(
       scale=2.0,
     ),
   }
-  # Re-append container so it remains the final critic term after lin_vel.
-  if "container_geom" in critic_terms:
+  # Phase-1/2: container stays last on critic after lin_vel.
+  # Phase-3: no container10; SDF/clearance already in actor_terms.
+  if int(phase) < 3 and "container_geom" in critic_terms:
     c_term = critic_terms.pop("container_geom")
     critic_terms["container_geom"] = c_term
   cfg.observations = {
@@ -559,6 +601,32 @@ def homie_g1_flat_env_cfg(
     ),
   }
 
+  if int(phase) >= 3:
+    cfg.rewards["reach_ee_position"] = RewardTermCfg(
+      func=homie_mdp.reach_ee_position,
+      weight=2.0,
+      params={"grasp_command_name": "grasp", "sigma": 0.08},
+    )
+    cfg.rewards["reach_ee_progress"] = RewardTermCfg(
+      func=homie_mdp.reach_ee_progress,
+      weight=1.0,
+      params={"grasp_command_name": "grasp"},
+    )
+    cfg.rewards["reach_success"] = RewardTermCfg(
+      func=homie_mdp.reach_success,
+      weight=0.5,
+      params={"grasp_command_name": "grasp", "threshold": 0.03},
+    )
+    cfg.rewards["clearance_penalty"] = RewardTermCfg(
+      func=homie_mdp.clearance_penalty,
+      weight=2.0,
+      params={"command_name": "container", "d_safe": 0.03, "d_max": 0.40},
+    )
+    cfg.rewards["ee_residual_l2"] = RewardTermCfg(
+      func=homie_mdp.ee_residual_l2,
+      weight=0.05,
+    )
+
   # ---- Terminations ----
   cfg.terminations = {
     "time_out": TerminationTermCfg(func=vel_mdp.time_out, time_out=True),
@@ -597,11 +665,11 @@ def homie_g1_flat_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
-    # Play: freeze random arm curriculum; hold arms at default.
+    # Play: freeze random arm curriculum; hold arms at default (not phase-3 IK).
     cfg.events.pop("init_upper_curriculum", None)
     cfg.events.pop("upper_body_curriculum", None)
     cfg.events.pop("reset_upper_curriculum", None)
-    if "hold_arms_default" not in cfg.events:
+    if int(phase) < 3 and "hold_arms_default" not in cfg.events:
       cfg.events["hold_arms_default"] = EventTermCfg(
         func=homie_mdp.hold_joints_at_default,
         mode="step",

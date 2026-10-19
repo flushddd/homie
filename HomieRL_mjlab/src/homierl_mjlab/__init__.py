@@ -25,3 +25,13 @@ register_mjlab_task(
   rl_cfg=homie_g1_him_runner_cfg(phase=2),
   runner_cls=HomieOnPolicyRunner,
 )
+
+# Phase-3: 14 loco + 3 EE residual; analytic SDF walls; teacher locks 14 loco dims.
+# Resume a phase-2 checkpoint so ``learn()`` can clone it as teacher.
+register_mjlab_task(
+  task_id="Mjlab-Homie-Flat-Unitree-G1-Phase3",
+  env_cfg=homie_g1_flat_env_cfg(phase=3),
+  play_env_cfg=homie_g1_flat_env_cfg(play=True, phase=3),
+  rl_cfg=homie_g1_him_runner_cfg(phase=3),
+  runner_cls=HomieOnPolicyRunner,
+)

@@ -10,6 +10,7 @@ from .events import (
   update_upper_body_pose_curriculum,
 )
 from .container_commands import ContainerGeometryCommand, ContainerGeometryCommandCfg
+from .ee_residual_actions import EeResidualIkAction, EeResidualIkActionCfg
 from .grasp_commands import GraspTargetCommand, GraspTargetCommandCfg
 from .observations import (
   container_geometry_command,
@@ -17,8 +18,13 @@ from .observations import (
   height_command,
   twist_command_xy_yaw,
 )
+from .sdf_observations import arm_clearance_field, ee_target_error, sdf_query_field
 from .rewards import (
   action_vanish,
+  clearance_penalty,
+  ee_residual_l2,
+  reach_ee_progress,
+  reach_success,
   ang_vel_xy,
   contact_momentum,
   deviation_ankle_joint,
@@ -43,6 +49,7 @@ from .rewards import (
   lin_vel_z,
   no_fly,
   orientation,
+  reach_ee_position,
   smoothness_second_order,
   loco_waist_roll_sway,
   stand_still,
@@ -59,14 +66,19 @@ __all__ = [
   "ContainerGeometryCommand",
   "ContainerGeometryCommandCfg",
   "CurriculumScheduler",
+  "EeResidualIkAction",
+  "EeResidualIkActionCfg",
   "GraspTargetCommand",
   "GraspTargetCommandCfg",
   "TwistHeightCommand",
   "TwistHeightCommandCfg",
   "action_vanish",
   "ang_vel_xy",
+  "arm_clearance_field",
+  "clearance_penalty",
   "contact_momentum",
   "container_geometry_command",
+  "ee_residual_l2",
   "deviation_ankle_joint",
   "deviation_hip_joint",
   "deviation_knee_joint",
@@ -75,6 +87,7 @@ __all__ = [
   "dof_acc_l2",
   "dof_vel_l2",
   "dof_vel_limits",
+  "ee_target_error",
   "feet_air_time_homie",
   "feet_clearance",
   "feet_contact_forces",
@@ -94,7 +107,11 @@ __all__ = [
   "lin_vel_z",
   "no_fly",
   "orientation",
+  "reach_ee_position",
+  "reach_ee_progress",
+  "reach_success",
   "reset_upper_body_curriculum",
+  "sdf_query_field",
   "smoothness_second_order",
   "loco_waist_roll_sway",
   "stand_still",

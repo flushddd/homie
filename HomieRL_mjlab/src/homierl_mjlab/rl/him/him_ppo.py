@@ -62,13 +62,16 @@ class HIMPPO:
     self.max_grad_norm = max_grad_norm
     self.use_clipped_value_loss = use_clipped_value_loss
 
-    # Phase-2 teacher lock (Homie ``him_ppo mean+kl`` / ``set_teacher``).
+    # Teacher mean+KL lock (phase-2: 12 legs; phase-3: 14 loco, no waist yaw).
     self.teacher_actor_critic: HIMActorCritic | None = None
     self.keep_loco_weight = 0.0
     self.keep_loco_dims = 12
     self.freeze_std_dims = 12
     self.stand_height = 0.74
     self.keep_height_tol = 0.02
+    self.is_waist_one_step_idx = 83
+    self.keep_loco_always = False
+    self.teacher_one_step_obs = 0
 
     # Build left-right joint permutation for G1 naming convention.
     self._joint_perm: list[int] | None = None
@@ -206,11 +209,12 @@ class HIMPPO:
       sigma_batch = self.actor_critic.action_std
       entropy_batch = self.actor_critic.entropy
 
-      # ---- Phase-2: mean + KL keep toward stage-1 teacher (Homie mean+kl) ----
+      # ---- Teacher mean + KL keep on loco dims (selective via is_waist mask) ----
       loss_keep = torch.zeros((), device=self.device)
       if self.teacher_actor_critic is not None and self.keep_loco_weight > 0:
         with torch.no_grad():
-          _ = self.teacher_actor_critic.act(obs_batch)
+          obs_t = self._teacher_obs(obs_batch)
+          _ = self.teacher_actor_critic.act(obs_t)
           teacher_mu = self.teacher_actor_critic.action_mean
           teacher_sigma = self.teacher_actor_critic.action_std
         k = min(int(self.keep_loco_dims), mu_batch.shape[-1], teacher_mu.shape[-1])
@@ -218,7 +222,7 @@ class HIMPPO:
         mask_count = loco_mask.sum().clamp(min=1.0)
         diff = (mu_batch[:, :k] - teacher_mu[:, :k]) * loco_mask.unsqueeze(-1)
         # Homie ``_kl_diag_gauss`` detaches student → KL has no grad; mean L2
-        # carries the keep signal (selective on non-waist envs).
+        # carries the keep signal (selective on non-waist envs / always in p3).
         kl = self._kl_diag_gauss(
           mu_batch[:, :k],
           sigma_batch[:, :k],
@@ -391,17 +395,17 @@ class HIMPPO:
     out[:, 9] = flat[:, 3]
     out[:, 10] = flat[:, 4]
     out[:, 11] = -flat[:, 5]
-    if flat.shape[-1] == 14:
-      # phase-2: waist_roll, waist_pitch (yaw held, not in action)
+    if flat.shape[-1] >= 14:
+      # phase-2/3 loco: waist_roll, waist_pitch (yaw held, not in action)
       out[:, 12] = -flat[:, 12]
       out[:, 13] = flat[:, 13]
-    elif flat.shape[-1] >= 15:
-      # Homie lower-15 layout: yaw, roll, pitch
-      out[:, 12] = -flat[:, 12]
-      out[:, 13] = -flat[:, 13]
-      out[:, 14] = flat[:, 14]
-      if flat.shape[-1] > 15:
-        out[:, 15:] = flat[:, 15:]
+      # phase-3 EE residual (Δx,Δy,Δz): mirror y
+      if flat.shape[-1] >= 17:
+        out[:, 14] = flat[:, 14]
+        out[:, 15] = -flat[:, 15]
+        out[:, 16] = flat[:, 16]
+        if flat.shape[-1] > 17:
+          out[:, 17:] = flat[:, 17:]
     return out.reshape(actions.shape)
 
   def set_teacher(
@@ -412,8 +416,11 @@ class HIMPPO:
     freeze_std_dims: int = 12,
     stand_height: float = 0.74,
     keep_height_tol: float = 0.02,
+    is_waist_one_step_idx: int = 83,
+    keep_loco_always: bool = False,
+    teacher_one_step_obs: int = 0,
   ) -> None:
-    """Freeze a phase-1 copy and enable mean+KL loco lock (Homie ``set_teacher``)."""
+    """Freeze teacher AC and enable mean+KL loco lock (Homie ``set_teacher``)."""
     self.teacher_actor_critic = teacher_actor_critic
     self.teacher_actor_critic.to(self.device)
     self.teacher_actor_critic.eval()
@@ -424,25 +431,65 @@ class HIMPPO:
     self.freeze_std_dims = int(freeze_std_dims)
     self.stand_height = float(stand_height)
     self.keep_height_tol = float(keep_height_tol)
+    self.is_waist_one_step_idx = int(is_waist_one_step_idx)
+    self.keep_loco_always = bool(keep_loco_always)
+    self.teacher_one_step_obs = int(teacher_one_step_obs)
     print(
       f"[INFO] Teacher lock ON: weight={self.keep_loco_weight}, "
-      f"dims={self.keep_loco_dims}, freeze_std={self.freeze_std_dims}"
+      f"dims={self.keep_loco_dims}, freeze_std={self.freeze_std_dims}, "
+      f"is_waist_idx={self.is_waist_one_step_idx}, "
+      f"always={self.keep_loco_always}, teacher_d={self.teacher_one_step_obs}"
     )
 
-  # Phase-2 one-step actor layout (29-DoF G1 + 14-act + grasp7 + container10):
-  #   twist3|h1|ang3|grav3|q29|dq29|a14|grasp7|container10  → d=99
-  #   grasp = [is_target, is_waist, ...] → is_waist at index 83
-  # Homie used a hard index (``obs[:, 99]``); we do the same for the last history step.
-  _IS_WAIST_ONE_STEP_IDX = 83
+  def _teacher_obs(self, obs_batch: torch.Tensor) -> torch.Tensor:
+    """Rebuild phase-2 one-step layout from phase-3 frames for the teacher.
+
+    Phase-2: proprio68 | a14 | grasp7 | container10 = 99
+    Phase-3: proprio68 | a17 | grasp7 | sdf… (no container10 in actor)
+    Teacher keeps first 14 actions; copies grasp7; zeros container10; drops SDF/EE.
+    """
+    d_t = int(self.teacher_one_step_obs)
+    if d_t <= 0:
+      return obs_batch
+    d = int(self.actor_critic.num_one_step_obs)
+    h = int(self.actor_critic.actor_history_length)
+    if d_t >= d:
+      return obs_batch
+    proprio = 68
+    a_t = min(int(self.keep_loco_dims), 14)
+    grasp_dim = 7
+    a_s = int(self.actor_critic.num_actions)
+    obs_t = obs_batch.clone()
+    for t in range(h):
+      o0 = t * d
+      src = obs_batch[:, o0 : o0 + d]
+      frame = torch.zeros(
+        obs_batch.shape[0], d, device=obs_batch.device, dtype=obs_batch.dtype
+      )
+      frame[:, :proprio] = src[:, :proprio]
+      frame[:, proprio : proprio + a_t] = src[:, proprio : proprio + a_t]
+      s_grasp0 = proprio + a_s
+      t_grasp0 = proprio + a_t
+      if src.shape[-1] >= s_grasp0 + grasp_dim:
+        frame[:, t_grasp0 : t_grasp0 + grasp_dim] = src[
+          :, s_grasp0 : s_grasp0 + grasp_dim
+        ]
+      # container10 remains zero (phase-2 placeholder).
+      obs_t[:, o0 : o0 + d] = frame
+    return obs_t
+
+  # Phase-2 one-step: proprio68|a14|grasp7|container10 → is_waist @ 83
+  # Phase-3 one-step: proprio68|a17|grasp7|container10|sdf… → is_waist @ 86
 
   def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
-    """Homie keep mask: lock loco only when NOT in waist mode (``is_waist < 0.5``)."""
+    """Mask for loco keep. Phase-2: only non-waist envs. Phase-3: always on."""
+    if self.keep_loco_always:
+      return torch.ones(obs_batch.shape[0], device=obs_batch.device, dtype=obs_batch.dtype)
     d = int(self.actor_critic.num_one_step_obs)
     h = int(self.actor_critic.actor_history_length)
     base = (h - 1) * d
-    idx = self._IS_WAIST_ONE_STEP_IDX
+    idx = int(self.is_waist_one_step_idx)
     if d > idx:
-      # Last history frame, fixed slot (e.g. flat index 5*99+83=578 when h=6).
       is_waist = obs_batch[:, base + idx]
       return (is_waist < 0.5).float()
     height = obs_batch[:, base + 3]

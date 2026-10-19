@@ -1,0 +1,19 @@
+---
+description: HomieRL_mjlab experiment archive — train and play
+globs: HomieRL_mjlab/**/*
+alwaysApply: false
+---
+
+# Experiment archive rules
+
+When archiving HomieRL_mjlab train or play experiments:
+
+1. Train configs: only the run's `params/env.yaml` and `params/agent.yaml`.
+2. Play: record CLI/checkpoint in `play_meta.json`; link train `params/` by parent dir or sha256; else `未记录`.
+3. Never fill missing **historical train** fields from current source; use `未记录`.
+4. Optional `play_resolved/` must declare archive-time reconstruction provenance.
+5. Never overwrite `logs/rsl_rl/...`; write under `experiments/archives/` (+ `play_sessions/`).
+6. Archive-only requests must not start train/sim (use `archive_play_session.py`, not full viewer).
+7. Keep separate: `RULES.md`, Skill, and scripts under `scripts/experiment_archive/`.
+8. Every `report.md`: 数据观察 / 原因推测 / 已验证结论.
+9. After archive, fill `agent_review.md` from the param diff plus user-observed 弯腰/站立/速度跟随. Stop for explicit confirmation before any training-code edit or new run.

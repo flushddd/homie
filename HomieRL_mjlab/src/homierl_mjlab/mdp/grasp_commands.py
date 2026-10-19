@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 # Narrow paper defaults (0.15..0.35 / -0.05..0.1) never exceed arm reach 0.49
 # → ``need_waist`` stays 0 → ``deviation_waist_joint`` only has zero_loss (keep upright).
 _DEFAULT_POS_X = (0.05, 0.65)
-_DEFAULT_POS_Y = (-0.15, 0.15)
+_DEFAULT_POS_Y = (-0.35, 0.35)
 _DEFAULT_POS_Z = (-1.0, 0.2)
 
 _ARM_REACH = 0.49
@@ -138,28 +138,38 @@ class GraspTargetCommand(CommandTerm):
     forever (TB: need_waist/extend_dist ≈ 0).
     """
     step = int(self._env.common_step_counter)
-    self.arm_on = False  # arm reach training disabled
-    self.is_target.zero_()
+    # Phase-3: arm reach on waist envs; phase-2 keeps arm_on off.
+    self.arm_on = bool(self.cfg.enable_arm_reach)
     prob2 = self.waist_curriculum.value(step)
     was_on = self.waist_on
-    self.waist_on = prob2 >= 0.5
-    self.metrics["waist_curriculum"][:] = prob2
+    # Phase-3 always allows waist/loco mix via is_waist_prob (not Homie schedule).
+    self.waist_on = True if self.arm_on else (prob2 >= 0.5)
+    self.metrics["waist_curriculum"][:] = (
+      float(self.cfg.is_waist_prob) if self.arm_on else prob2
+    )
     if not self.waist_on:
       self.is_waist.zero_()
+      self.is_target.zero_()
       return
     if not (reshuffle_waist or not was_on):
+      if self.arm_on:
+        self.is_target[:] = self.is_waist
       return
+    waist_p = float(self.cfg.is_waist_prob) if self.arm_on else 0.5
     if env_ids is None or (reshuffle_waist and not was_on):
-      # First time waist turns on: assign mask for everyone once.
       rand = torch.rand(self.num_envs, 1, device=self.device)
-      self.is_waist[:] = (rand < 0.5).float()
+      self.is_waist[:] = (rand < waist_p).float()
+      self.is_target[:] = self.is_waist if self.arm_on else torch.zeros_like(self.is_waist)
       return
-    # Only reshuffle envs that also get new targets below.
     n = len(env_ids)
     if n == 0:
       return
     rand = torch.rand(n, 1, device=self.device)
-    self.is_waist[env_ids] = (rand < 0.5).float()
+    self.is_waist[env_ids] = (rand < waist_p).float()
+    if self.arm_on:
+      self.is_target[env_ids] = self.is_waist[env_ids]
+    else:
+      self.is_target[env_ids] = 0.0
 
   def _waist_gate(self, env_ids: torch.Tensor) -> torch.Tensor:
     return self.is_waist[env_ids]
@@ -491,7 +501,7 @@ class GraspTargetCommand(CommandTerm):
 
 @dataclass(kw_only=True)
 class GraspTargetCommandCfg(CommandTermCfg):
-  """Config for Homie waist grasp targets (arm training off)."""
+  """Config for Homie waist grasp targets (arm training off by default)."""
 
   entity_name: str = "robot"
   resampling_time_range: tuple[float, float] = (4.0, 4.0)
@@ -500,6 +510,10 @@ class GraspTargetCommandCfg(CommandTermCfg):
   pos_x: tuple[float, float] = _DEFAULT_POS_X
   pos_y: tuple[float, float] = _DEFAULT_POS_Y
   pos_z: tuple[float, float] = _DEFAULT_POS_Z
+  # Phase-3: enable arm reach (is_target) for EE residual + IK.
+  enable_arm_reach: bool = False
+  # Phase-3 mix: fraction of envs with is_waist=1 (rest keep loco-only).
+  is_waist_prob: float = 0.25
 
   def build(self, env: ManagerBasedRlEnv) -> GraspTargetCommand:
     return GraspTargetCommand(self, env)
