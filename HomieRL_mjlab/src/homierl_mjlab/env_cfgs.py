@@ -134,11 +134,22 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 def _configure_phase_commands_and_obs(
   cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
 ) -> None:
-  """Phase-2: grasp + container10. Phase-3: grasp + SDF (no container10 in obs)."""
+  """All phases share phase-3 actor layout; unused channels are zeros.
+
+  Layout: proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3 = 229
+  Phase-1: grasp/SDF/clearance/EE zeros; actions padded 12→17.
+  Phase-2: real grasp; SDF/clearance/EE zeros; actions padded 14→17.
+  Phase-3: all live.
+  """
   phase = int(phase)
+  actor_terms.pop("container_geom", None)
+
   if phase <= 1:
     cfg.commands.pop("grasp", None)
-    actor_terms.pop("grasp_target", None)
+    actor_terms["grasp_target"] = ObservationTermCfg(
+      func=homie_mdp.zeros_vector,
+      params={"dim": homie_mdp.HOMIE_GRASP_DIM},
+    )
   else:
     cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
       entity_name="robot",
@@ -157,7 +168,7 @@ def _configure_phase_commands_and_obs(
     )
 
   if phase >= 3:
-    # Container params drive analytic SDF only — not exposed as actor obs.
+    # Container params drive analytic SDF only — not exposed as raw geom obs.
     cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
@@ -165,7 +176,6 @@ def _configure_phase_commands_and_obs(
       presence_prob=0.75,
       debug_vis=False,
     )
-    actor_terms.pop("container_geom", None)
     actor_terms["sdf_field"] = ObservationTermCfg(
       func=homie_mdp.sdf_query_field,
       params={
@@ -184,16 +194,18 @@ def _configure_phase_commands_and_obs(
       params={"grasp_command_name": "grasp"},
     )
   else:
-    # Fixed 10-D container zeros in phase-1/2 (slot reserved).
-    cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
-      entity_name="robot",
-      randomize=False,
-      fixed_values=(0.0,) * 10,
-      debug_vis=False,
+    cfg.commands.pop("container", None)
+    actor_terms["sdf_field"] = ObservationTermCfg(
+      func=homie_mdp.zeros_vector,
+      params={"dim": homie_mdp.HOMIE_SDF_DIM},
     )
-    actor_terms["container_geom"] = ObservationTermCfg(
-      func=homie_mdp.container_geometry_command,
-      params={"command_name": "container"},
+    actor_terms["arm_clearance"] = ObservationTermCfg(
+      func=homie_mdp.zeros_vector,
+      params={"dim": homie_mdp.HOMIE_CLEARANCE_DIM},
+    )
+    actor_terms["ee_target_error"] = ObservationTermCfg(
+      func=homie_mdp.zeros_vector,
+      params={"dim": homie_mdp.HOMIE_EE_ERR_DIM},
     )
 
 
@@ -327,26 +339,23 @@ def homie_g1_flat_env_cfg(
       noise=Unoise(n_min=-2.0, n_max=2.0),
       scale=0.05,
     ),
-    "actions": ObservationTermCfg(func=vel_mdp.last_action),
+    "actions": ObservationTermCfg(
+      func=homie_mdp.padded_last_action,
+      params={"target_dim": homie_mdp.HOMIE_ACTION_OBS_DIM},
+    ),
   }
-  # Grasp (phase-2) then container (10-D) after actions; critic adds lin_vel last.
+  # Unified tail after actions; critic appends lin_vel last.
   _configure_phase_commands_and_obs(cfg, phase, actor_terms)
   critic_terms = {
     **actor_terms,
     "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel, scale=1.0),
     # Homie critic appends base_lin_vel * obs_scales.lin_vel (2.0).
-    # Keep after proprio; container stays at actor tail via shared actor_terms.
     "base_lin_vel": ObservationTermCfg(
       func=vel_mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_lin_vel"},
       scale=2.0,
     ),
   }
-  # Phase-1/2: container stays last on critic after lin_vel.
-  # Phase-3: no container10; SDF/clearance already in actor_terms.
-  if int(phase) < 3 and "container_geom" in critic_terms:
-    c_term = critic_terms.pop("container_geom")
-    critic_terms["container_geom"] = c_term
   cfg.observations = {
     "actor": ObservationGroupCfg(
       terms=actor_terms,

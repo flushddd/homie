@@ -14,10 +14,20 @@ from .container_commands import ContainerGeometryCommand, ContainerGeometryComma
 from .ee_residual_actions import EeResidualIkAction, EeResidualIkActionCfg
 from .grasp_commands import GraspTargetCommand, GraspTargetCommandCfg
 from .observations import (
+  HOMIE_ACTION_OBS_DIM,
+  HOMIE_CLEARANCE_DIM,
+  HOMIE_EE_ERR_DIM,
+  HOMIE_GRASP_DIM,
+  HOMIE_IS_WAIST_IDX,
+  HOMIE_ONE_STEP_OBS,
+  HOMIE_PROPRIO_DIM,
+  HOMIE_SDF_DIM,
   container_geometry_command,
   grasp_target_command,
   height_command,
+  padded_last_action,
   twist_command_xy_yaw,
+  zeros_vector,
 )
 from .sdf_observations import arm_clearance_field, ee_target_error, sdf_query_field
 from .rewards import (
@@ -100,7 +110,16 @@ __all__ = [
   "get_curriculum_ratio",
   "grasp_target_command",
   "height_command",
+  "HOMIE_ACTION_OBS_DIM",
+  "HOMIE_CLEARANCE_DIM",
+  "HOMIE_EE_ERR_DIM",
+  "HOMIE_GRASP_DIM",
+  "HOMIE_IS_WAIST_IDX",
+  "HOMIE_ONE_STEP_OBS",
+  "HOMIE_PROPRIO_DIM",
+  "HOMIE_SDF_DIM",
   "hold_joints_at_default",
+  "padded_last_action",
   "init_upper_body_curriculum",
   "log_waist_pitch",
   "joint_power",
@@ -126,4 +145,5 @@ __all__ = [
   "tracking_y_vel",
   "twist_command_xy_yaw",
   "update_upper_body_pose_curriculum",
+  "zeros_vector",
 ]

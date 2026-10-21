@@ -494,12 +494,20 @@ class HomieOnPolicyRunner:
     torch.save(payload, path)
 
   # Homie one-step layouts (actor):
-  #   phase-1: proprio68 | a12 | container10 = 90
-  #   phase-2: proprio68 | a14 | grasp7 | container10 = 99
-  #   phase-3: proprio68 | a17 | grasp7 | sdf… = 229
+  #   legacy p1: proprio68 | a12 | container10 = 90
+  #   legacy p2: proprio68 | a14 | grasp7 | container10 = 99
+  #   unified:   proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
   _HOMIE_PROPRIO = 68
   _HOMIE_GRASP = 7
   _HOMIE_CONTAINER = 10
+  _HOMIE_ACT_OBS = 17
+
+  @classmethod
+  def _act_obs_slots(cls, one_step: int, num_actions: int) -> int:
+    """Action-history width in one-step obs (17 once unified layout is used)."""
+    if one_step >= cls._HOMIE_PROPRIO + cls._HOMIE_ACT_OBS + cls._HOMIE_GRASP:
+      return cls._HOMIE_ACT_OBS
+    return int(num_actions)
 
   def _remap_homie_actor_frame(
     self,
@@ -517,32 +525,39 @@ class HomieOnPolicyRunner:
     proprio = self._HOMIE_PROPRIO
     grasp = self._HOMIE_GRASP
     container = self._HOMIE_CONTAINER
+    old_slots = self._act_obs_slots(old_one, old_act)
+    new_slots = self._act_obs_slots(new_one, new_act)
 
-    old_after = old_one - proprio - old_act
-    old_has_grasp = old_after >= grasp
-    old_grasp = grasp if old_has_grasp else 0
-    old_cont = (
-      container
-      if (old_after - old_grasp) >= container
-      else max(old_after - old_grasp, 0)
-    )
-    if proprio + old_act + old_grasp + old_cont != old_one:
-      print(
-        f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
-        "using generic proprio|act copy"
+    old_after = old_one - proprio - old_slots
+    # Legacy container10 vs unified SDF trail vs grasp-only.
+    if old_one >= proprio + self._HOMIE_ACT_OBS + grasp:
+      old_grasp = grasp
+      old_cont = 0  # SDF/… trail — do not copy into new
+    else:
+      old_has_grasp = old_after >= grasp
+      old_grasp = grasp if old_has_grasp else 0
+      old_cont = (
+        container
+        if (old_after - old_grasp) >= container
+        else max(old_after - old_grasp, 0)
       )
-      proprio = old_one - old_act
-      old_grasp = 0
-      old_cont = 0
+      if proprio + old_slots + old_grasp + old_cont != old_one:
+        print(
+          f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
+          "using generic proprio|act copy"
+        )
+        proprio = old_one - old_slots
+        old_grasp = 0
+        old_cont = 0
 
-    new_after = new_one - proprio - new_act
+    new_after = new_one - proprio - new_slots
     new_grasp = grasp if new_after >= grasp else 0
-    if proprio + new_act + new_grasp > new_one:
-      print(f"[WARN] new actor layout too small: one={new_one} act={new_act}")
+    if proprio + new_slots + new_grasp > new_one:
+      print(f"[WARN] new actor layout too small: one={new_one} act_slots={new_slots}")
       return old_w
 
     new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
-    a_copy = min(old_act, new_act)
+    a_copy = min(old_slots, new_slots, old_act, new_act)
     g_copy = min(old_grasp, new_grasp)
     for t in range(hist):
       o0 = t * old_one
@@ -552,8 +567,8 @@ class HomieOnPolicyRunner:
         :, o0 + proprio : o0 + proprio + a_copy
       ]
       if g_copy > 0:
-        o_g = o0 + proprio + old_act
-        n_g = n0 + proprio + new_act
+        o_g = o0 + proprio + old_slots
+        n_g = n0 + proprio + new_slots
         new_w[:, n_g : n_g + g_copy] = old_w[:, o_g : o_g + g_copy]
     return new_w
 
@@ -574,22 +589,24 @@ class HomieOnPolicyRunner:
     grasp = self._HOMIE_GRASP
     lin_vel = 3
 
-    old_core = old_one
     old_has_lin = False
     old_actor_one = old_one
-    # Prefer ...|lin_vel at end (phase-2/3 critic).
+    # Prefer ...|lin_vel at end (legacy + unified critic = actor + 3).
     if old_one >= lin_vel:
       maybe_actor = old_one - lin_vel
-      if maybe_actor in (
+      legacy = {
         proprio + old_act,
         proprio + old_act + grasp,
         proprio + old_act + grasp + self._HOMIE_CONTAINER,
         proprio + old_act + self._HOMIE_CONTAINER,
-      ):
+      }
+      unified_min = proprio + self._HOMIE_ACT_OBS + grasp
+      if maybe_actor in legacy or maybe_actor >= unified_min:
         old_has_lin = True
         old_actor_one = maybe_actor
 
-    new_has_lin = new_one >= lin_vel and (new_one - lin_vel) >= proprio + new_act
+    new_slots = self._act_obs_slots(new_one - lin_vel if new_one >= lin_vel else new_one, new_act)
+    new_has_lin = new_one >= lin_vel and (new_one - lin_vel) >= proprio + new_slots
     new_actor_one = new_one - lin_vel if new_has_lin else new_one
 
     actor_old = old_w.new_zeros(old_w.shape[0], hist * old_actor_one)

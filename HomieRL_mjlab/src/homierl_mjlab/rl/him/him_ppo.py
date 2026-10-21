@@ -69,7 +69,7 @@ class HIMPPO:
     self.freeze_std_dims = 12
     self.stand_height = 0.74
     self.keep_height_tol = 0.02
-    self.is_waist_one_step_idx = 83
+    self.is_waist_one_step_idx = 86  # unified: 68+17+1
     self.keep_loco_always = False
     self.teacher_one_step_obs = 0
 
@@ -346,8 +346,21 @@ class HIMPPO:
       mean_loss_keep / num_updates,
     )
 
-  # ---- symmetry helpers (Homie obs layout) ----
-  # one-step: [vx,vy,yaw, height, ang(3), grav(3), q(N), dq(N), a(12)]
+  # ---- symmetry helpers (unified Homie obs layout) ----
+  # one-step actor: proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3
+  # critic: same + trailing lin_vel(3)
+  _ACT_OBS = 17
+  _GRASP = 7
+  _SDF = 128
+  _CLEAR = 6
+  _EE = 3
+
+  @staticmethod
+  def _action_obs_slots(step_dim: int, num_actions: int, a0: int) -> int:
+    """Obs action-history width: 17 for unified layout, else policy act dim."""
+    if step_dim >= a0 + 17 + 7:
+      return 17
+    return int(num_actions)
 
   def _flip_one_step(self, step: torch.Tensor, with_lin_vel: bool) -> torch.Tensor:
     out = step.clone()
@@ -368,15 +381,73 @@ class HIMPPO:
       for i in range(n):
         out[..., q0 + i] = sign[i] * step[..., q0 + perm[i]]
         out[..., q0 + n + i] = sign[i] * step[..., q0 + n + perm[i]]
-    # actions: 12 legs (+ optional 3 waist). Assume leg block [L6 | R6].
+    # actions: [L6|R6] (+ waist14) (+ EE17). Pad slots beyond num_actions stay 0.
     a0 = 10 + 2 * n
     n_act = int(self.actor_critic.num_actions)
+    act_slots = self._action_obs_slots(int(step.shape[-1]), n_act, a0)
     if step.shape[-1] >= a0 + n_act:
       out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
-    if with_lin_vel and step.shape[-1] >= a0 + n_act + 3:
-      lv = a0 + n_act
+    # grasp: [is_target, is_waist, extend, tx, ty, tz, arm] — mirror ty, swap arm 1↔2
+    g0 = a0 + act_slots
+    if step.shape[-1] >= g0 + self._GRASP:
+      out[..., g0 : g0 + self._GRASP] = step[..., g0 : g0 + self._GRASP]
+      out[..., g0 + 4] = -step[..., g0 + 4]
+      arm = step[..., g0 + 6]
+      out[..., g0 + 6] = torch.where(
+        arm > 1.5, torch.ones_like(arm), torch.where(arm > 0.5, torch.full_like(arm, 2.0), arm)
+      )
+      # SDF: phi||valid — mirror by y-flip of the fixed base-frame query grid
+      s0 = g0 + self._GRASP
+      if step.shape[-1] >= s0 + self._SDF:
+        k = self._SDF // 2
+        perm = self._sdf_y_flip_perm(k, step.device)
+        phi = step[..., s0 : s0 + k]
+        valid = step[..., s0 + k : s0 + self._SDF]
+        out[..., s0 : s0 + k] = phi[..., perm]
+        out[..., s0 + k : s0 + self._SDF] = valid[..., perm]
+        # clearance: [L_sh, L_el, L_wr, R_sh, R_el, R_wr] → swap L/R blocks
+        c0 = s0 + self._SDF
+        if step.shape[-1] >= c0 + self._CLEAR:
+          clr = step[..., c0 : c0 + self._CLEAR]
+          out[..., c0 : c0 + 3] = clr[..., 3:6]
+          out[..., c0 + 3 : c0 + 6] = clr[..., 0:3]
+          e0 = c0 + self._CLEAR
+          if step.shape[-1] >= e0 + self._EE:
+            out[..., e0 : e0 + self._EE] = step[..., e0 : e0 + self._EE]
+            out[..., e0 + 1] = -step[..., e0 + 1]
+    # critic lin_vel is always the trailing 3 dims (after grasp/SDF/…), not after acts
+    if with_lin_vel and step.shape[-1] >= 3:
+      lv = int(step.shape[-1]) - 3
+      out[..., lv] = step[..., lv]
       out[..., lv + 1] = -step[..., lv + 1]
+      out[..., lv + 2] = step[..., lv + 2]
     return out
+
+  _sdf_perm_cache: dict[tuple[int, str], torch.Tensor] = {}
+
+  @classmethod
+  def _sdf_y_flip_perm(cls, count: int, device: torch.device) -> torch.Tensor:
+    """Index perm mapping query i → query with (x,-y,z) for the fixed SDF grid."""
+    key = (int(count), str(device))
+    cached = cls._sdf_perm_cache.get(key)
+    if cached is not None:
+      return cached
+    from homierl_mjlab.mdp.sdf_geometry import make_shoulder_query_grid
+
+    grid = make_shoulder_query_grid(
+      count=count,
+      x_range=(0.10, 0.70),
+      y_range=(-0.45, 0.45),
+      z_range=(-0.25, 0.35),
+      device=device,
+    )
+    mirrored = grid.clone()
+    mirrored[:, 1] = -mirrored[:, 1]
+    # Nearest neighbour match (grid is symmetric in y by construction).
+    d = torch.cdist(mirrored, grid)
+    perm = torch.argmin(d, dim=-1)
+    cls._sdf_perm_cache[key] = perm
+    return perm
 
   def flip_actor_obs(self, obs: torch.Tensor) -> torch.Tensor:
     h = self.actor_critic.actor_history_length
@@ -429,7 +500,7 @@ class HIMPPO:
     freeze_std_dims: int = 12,
     stand_height: float = 0.74,
     keep_height_tol: float = 0.02,
-    is_waist_one_step_idx: int = 83,
+    is_waist_one_step_idx: int = 86,
     keep_loco_always: bool = False,
     teacher_one_step_obs: int = 0,
   ) -> None:
@@ -455,25 +526,24 @@ class HIMPPO:
     )
 
   def _teacher_obs(self, obs_batch: torch.Tensor) -> torch.Tensor:
-    """Rebuild phase-2 one-step layout from phase-3 frames for the teacher.
+    """Zero channels the frozen teacher never trained on.
 
-    Phase-2: proprio68 | a14 | grasp7 | container10 = 99
-    Phase-3: proprio68 | a17 | grasp7 | sdf… (no container10 in actor)
-    Teacher keeps first 14 actions; copies grasp7; zeros container10; drops SDF/EE.
+    Shared layout: proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3.
+    Phase-2 teacher (p1): loco a12 only; grasp/SDF stay 0.
+    Phase-3 teacher (p2): loco a14 + grasp; SDF/EE-act stay 0.
     """
-    d_t = int(self.teacher_one_step_obs)
-    if d_t <= 0:
+    if self.teacher_actor_critic is None:
       return obs_batch
     d = int(self.actor_critic.num_one_step_obs)
     h = int(self.actor_critic.actor_history_length)
-    if d_t >= d:
-      return obs_batch
     proprio = 68
-    a_t = min(int(self.keep_loco_dims), 14)
-    grasp_dim = 7
-    a_s = int(self.actor_critic.num_actions)
-    # Teacher net shares phase-3 layout: proprio | a17 | grasp7 | sdf…
-    # Zero EE-action history + SDF trail; keep loco acts + grasp.
+    act_slots = self._ACT_OBS if d >= proprio + self._ACT_OBS + self._GRASP else int(
+      self.actor_critic.num_actions
+    )
+    a_t = min(int(self.keep_loco_dims), act_slots)
+    # p3 keep_loco_dims=14 → teacher saw grasp; p2 keep=12 → teacher did not.
+    copy_grasp = int(self.keep_loco_dims) >= 14
+    grasp_dim = self._GRASP
     obs_t = torch.zeros_like(obs_batch)
     for t in range(h):
       o0 = t * d
@@ -481,13 +551,13 @@ class HIMPPO:
       frame = obs_t[:, o0 : o0 + d]
       frame[:, :proprio] = src[:, :proprio]
       frame[:, proprio : proprio + a_t] = src[:, proprio : proprio + a_t]
-      grasp0 = proprio + a_s
-      if src.shape[-1] >= grasp0 + grasp_dim:
-        frame[:, grasp0 : grasp0 + grasp_dim] = src[:, grasp0 : grasp0 + grasp_dim]
+      if copy_grasp:
+        grasp0 = proprio + act_slots
+        if src.shape[-1] >= grasp0 + grasp_dim:
+          frame[:, grasp0 : grasp0 + grasp_dim] = src[:, grasp0 : grasp0 + grasp_dim]
     return torch.nan_to_num(obs_t, nan=0.0, posinf=0.0, neginf=0.0)
 
-  # Phase-2 one-step: proprio68|a14|grasp7|container10 → is_waist @ 83
-  # Phase-3 one-step: proprio68|a17|grasp7|container10|sdf… → is_waist @ 86
+  # Unified one-step: proprio68|a17|grasp7|sdf… → is_waist @ 86
 
   def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
     """Mask for loco keep. Phase-2: only non-waist envs. Phase-3: always on."""
