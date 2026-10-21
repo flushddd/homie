@@ -248,16 +248,33 @@ HOMIE_ARTICULATION = EntityArticulationInfoCfg(
   soft_joint_pos_limit_factor=0.975,
 )
 
-# Foot sphere collisions from the inspire XML (4 per foot after naming).
-FEET_COLLISION = CollisionCfg(
-  geom_names_expr=(r"^(left|right)_foot[1-4]_collision$",),
-  contype=0,
-  conaffinity=1,
+# Feet: contype=0 / ca=1 (floor+walls). Body/arms: ct=2 / ca=1 → hit env
+# (floor/walls ct=1) but NOT each other (avoids self-contact OOM at 4k envs).
+# Fingers/force-sensors stay unnamed → disabled; palm (base_link) kept.
+G1_COLLISION = CollisionCfg(
+  geom_names_expr=(
+    r"^(left|right)_foot[1-4]_collision$",
+    r".*_collision(_\d+)?$",
+  ),
+  contype={
+    r"^(left|right)_foot[1-4]_collision$": 0,
+    r".*": 2,
+  },
+  conaffinity={
+    r"^(left|right)_foot[1-4]_collision$": 1,
+    r".*": 1,
+  },
   condim=3,
-  priority=1,
+  priority={
+    r"^(left|right)_foot[1-4]_collision$": 1,
+    r".*": 0,
+  },
   friction=(0.6,),
   disable_other_geoms=True,
 )
+
+# Back-compat alias (feet-only era).
+FEET_COLLISION = G1_COLLISION
 
 
 def _ensure_named_sensor(
@@ -275,6 +292,65 @@ def _ensure_named_sensor(
     objtype=mujoco.mjtObj.mjOBJ_SITE,
     objname=site_name,
   )
+
+
+def _is_visual_geom(geom: mujoco.MjsGeom) -> bool:
+  return geom.contype == 0 and geom.conaffinity == 0 and int(geom.group) == 1
+
+
+def _skip_collision_mesh(mesh: str, body_name: str) -> bool:
+  """Drop high-cardinality / destabilizing contacts.
+
+  Keep: feet spheres, pelvis/torso/head, arms + palm.
+  Skip: fingers, force sensors, leg link meshes (fight foot spheres → nefc/nan).
+  """
+  if "force_sensor" in mesh:
+    return True
+  # Finger phalanges (thumb/index/...); keep ``*_base_link`` palm.
+  finger_tokens = (
+    "thumb_",
+    "index_",
+    "middle_",
+    "ring_",
+    "little_",
+  )
+  if any(t in mesh for t in finger_tokens) or any(t in body_name for t in finger_tokens):
+    return True
+  leg_tokens = (
+    "hip_pitch",
+    "hip_roll",
+    "hip_yaw",
+    "knee",
+    "ankle_pitch",
+    "ankle_roll",
+  )
+  if any(t in mesh for t in leg_tokens) or any(t in body_name for t in leg_tokens):
+    return True
+  return False
+
+
+def _name_collision_geoms(spec: mujoco.MjSpec) -> None:
+  """Assign stable names to non-visual collision geoms (CollisionCfg matches by name)."""
+  used = {g.name for g in spec.geoms if g.name}
+  for body in spec.bodies:
+    idx = 0
+    for geom in body.geoms:
+      if _is_visual_geom(geom) or geom.name:
+        continue
+      mesh = geom.meshname or ""
+      if _skip_collision_mesh(mesh, body.name):
+        continue
+      if geom.type == mujoco.mjtGeom.mjGEOM_MESH and mesh:
+        base = f"{mesh}_collision"
+      else:
+        base = f"{body.name}_collision"
+      name = base if idx == 0 else f"{base}_{idx}"
+      while name in used:
+        idx += 1
+        name = f"{base}_{idx}"
+      geom.name = name
+      used.add(name)
+      idx += 1
 
 
 def _patch_inspire_spec(spec: mujoco.MjSpec) -> mujoco.MjSpec:
@@ -300,6 +376,8 @@ def _patch_inspire_spec(spec: mujoco.MjSpec) -> mujoco.MjSpec:
         rgba=[1.0, 0.0, 0.0, 1.0],
       )
 
+  _name_collision_geoms(spec)
+
   _ensure_named_sensor(
     spec, "imu_ang_vel", mujoco.mjtSensor.mjSENS_GYRO, "imu_in_pelvis"
   )
@@ -320,7 +398,7 @@ def get_g1_robot_cfg() -> EntityCfg:
   """G1 inspire-waist: 29-DoF obs; PD on legs+waist+arms; policy = 12 legs."""
   return EntityCfg(
     init_state=HOMIE_INIT_STATE,
-    collisions=(FEET_COLLISION,),
+    collisions=(G1_COLLISION,),
     spec_fn=get_inspire_waist_spec,
     articulation=HOMIE_ARTICULATION,
   )
@@ -334,6 +412,7 @@ __all__ = [
   "ARM_JOINT_NAMES",
   "FEET_COLLISION",
   "FOOT_COLLISION_GEOM_NAMES",
+  "G1_COLLISION",
   "G1_ACTION_SCALE",
   "HOMIE_ACTION_SCALE",
   "HOMIE_ARTICULATION",

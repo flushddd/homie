@@ -275,7 +275,7 @@
       "args": [
         "Mjlab-Homie-Flat-Unitree-G1-Phase3",
         "--env.scene.num-envs",
-        "4096",
+        "2048",
         "--agent.resume",
         "True",
         "--agent.load-run",

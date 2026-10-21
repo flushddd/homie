@@ -7,9 +7,9 @@ task frame fixed at episode reset: origin = initial pelvis projection on ground,
 x forward, y left, z up.
 
 Phase-1/2 use a constant vector (no randomization) matching the design doc example.
-Phase-3 samples open-bottom square walls around the grasp target and syncs a
-mocap MuJoCo entity (``container_walls``) for collide + viz; analytic SDF uses
-the same params.
+Phase-3 samples a square bin (4 walls + thin bottom) around the grasp target
+and syncs a mocap MuJoCo entity (``container_walls``) for collide + viz;
+analytic SDF uses the same params.
 """
 
 from __future__ import annotations
@@ -22,7 +22,11 @@ import torch
 from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 
-from homierl_mjlab.robot.container_spec import CONTAINER_ENTITY_NAME, WALL_GEOM_NAMES
+from homierl_mjlab.robot.container_spec import (
+  BOTTOM_GEOM_NAME,
+  CONTAINER_ENTITY_NAME,
+  WALL_GEOM_NAMES,
+)
 
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -47,8 +51,10 @@ class ContainerGeometryCommand(CommandTerm):
     self.ref_origin_xy = torch.zeros(self.num_envs, 2, device=self.device)
     self.ref_yaw = torch.zeros(self.num_envs, device=self.device)
     self.container = torch.zeros(self.num_envs, 10, device=self.device)
-    # 1 = open-bottom square walls present (phase-3).
+    # 1 = square bin present (phase-3).
     self.present = torch.zeros(self.num_envs, device=self.device)
+    # Task-frame offset of container center relative to grasp (for follow).
+    self._grasp_offset_xy = torch.zeros(self.num_envs, 2, device=self.device)
     self._fixed = torch.tensor(cfg.fixed_values, device=self.device, dtype=torch.float32)
     if self._fixed.numel() != 10:
       raise ValueError(f"fixed_values must have length 10, got {self._fixed.numel()}")
@@ -152,6 +158,8 @@ class ContainerGeometryCommand(CommandTerm):
     x_c = x_t - off_x
     y_c = y_t - off_y
     z_b = tw[:, 2] - 0.02  # slightly below target (desktop support)
+    self._grasp_offset_xy[env_ids, 0] = off_x
+    self._grasp_offset_xy[env_ids, 1] = off_y
 
     self.container[env_ids, 0] = x_c * present
     self.container[env_ids, 1] = y_c * present
@@ -162,7 +170,25 @@ class ContainerGeometryCommand(CommandTerm):
     self.container[env_ids, 6] = present  # b_rect
     self.container[env_ids, 7] = 0.0  # b_circle (ellipse later)
     self.container[env_ids, 8] = t_wall * present
-    self.container[env_ids, 9] = 0.0  # open bottom
+    self.container[env_ids, 9] = 0.01 * present  # thin bottom plate
+
+  def _follow_grasp_for_present(self) -> None:
+    """Keep present containers centered on the current grasp (play slider / crawl)."""
+    ids = (self.present > 0.5).nonzero(as_tuple=False).flatten()
+    if len(ids) == 0:
+      return
+    grasp = self._env.command_manager.get_term("grasp")
+    tw = grasp.target_pos_w[ids]
+    yaw = self.ref_yaw[ids]
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    dx = tw[:, 0] - self.ref_origin_xy[ids, 0]
+    dy = tw[:, 1] - self.ref_origin_xy[ids, 1]
+    x_t = c * dx + s * dy
+    y_t = -s * dx + c * dy
+    off = self._grasp_offset_xy[ids]
+    self.container[ids, 0] = x_t - off[:, 0]
+    self.container[ids, 1] = y_t - off[:, 1]
+    self.container[ids, 2] = tw[:, 2] - 0.02
 
   def container_pos_w(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
     if env_ids is None:
@@ -250,25 +276,49 @@ class ContainerGeometryCommand(CommandTerm):
     )
     local_pos = torch.where(present.view(n, 1, 1), local_pos, torch.zeros_like(local_pos))
 
+    # Thin bottom plate (visual + foot contact); outer footprint = inner + 2*t_wall.
+    bottom_half = torch.zeros(n, 3, device=self.device)
+    bottom_pos = torch.zeros(n, 3, device=self.device)
+    bottom_half[:, 0] = 0.5 * inner_x + t_wall
+    bottom_half[:, 1] = 0.5 * inner_y + t_wall
+    bottom_half[:, 2] = 0.005
+    bottom_pos[:, 2] = 0.005
+    bottom_half = torch.where(
+      present.unsqueeze(-1), bottom_half, torch.full_like(bottom_half, _EPS_HALF)
+    )
+    bottom_pos = torch.where(present.unsqueeze(-1), bottom_pos, torch.zeros_like(bottom_pos))
+
     gnames = list(walls.geom_names)
     try:
       g_order = [gnames.index(n_) for n_ in WALL_GEOM_NAMES]
+      bottom_i = gnames.index(BOTTOM_GEOM_NAME)
     except ValueError:
       g_order = list(range(min(4, len(gnames))))
+      bottom_i = 4 if len(gnames) > 4 else None
     gids = walls.indexing.geom_ids
     if isinstance(gids, torch.Tensor):
       gid_t = gids[g_order].to(device=self.device)
+      gid_bottom = gids[bottom_i].to(device=self.device) if bottom_i is not None else None
     else:
       gid_t = torch.as_tensor(gids, device=self.device)[g_order]
+      gid_bottom = (
+        torch.as_tensor(gids, device=self.device)[bottom_i]
+        if bottom_i is not None
+        else None
+      )
 
     env_i = env_ids.to(dtype=torch.long)
     model = self._env.sim.model
     model.geom_pos[env_i[:, None], gid_t[None, :], :] = local_pos
     model.geom_size[env_i[:, None], gid_t[None, :], :] = local_half
-    # Broadphase bounds for boxes.
     rbound = torch.linalg.norm(local_half, dim=-1)
     model.geom_rbound[env_i[:, None], gid_t[None, :]] = rbound
     model.geom_aabb[env_i[:, None], gid_t[None, :], 1] = local_half
+    if gid_bottom is not None:
+      model.geom_pos[env_i, gid_bottom, :] = bottom_pos
+      model.geom_size[env_i, gid_bottom, :] = bottom_half
+      model.geom_rbound[env_i, gid_bottom] = torch.linalg.norm(bottom_half, dim=-1)
+      model.geom_aabb[env_i, gid_bottom, 1] = bottom_half
 
   def _update_metrics(self) -> None:
     self.metrics["container_rect"][:] = self.container[:, 6]
@@ -276,7 +326,14 @@ class ContainerGeometryCommand(CommandTerm):
     self.metrics["container_present"][:] = self.present
 
   def _update_command(self, env_ids: torch.Tensor | None) -> None:
+    # Re-sync every step: reset_scene_to_default re-buries mocap walls on reset.
+    # Also re-center on grasp so play Viser / arm crawl keep a closed bin.
     del env_ids
+    if self.cfg.sample_around_grasp and bool(self.present.any()):
+      self._follow_grasp_for_present()
+      self.sync_walls_to_sim()
+    elif bool(self.present.any()):
+      self.sync_walls_to_sim()
 
 
 @dataclass(kw_only=True)
@@ -289,10 +346,11 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   debug_vis: bool = False
   randomize: bool = False
   fixed_values: tuple[float, ...] = field(default_factory=lambda: _FIXED_CONTAINER)
-  # Phase-3: sample open-bottom square walls around grasp (overrides randomize).
+  # Phase-3: sample square bin around grasp (overrides randomize).
   sample_around_grasp: bool = False
   presence_prob: float = 0.75
-  inner_size_xy: tuple[float, float] = (0.28, 0.45)
+  # Everyday shallow bin: ~30–40 cm cavity, ~12–20 cm wall height, ~2 cm walls.
+  inner_size_xy: tuple[float, float] = (0.30, 0.42)
   target_offset_xy: tuple[float, float] = (-0.06, 0.06)
   target_margin: float = 0.06
   # Used only if randomize=True
@@ -300,8 +358,8 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   pos_y: tuple[float, float] = (-0.30, 0.30)
   z_b: tuple[float, float] = (0.70, 0.80)
   size_xy: tuple[float, float] = (0.20, 0.50)
-  height: tuple[float, float] = (0.08, 0.18)
-  thickness: tuple[float, float] = (0.01, 0.025)
+  height: tuple[float, float] = (0.12, 0.22)
+  thickness: tuple[float, float] = (0.015, 0.03)
   circle_prob: float = 0.4
 
   def build(self, env: ManagerBasedRlEnv) -> ContainerGeometryCommand:

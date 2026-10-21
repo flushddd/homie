@@ -214,9 +214,14 @@ class HIMPPO:
       if self.teacher_actor_critic is not None and self.keep_loco_weight > 0:
         with torch.no_grad():
           obs_t = self._teacher_obs(obs_batch)
-          _ = self.teacher_actor_critic.act(obs_t)
-          teacher_mu = self.teacher_actor_critic.action_mean
-          teacher_sigma = self.teacher_actor_critic.action_std
+          # Inference only (no Normal sample — avoids CUDA std assert on teacher).
+          teacher_mu = self.teacher_actor_critic.act_inference(obs_t)
+          teacher_sigma = (
+            torch.nan_to_num(self.teacher_actor_critic.std, nan=1.0)
+            .abs()
+            .clamp(min=1e-4)
+            .expand_as(teacher_mu)
+          )
         k = min(int(self.keep_loco_dims), mu_batch.shape[-1], teacher_mu.shape[-1])
         loco_mask = self._loco_mask(obs_batch)
         mask_count = loco_mask.sum().clamp(min=1.0)
@@ -312,6 +317,14 @@ class HIMPPO:
         self.actor_critic.std.grad[: self.freeze_std_dims].zero_()
       nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
       self.optimizer.step()
+      # Keep Diagonal Normal valid after a bad minibatch (EE dims not freeze_std).
+      if hasattr(self.actor_critic, "std"):
+        with torch.no_grad():
+          self.actor_critic.std.copy_(
+            torch.nan_to_num(self.actor_critic.std, nan=1.0, posinf=1.0, neginf=1.0)
+            .abs()
+            .clamp(min=1e-4, max=2.0)
+          )
 
       mean_value_loss += value_loss.item()
       mean_surrogate_loss += surrogate_loss.item()
@@ -459,24 +472,19 @@ class HIMPPO:
     a_t = min(int(self.keep_loco_dims), 14)
     grasp_dim = 7
     a_s = int(self.actor_critic.num_actions)
-    obs_t = obs_batch.clone()
+    # Teacher net shares phase-3 layout: proprio | a17 | grasp7 | sdf…
+    # Zero EE-action history + SDF trail; keep loco acts + grasp.
+    obs_t = torch.zeros_like(obs_batch)
     for t in range(h):
       o0 = t * d
       src = obs_batch[:, o0 : o0 + d]
-      frame = torch.zeros(
-        obs_batch.shape[0], d, device=obs_batch.device, dtype=obs_batch.dtype
-      )
+      frame = obs_t[:, o0 : o0 + d]
       frame[:, :proprio] = src[:, :proprio]
       frame[:, proprio : proprio + a_t] = src[:, proprio : proprio + a_t]
-      s_grasp0 = proprio + a_s
-      t_grasp0 = proprio + a_t
-      if src.shape[-1] >= s_grasp0 + grasp_dim:
-        frame[:, t_grasp0 : t_grasp0 + grasp_dim] = src[
-          :, s_grasp0 : s_grasp0 + grasp_dim
-        ]
-      # container10 remains zero (phase-2 placeholder).
-      obs_t[:, o0 : o0 + d] = frame
-    return obs_t
+      grasp0 = proprio + a_s
+      if src.shape[-1] >= grasp0 + grasp_dim:
+        frame[:, grasp0 : grasp0 + grasp_dim] = src[:, grasp0 : grasp0 + grasp_dim]
+    return torch.nan_to_num(obs_t, nan=0.0, posinf=0.0, neginf=0.0)
 
   # Phase-2 one-step: proprio68|a14|grasp7|container10 → is_waist @ 83
   # Phase-3 one-step: proprio68|a17|grasp7|container10|sdf… → is_waist @ 86

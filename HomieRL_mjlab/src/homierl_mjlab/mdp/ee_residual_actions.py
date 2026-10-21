@@ -8,7 +8,7 @@ a bounded residual relative to the anchored grasp target.
   desired_base = target_base + delta
   q_arm ← DLS IK in base frame toward desired_base
 
-Inactive reach envs (``is_waist=0`` / no arm) hold arm joints at default.
+Inactive reach envs (``is_target=0``) hold arm joints at default.
 """
 
 from __future__ import annotations
@@ -160,9 +160,11 @@ class EeResidualIkAction(ActionTerm):
   def apply_actions(self) -> None:
     grasp = self._env.command_manager.get_term("grasp")
     arm = grasp.target_arm.squeeze(-1)
-    is_waist = grasp.is_waist.squeeze(-1) > 0.5
-    left_mask = is_waist & (arm > 0.5) & (arm < 1.5)
-    right_mask = is_waist & (arm > 1.5)
+    # Reach mode only (is_target=1). Waist-only / loco keep arms at default —
+    # gating on is_waist yanked ~80% of envs toward far targets and caused falls.
+    is_reach = grasp.is_target.squeeze(-1) > 0.5
+    left_mask = is_reach & (arm > 0.5) & (arm < 1.5)
+    right_mask = is_reach & (arm > 1.5)
 
     left_tgt = self.robot.data.default_joint_pos[:, self._left_ids].clone()
     right_tgt = self.robot.data.default_joint_pos[:, self._right_ids].clone()

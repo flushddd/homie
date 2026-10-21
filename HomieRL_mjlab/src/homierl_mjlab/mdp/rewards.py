@@ -316,7 +316,9 @@ def deviation_roll_joint(
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
   roll = asset.data.joint_pos[:, asset_cfg.joint_ids]
-  return torch.sum(-torch.exp(torch.abs(roll) * 5.0), dim=-1)
+  # Clamp before exp — NaN/huge |roll| was blowing reward to -1e9 and poisoning PPO.
+  x = torch.nan_to_num(torch.abs(roll), nan=0.0, posinf=10.0, neginf=0.0).clamp(max=5.0)
+  return torch.sum(-torch.exp(x * 5.0), dim=-1)
 
 
 def _grasp_term(env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"):
@@ -329,9 +331,10 @@ def _grasp_term(env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"):
 def _reach_active_mask(
   env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"
 ) -> torch.Tensor:
+  """Only arm-reach envs (``is_target=1``), not waist-only bend."""
   grasp = env.command_manager.get_term(grasp_command_name)
   return (
-    (grasp.is_waist.squeeze(-1) > 0.5) & (grasp.target_arm.squeeze(-1) > 0.5)
+    (grasp.is_target.squeeze(-1) > 0.5) & (grasp.target_arm.squeeze(-1) > 0.5)
   ).float()
 
 

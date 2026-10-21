@@ -257,8 +257,13 @@ class HIMActorCritic(nn.Module):
 
     def update_distribution(self, obs_history):
         action_mean = self._actor_forward(obs_history)
-        # Keep std positive; expand to batch for broadcasting safety.
-        std = self.std.clamp(min=1e-4).expand_as(action_mean)
+        # Raw Parameter can go negative/NaN; CUDA Normal asserts std >= 0.
+        std = (
+            torch.nan_to_num(self.std, nan=1.0, posinf=1.0, neginf=1.0)
+            .abs()
+            .clamp(min=1e-4)
+            .expand_as(action_mean)
+        )
         self.distribution = Normal(action_mean, std, validate_args=False)
 
     def act(self, obs_history=None, **kwargs):

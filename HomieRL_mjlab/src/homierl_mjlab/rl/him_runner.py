@@ -493,8 +493,16 @@ class HomieOnPolicyRunner:
     }
     torch.save(payload, path)
 
-  @staticmethod
-  def _remap_one_step_in_weight(
+  # Homie one-step layouts (actor):
+  #   phase-1: proprio68 | a12 | container10 = 90
+  #   phase-2: proprio68 | a14 | grasp7 | container10 = 99
+  #   phase-3: proprio68 | a17 | grasp7 | sdf… = 229
+  _HOMIE_PROPRIO = 68
+  _HOMIE_GRASP = 7
+  _HOMIE_CONTAINER = 10
+
+  def _remap_homie_actor_frame(
+    self,
     old_w: torch.Tensor,
     *,
     old_one: int,
@@ -502,42 +510,119 @@ class HomieOnPolicyRunner:
     hist: int,
     old_act: int,
     new_act: int,
-    old_trailing: int = 0,
-    new_trailing: int = 0,
-    old_trailing_end_offset: int = 0,
   ) -> torch.Tensor:
-    """Copy Linear-in weights when actions / post-action obs grow.
-
-    Layout: ``[proprio | actions | trailing]``. New slots stay zero.
-    ``old_trailing_end_offset`` shifts the old trailing block away from the
-    new vector end (e.g. 10 leaves room for container after lin_vel).
-    """
+    """Remap Linear input weights across Homie phase obs layouts (per history frame)."""
     if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
       return old_w
-    proprio = old_one - old_act - old_trailing
-    if new_one != proprio + new_act + new_trailing or proprio < 0:
+    proprio = self._HOMIE_PROPRIO
+    grasp = self._HOMIE_GRASP
+    container = self._HOMIE_CONTAINER
+
+    old_after = old_one - proprio - old_act
+    old_has_grasp = old_after >= grasp
+    old_grasp = grasp if old_has_grasp else 0
+    old_cont = (
+      container
+      if (old_after - old_grasp) >= container
+      else max(old_after - old_grasp, 0)
+    )
+    if proprio + old_act + old_grasp + old_cont != old_one:
+      print(
+        f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
+        "using generic proprio|act copy"
+      )
+      proprio = old_one - old_act
+      old_grasp = 0
+      old_cont = 0
+
+    new_after = new_one - proprio - new_act
+    new_grasp = grasp if new_after >= grasp else 0
+    if proprio + new_act + new_grasp > new_one:
+      print(f"[WARN] new actor layout too small: one={new_one} act={new_act}")
       return old_w
-    if old_trailing_end_offset < 0 or old_trailing + old_trailing_end_offset > new_trailing:
-      return old_w
+
     new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
+    a_copy = min(old_act, new_act)
+    g_copy = min(old_grasp, new_grasp)
     for t in range(hist):
       o0 = t * old_one
       n0 = t * new_one
       new_w[:, n0 : n0 + proprio] = old_w[:, o0 : o0 + proprio]
-      new_w[:, n0 + proprio : n0 + proprio + old_act] = old_w[
-        :, o0 + proprio : o0 + proprio + old_act
+      new_w[:, n0 + proprio : n0 + proprio + a_copy] = old_w[
+        :, o0 + proprio : o0 + proprio + a_copy
       ]
-      if old_trailing > 0:
-        n_end = n0 + new_one - old_trailing_end_offset
-        new_w[:, n_end - old_trailing : n_end] = old_w[
-          :, o0 + old_one - old_trailing : o0 + old_one
+      if g_copy > 0:
+        o_g = o0 + proprio + old_act
+        n_g = n0 + proprio + new_act
+        new_w[:, n_g : n_g + g_copy] = old_w[:, o_g : o_g + g_copy]
+    return new_w
+
+  def _remap_homie_critic_frame(
+    self,
+    old_w: torch.Tensor,
+    *,
+    old_one: int,
+    new_one: int,
+    hist: int,
+    old_act: int,
+    new_act: int,
+  ) -> torch.Tensor:
+    """Critic ≈ actor layout + trailing base_lin_vel(3)."""
+    if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
+      return old_w
+    proprio = self._HOMIE_PROPRIO
+    grasp = self._HOMIE_GRASP
+    lin_vel = 3
+
+    old_core = old_one
+    old_has_lin = False
+    old_actor_one = old_one
+    # Prefer ...|lin_vel at end (phase-2/3 critic).
+    if old_one >= lin_vel:
+      maybe_actor = old_one - lin_vel
+      if maybe_actor in (
+        proprio + old_act,
+        proprio + old_act + grasp,
+        proprio + old_act + grasp + self._HOMIE_CONTAINER,
+        proprio + old_act + self._HOMIE_CONTAINER,
+      ):
+        old_has_lin = True
+        old_actor_one = maybe_actor
+
+    new_has_lin = new_one >= lin_vel and (new_one - lin_vel) >= proprio + new_act
+    new_actor_one = new_one - lin_vel if new_has_lin else new_one
+
+    actor_old = old_w.new_zeros(old_w.shape[0], hist * old_actor_one)
+    for t in range(hist):
+      o0 = t * old_one
+      actor_old[:, t * old_actor_one : (t + 1) * old_actor_one] = old_w[
+        :, o0 : o0 + old_actor_one
+      ]
+    actor_new = self._remap_homie_actor_frame(
+      actor_old,
+      old_one=old_actor_one,
+      new_one=new_actor_one,
+      hist=hist,
+      old_act=old_act,
+      new_act=new_act,
+    )
+    new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
+    for t in range(hist):
+      n0 = t * new_one
+      new_w[:, n0 : n0 + new_actor_one] = actor_new[
+        :, t * new_actor_one : (t + 1) * new_actor_one
+      ]
+      if old_has_lin and new_has_lin:
+        o0 = t * old_one
+        new_w[:, n0 + new_actor_one : n0 + new_actor_one + lin_vel] = old_w[
+          :, o0 + old_actor_one : o0 + old_actor_one + lin_vel
         ]
     return new_w
 
   def _expand_phase1_to_phase2_state_dict(
     self, loaded_sd: dict
   ) -> dict[str, torch.Tensor]:
-    """Map phase-1 weights onto phase-2 (more actions + grasp obs)."""
+    """Map earlier-phase weights onto current obs/action dims (p1→p2 or p2→p3)."""
     ac = self.alg.actor_critic
     cur = ac.state_dict()
     new_act = int(ac.num_actions)
@@ -551,25 +636,17 @@ class HomieOnPolicyRunner:
       old_one = int(enc.shape[1] // hist_a)
     else:
       old_one = new_one - (new_act - old_act)
-    # Trailing after actions: grasp (phase-2) + container(10); critic also has lin_vel.
-    actor_new_trail = new_one - (old_one - old_act + new_act)
-    actor_old_trail = 0
-    critic_old_trail = 3  # base_lin_vel only on legacy phase-1 critic
-    critic_new_trail = new_one_c - (old_one - old_act + new_act)
-    old_one_c = old_one + critic_old_trail
-    # Container (10) sits at the very end of critic; keep old lin_vel just before it.
-    container_trail = 10 if critic_new_trail >= critic_old_trail + 10 else 0
-    if actor_new_trail < 0 or critic_new_trail < critic_old_trail:
-      print("[WARN] unexpected obs expand sizes; falling back to strict-compatible keys")
-      actor_new_trail = max(actor_new_trail, 0)
-      critic_new_trail = max(critic_new_trail, critic_old_trail)
-      container_trail = 0
+
+    crit_w = loaded_sd.get("critic.0.weight")
+    if crit_w is not None and crit_w.ndim == 2 and hist_c > 0:
+      old_one_c = int(crit_w.shape[1] // hist_c)
+    else:
+      old_one_c = old_one + 3
 
     latent = 3 + int(getattr(ac, "dynamic_latent_dim", 32))
     print(
       f"[INFO] Remap obs/act: one_step {old_one}->{new_one}, "
-      f"act {old_act}->{new_act}, trail={actor_new_trail}, "
-      f"critic_trail={critic_new_trail}"
+      f"critic {old_one_c}->{new_one_c}, act {old_act}->{new_act}"
     )
 
     out: dict[str, torch.Tensor] = {}
@@ -582,8 +659,9 @@ class HomieOnPolicyRunner:
         continue
 
       if key == "std" and src.ndim == 1 and dst_shape[0] > src.shape[0]:
-        std = cur[key].clone()
-        std[: src.shape[0]] = src
+        # Keep loco std from ckpt; new EE dims tiny so residual starts near 0.
+        std = torch.full(dst_shape, 0.05, device=src.device, dtype=src.dtype)
+        std[: src.shape[0]] = torch.nan_to_num(src, nan=1.0).abs().clamp(min=1e-4)
         out[key] = std
         continue
       if (
@@ -592,51 +670,46 @@ class HomieOnPolicyRunner:
         and dst_shape[0] > src.shape[0]
         and dst_shape[1] == src.shape[1]
       ):
-        w = cur[key].clone()
+        # Expanding action head rows: zero new EE rows (avoid random arm fling).
+        w = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
         w[: src.shape[0]] = src
         out[key] = w
         continue
       if key.endswith("bias") and src.ndim == 1 and dst_shape[0] > src.shape[0]:
-        b = cur[key].clone()
+        b = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
         b[: src.shape[0]] = src
         out[key] = b
         continue
 
       if key.startswith("estimator.encoder.0.weight"):
-        out[key] = self._remap_one_step_in_weight(
+        out[key] = self._remap_homie_actor_frame(
           src,
           old_one=old_one,
           new_one=new_one,
           hist=hist_a,
           old_act=old_act,
           new_act=new_act,
-          old_trailing=actor_old_trail,
-          new_trailing=actor_new_trail,
         )
         continue
       if key.startswith("estimator.target.0.weight"):
-        out[key] = self._remap_one_step_in_weight(
+        out[key] = self._remap_homie_actor_frame(
           src,
           old_one=old_one,
           new_one=new_one,
           hist=1,
           old_act=old_act,
           new_act=new_act,
-          old_trailing=actor_old_trail,
-          new_trailing=actor_new_trail,
         )
         continue
       if key == "actor.0.weight" and src.ndim == 2:
         w = cur[key].clone()
-        remapped = self._remap_one_step_in_weight(
+        remapped = self._remap_homie_actor_frame(
           src[:, :old_one],
           old_one=old_one,
           new_one=new_one,
           hist=1,
           old_act=old_act,
           new_act=new_act,
-          old_trailing=actor_old_trail,
-          new_trailing=actor_new_trail,
         )
         w[:, :new_one] = remapped
         if src.shape[1] >= old_one + latent and w.shape[1] >= new_one + latent:
@@ -644,16 +717,13 @@ class HomieOnPolicyRunner:
         out[key] = w
         continue
       if key == "critic.0.weight" and src.ndim == 2:
-        out[key] = self._remap_one_step_in_weight(
+        out[key] = self._remap_homie_critic_frame(
           src,
           old_one=old_one_c,
           new_one=new_one_c,
           hist=hist_c,
           old_act=old_act,
           new_act=new_act,
-          old_trailing=critic_old_trail,
-          new_trailing=critic_new_trail,
-          old_trailing_end_offset=container_trail,
         )
         continue
 
@@ -687,10 +757,16 @@ class HomieOnPolicyRunner:
       )
     self.current_learning_iteration = int(loaded.get("iter", 0))
     infos = loaded.get("infos") or {}
-    if "env_state" in infos:
+    # Cross-phase expand (p2→p3): do NOT restore phase-2 step counter — it
+    # instantly maxes phase-3 reach/target curriculum and skews metrics.
+    if "env_state" in infos and not need_expand:
       self.adapter.unwrapped.common_step_counter = infos["env_state"][
         "common_step_counter"
       ]
+    elif need_expand:
+      print(
+        "[INFO] Skipping common_step_counter restore after obs/action-dim expand"
+      )
     return infos
 
   def add_git_repo_to_log(self, repo_file_path: str):
