@@ -6,6 +6,7 @@ from .events import (
   get_curriculum_ratio,
   hold_joints_at_default,
   init_upper_body_curriculum,
+  log_waist_pitch,
   reset_upper_body_curriculum,
   update_upper_body_pose_curriculum,
 )
@@ -101,6 +102,7 @@ __all__ = [
   "height_command",
   "hold_joints_at_default",
   "init_upper_body_curriculum",
+  "log_waist_pitch",
   "joint_power",
   "joint_tracking_error",
   "knee_distance_lateral",

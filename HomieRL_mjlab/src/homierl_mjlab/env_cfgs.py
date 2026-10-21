@@ -20,6 +20,10 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from homierl_mjlab import mdp as homie_mdp
+from homierl_mjlab.robot.container_spec import (
+  CONTAINER_ENTITY_NAME,
+  get_container_walls_cfg,
+)
 from homierl_mjlab.robot.g1_constants import (
   ARM_JOINT_NAMES,
   FOOT_COLLISION_GEOM_NAMES,
@@ -143,7 +147,9 @@ def _configure_phase_commands_and_obs(
       debug_vis=True,
       base_height_target=0.74,
       enable_arm_reach=(phase >= 3),
-      is_waist_prob=0.25 if phase >= 3 else 0.5,
+      # Phase-2: 50% bend-only. Phase-3: ternary loco / waist_only / reach.
+      is_waist_prob=0.5,
+      mode_probs=(0.2, 0.2, 0.6) if phase >= 3 else (1.0, 0.0, 0.0),
     )
     actor_terms["grasp_target"] = ObservationTermCfg(
       func=homie_mdp.grasp_target_command,
@@ -156,7 +162,7 @@ def _configure_phase_commands_and_obs(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
       sample_around_grasp=True,
-      presence_prob=0.5,
+      presence_prob=0.75,
       debug_vis=False,
     )
     actor_terms.pop("container_geom", None)
@@ -207,7 +213,11 @@ def homie_g1_flat_env_cfg(
   cfg.scene.terrain.terrain_type = "plane"
   cfg.scene.terrain.terrain_generator = None
 
-  cfg.scene.entities = {"robot": get_g1_robot_cfg()}
+  entities = {"robot": get_g1_robot_cfg()}
+  if int(phase) >= 3:
+    # Mocap open-box walls; pose/size synced from container command.
+    entities[CONTAINER_ENTITY_NAME] = get_container_walls_cfg()
+  cfg.scene.entities = entities
 
   # Drop height-scan sensors (flat).
   cfg.scene.sensors = tuple(
@@ -686,5 +696,11 @@ def homie_g1_flat_env_cfg(
     grasp = cfg.commands.get("grasp")
     if grasp is not None:
       grasp.resampling_time_range = (1e9, 1e9)
+    # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
+    cfg.events["log_waist_pitch"] = EventTermCfg(
+      func=homie_mdp.log_waist_pitch,
+      mode="step",
+      params={"env_index": 0, "every_steps": 25},
+    )
 
   return cfg

@@ -70,6 +70,16 @@ class TwistHeightCommand(UniformVelocityCommand):
     self._joystick_sliders: list[viser.GuiSliderHandle] = []
     self._height_abs_slider: viser.GuiSliderHandle | None = None
     self._joystick_get_env_idx: Callable[[], int] | None = None
+    self._gui_waist_pitch_rad: Any = None
+    self._gui_waist_pitch_deg: Any = None
+    self._gui_waist_pitch_act: Any = None
+    self._waist_pitch_jid: int | None = None
+    try:
+      jnames = list(self.robot.joint_names)
+      if "waist_pitch_joint" in jnames:
+        self._waist_pitch_jid = jnames.index("waist_pitch_joint")
+    except Exception:  # noqa: BLE001
+      self._waist_pitch_jid = None
 
   @property
   def command(self) -> torch.Tensor:
@@ -244,6 +254,28 @@ class TwistHeightCommand(UniformVelocityCommand):
       def _(_ev, _h=height_abs, _hint=hint, _base=h0) -> None:
         _hint.value = float(_h.value) - _base
 
+      # Live waist pitch readout for the viewed env (updated each compute).
+      pitch_rad = server.gui.add_number(
+        "waist_pitch (rad)",
+        initial_value=0.0,
+        step=0.001,
+        disabled=True,
+        hint="Measured joint angle of viewed env.",
+      )
+      pitch_deg = server.gui.add_number(
+        "waist_pitch (deg)",
+        initial_value=0.0,
+        step=0.01,
+        disabled=True,
+      )
+      pitch_act = server.gui.add_number(
+        "waist_pitch act",
+        initial_value=0.0,
+        step=0.001,
+        disabled=True,
+        hint="Policy action for waist_pitch (phase-2 index 13).",
+      )
+
       zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
 
       @zero_btn.on_click
@@ -256,6 +288,29 @@ class TwistHeightCommand(UniformVelocityCommand):
     self._joystick_sliders = sliders
     self._height_abs_slider = height_abs
     self._joystick_get_env_idx = get_env_idx
+    self._gui_waist_pitch_rad = pitch_rad
+    self._gui_waist_pitch_deg = pitch_deg
+    self._gui_waist_pitch_act = pitch_act
+
+  def _update_waist_pitch_gui(self, idx: int) -> None:
+    if self._gui_waist_pitch_rad is None or self._waist_pitch_jid is None:
+      return
+    q = float(self.robot.data.joint_pos[idx, self._waist_pitch_jid].item())
+    self._gui_waist_pitch_rad.value = q
+    self._gui_waist_pitch_deg.value = q * 57.2957795
+    act = 0.0
+    try:
+      am = self._env.action_manager
+      term = am.get_term("joint_pos")
+      names = list(getattr(term, "target_names", []) or [])
+      if "waist_pitch_joint" in names:
+        act = float(am.action[idx, names.index("waist_pitch_joint")].item())
+      elif am.total_action_dim >= 14:
+        act = float(am.action[idx, 13].item())
+    except Exception:  # noqa: BLE001
+      act = 0.0
+    if self._gui_waist_pitch_act is not None:
+      self._gui_waist_pitch_act.value = act
 
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
@@ -264,6 +319,7 @@ class TwistHeightCommand(UniformVelocityCommand):
     if self._joystick_get_env_idx is None:
       return
     idx = self._joystick_get_env_idx()
+    self._update_waist_pitch_gui(idx)
     # Height slider always wins when the GUI exists (no need to toggle Enable).
     if self._height_abs_slider is not None:
       abs_h = float(self._height_abs_slider.value)

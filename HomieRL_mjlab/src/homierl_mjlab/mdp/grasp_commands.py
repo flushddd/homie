@@ -1,7 +1,8 @@
-"""Homie waist-grasp target (phase-2 waist-only; arm training disabled).
+"""Homie waist-grasp target (phase-2 bend; phase-3 loco/waist/reach mix).
 
-Uses ``waist_curriculum`` + random grasp points as obs for the waist policy.
-``arm_on`` / ``is_target`` stay off so arm reach is not trained (arms PD-held).
+Phase-2: ``waist_curriculum`` + ``is_waist_prob``; ``is_target`` stays 0 (arms held).
+Phase-3: ``enable_arm_reach`` + ternary ``mode_probs`` =
+  ``(p_loco, p_waist_only, p_reach)`` → flags ``(0,0) / (1,0) / (1,1)``.
 
 Viser play: ``create_gui`` exposes target_x/y/z so you can drive waist mode
 manually (Enable ON → force ``is_waist`` + stand still on the viewed env).
@@ -18,8 +19,8 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
-from mjlab.utils.lab_api.math import quat_apply, yaw_quat
 
+from homierl_mjlab.mdp.base_frame import base_to_world, world_to_base
 from homierl_mjlab.mdp.curriculum import CurriculumScheduler
 
 if TYPE_CHECKING:
@@ -119,18 +120,47 @@ class GraspTargetCommand(CommandTerm):
       dim=-1,
     )
 
+  def _normalized_mode_probs(self) -> tuple[float, float, float]:
+    """Phase-3 mix: ``(p_loco, p_waist_only, p_reach)``, renormalized to sum 1."""
+    p = self.cfg.mode_probs
+    a, b, c = float(p[0]), float(p[1]), float(p[2])
+    s = a + b + c
+    if s <= 0.0:
+      return 0.2, 0.2, 0.6
+    return a / s, b / s, c / s
+
+  def _sample_mode_flags(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample ``(is_waist, is_target)`` for ``n`` envs.
+
+    Phase-2 (``arm_on=False``): ``is_waist ~ Bern(is_waist_prob)``, ``is_target=0``.
+    Phase-3: ternary modes from ``mode_probs`` —
+      loco | waist_only | reach  →  (0,0) | (1,0) | (1,1).
+    """
+    if not self.arm_on:
+      waist_p = float(self.cfg.is_waist_prob)
+      is_waist = (torch.rand(n, 1, device=self.device) < waist_p).float()
+      return is_waist, torch.zeros_like(is_waist)
+
+    p_loco, p_wo, _p_reach = self._normalized_mode_probs()
+    u = torch.rand(n, device=self.device)
+    # 0=loco, 1=waist_only, 2=reach
+    mode = torch.zeros(n, dtype=torch.long, device=self.device)
+    mode = torch.where(u >= p_loco, torch.ones_like(mode), mode)
+    mode = torch.where(u >= (p_loco + p_wo), torch.full_like(mode, 2), mode)
+    is_waist = (mode >= 1).float().unsqueeze(-1)
+    is_target = (mode == 2).float().unsqueeze(-1)
+    return is_waist, is_target
+
   def _refresh_curriculum(
     self,
     *,
     reshuffle_waist: bool = False,
     env_ids: torch.Tensor | None = None,
   ) -> None:
-    """Waist-only: ``arm_on`` forced off; ``waist_on`` from Homie waist schedule.
+    """Assign waist / reach mode flags.
 
-    Homie commented waist path::
-
-        if not waist_on: is_waist = 0
-        else: is_target = 0; is_waist = (rand < 0.5)
+    Phase-2: Homie waist schedule + ``is_waist_prob`` (``is_target`` stays 0).
+    Phase-3: always on; ternary mix via ``mode_probs``.
 
     Important: when ``reshuffle_waist``, only shuffle ``env_ids`` (the envs
     being target-resampled). Reshuffling *all* envs while only writing targets
@@ -138,38 +168,35 @@ class GraspTargetCommand(CommandTerm):
     forever (TB: need_waist/extend_dist ≈ 0).
     """
     step = int(self._env.common_step_counter)
-    # Phase-3: arm reach on waist envs; phase-2 keeps arm_on off.
+    # Phase-3: arm reach enabled; phase-2 keeps arm_on off.
     self.arm_on = bool(self.cfg.enable_arm_reach)
     prob2 = self.waist_curriculum.value(step)
     was_on = self.waist_on
-    # Phase-3 always allows waist/loco mix via is_waist_prob (not Homie schedule).
+    # Phase-3 always allows mix; phase-2 follows Homie waist curriculum gate.
     self.waist_on = True if self.arm_on else (prob2 >= 0.5)
-    self.metrics["waist_curriculum"][:] = (
-      float(self.cfg.is_waist_prob) if self.arm_on else prob2
-    )
+    if self.arm_on:
+      _pl, _pw, pr = self._normalized_mode_probs()
+      self.metrics["waist_curriculum"][:] = pr  # log reach share
+    else:
+      self.metrics["waist_curriculum"][:] = prob2
     if not self.waist_on:
       self.is_waist.zero_()
       self.is_target.zero_()
       return
+    # Keep existing mode flags until the next resample (do not force is_target=is_waist).
     if not (reshuffle_waist or not was_on):
-      if self.arm_on:
-        self.is_target[:] = self.is_waist
       return
-    waist_p = float(self.cfg.is_waist_prob) if self.arm_on else 0.5
     if env_ids is None or (reshuffle_waist and not was_on):
-      rand = torch.rand(self.num_envs, 1, device=self.device)
-      self.is_waist[:] = (rand < waist_p).float()
-      self.is_target[:] = self.is_waist if self.arm_on else torch.zeros_like(self.is_waist)
+      is_w, is_t = self._sample_mode_flags(self.num_envs)
+      self.is_waist[:] = is_w
+      self.is_target[:] = is_t
       return
     n = len(env_ids)
     if n == 0:
       return
-    rand = torch.rand(n, 1, device=self.device)
-    self.is_waist[env_ids] = (rand < waist_p).float()
-    if self.arm_on:
-      self.is_target[env_ids] = self.is_waist[env_ids]
-    else:
-      self.is_target[env_ids] = 0.0
+    is_w, is_t = self._sample_mode_flags(n)
+    self.is_waist[env_ids] = is_w
+    self.is_target[env_ids] = is_t
 
   def _waist_gate(self, env_ids: torch.Tensor) -> torch.Tensor:
     return self.is_waist[env_ids]
@@ -194,7 +221,7 @@ class GraspTargetCommand(CommandTerm):
     self._finalize_waist_targets(env_ids, gate)
 
     self.init_robot_poses[env_ids] = self.robot.data.root_link_pos_w[env_ids, :3]
-    self._refresh_world_target(env_ids)
+    self._freeze_anchor_from_base(env_ids)
 
   def _finalize_waist_targets(
     self, env_ids: torch.Tensor, gate: torch.Tensor
@@ -244,19 +271,32 @@ class GraspTargetCommand(CommandTerm):
     else:
       self.target_position[env_ids, 2:3] = z_waist * gate + 0.3 * (1.0 - gate)
     self._finalize_waist_targets(env_ids, gate)
-    self._refresh_world_target(env_ids)
+    # Freeze world/task anchor once from the sampled base target.
+    self._freeze_anchor_from_base(env_ids)
 
-  def _refresh_world_target(self, env_ids: torch.Tensor | None = None) -> None:
+  def _freeze_anchor_from_base(self, env_ids: torch.Tensor | None = None) -> None:
+    """Resample-time: set ``target_pos_w`` from current base sample (fixed until next resample).
+
+    Uses full pelvis + yaw (``base_to_world``), so the physical grasp point stays
+    fixed while the robot later squats/bends; obs reprojects via
+    ``_reproject_base_from_anchor``.
+    """
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, device=self.device)
     if len(env_ids) == 0:
       return
-    root = self.robot.data.root_link_pos_w[env_ids, :3]
-    heading = yaw_quat(self.robot.data.root_link_quat_w[env_ids])
-    delta = quat_apply(heading, self.target_position[env_ids])
-    self.target_pos_w[env_ids, :2] = root[:, :2] + delta[:, :2]
-    self.target_pos_w[env_ids, 2] = (
-      float(self.cfg.base_height_target) + self.target_position[env_ids, 2]
+    self.target_pos_w[env_ids] = base_to_world(
+      self.robot, self.target_position[env_ids], env_ids
+    )
+
+  def _reproject_base_from_anchor(self, env_ids: torch.Tensor | None = None) -> None:
+    """Every step: refresh base-frame ``target_position`` from frozen ``target_pos_w``."""
+    if env_ids is None:
+      env_ids = torch.arange(self.num_envs, device=self.device)
+    if len(env_ids) == 0:
+      return
+    self.target_position[env_ids] = world_to_base(
+      self.robot, self.target_pos_w[env_ids], env_ids
     )
 
   def _update_extend_dist(self) -> None:
@@ -265,7 +305,8 @@ class GraspTargetCommand(CommandTerm):
     self.is_reachable.zero_()
     if len(active) == 0:
       return
-    self._refresh_world_target(active)
+    # Keep world anchor fixed; update base obs for squat/bend compensation.
+    self._reproject_base_from_anchor(active)
 
     left = active[(self.target_arm[active, 0] == 1)]
     right = active[(self.target_arm[active, 0] == 2)]
@@ -380,7 +421,7 @@ class GraspTargetCommand(CommandTerm):
     )
     self.need_waist[idx] = 1.0 if (dist - _ARM_REACH) > 0.0 else 0.0
     env_ids = torch.tensor([idx], device=self.device, dtype=torch.long)
-    self._refresh_world_target(env_ids)
+    self._freeze_anchor_from_base(env_ids)
     self._update_extend_dist()
     self._apply_twist_override()
     # Mirror Homie squat when target is low.
@@ -512,8 +553,11 @@ class GraspTargetCommandCfg(CommandTermCfg):
   pos_z: tuple[float, float] = _DEFAULT_POS_Z
   # Phase-3: enable arm reach (is_target) for EE residual + IK.
   enable_arm_reach: bool = False
-  # Phase-3 mix: fraction of envs with is_waist=1 (rest keep loco-only).
-  is_waist_prob: float = 0.25
+  # Phase-2: fraction of envs with is_waist=1 (is_target stays 0).
+  is_waist_prob: float = 0.5
+  # Phase-3 ternary mix (loco, waist_only, reach); renormalized at runtime.
+  # waist_only = bend without EE; reach = bend + EE residual.
+  mode_probs: tuple[float, float, float] = (0.2, 0.2, 0.6)
 
   def build(self, env: ManagerBasedRlEnv) -> GraspTargetCommand:
     return GraspTargetCommand(self, env)

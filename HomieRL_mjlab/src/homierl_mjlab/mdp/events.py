@@ -200,3 +200,46 @@ def hold_joints_at_default(
     env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long).view(-1)
   default = asset.data.default_joint_pos[env_ids][:, joint_ids]
   asset.set_joint_position_target(default, joint_ids=joint_ids, env_ids=env_ids)
+
+
+def log_waist_pitch(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor | None = None,
+  env_index: int = 0,
+  every_steps: int = 25,
+  asset_cfg: SceneEntityCfg = SceneEntityCfg(
+    "robot", joint_names=("waist_pitch_joint",)
+  ),
+) -> None:
+  """Print waist pitch (rad/deg) + policy action for one env during play."""
+  del env_ids
+  step = int(getattr(env, "common_step_counter", 0))
+  if every_steps > 1 and (step % int(every_steps)) != 0:
+    return
+  asset: Entity = env.scene[asset_cfg.name]
+  asset_cfg.resolve(env.scene)
+  jids = torch.as_tensor(
+    asset_cfg.joint_ids, device=env.device, dtype=torch.long
+  ).view(-1)
+  if jids.numel() == 0:
+    return
+  idx = min(max(int(env_index), 0), env.num_envs - 1)
+  q = float(asset.data.joint_pos[idx, jids[0]].item())
+  # Phase-2/3 loco actions: last of the 14 joint_pos block is waist_pitch.
+  act_pitch = float("nan")
+  try:
+    term = env.action_manager.get_term("joint_pos")
+    names = list(getattr(term, "target_names", []) or [])
+    if "waist_pitch_joint" in names:
+      ai = names.index("waist_pitch_joint")
+      act_pitch = float(env.action_manager.action[idx, ai].item())
+    elif env.action_manager.total_action_dim >= 14:
+      act_pitch = float(env.action_manager.action[idx, 13].item())
+  except Exception:  # noqa: BLE001
+    pass
+  print(
+    f"[play] step={step} env={idx} "
+    f"waist_pitch={q:.4f} rad ({q * 57.2957795:.2f} deg) "
+    f"act_pitch={act_pitch:.4f}",
+    flush=True,
+  )
