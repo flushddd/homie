@@ -73,49 +73,28 @@ class HIMPPO:
     self.keep_loco_always = False
     self.teacher_one_step_obs = 0
 
-    # Build left-right joint permutation for G1 naming convention.
-    self._joint_perm: list[int] | None = None
-    self._joint_sign: list[float] | None = None
-    # Homie ``flip_g1_*`` leaves arm DOFs at 0 in flipped obs (arm flip commented out).
-    self._arm_joint_ids: list[int] = []
+    # Homie phase-1 flip is hardcoded G1 indices (legs+waist only); arms stay 0.
+    # ``set_joint_symmetry`` only records ndof / validates order — does not build arm swap.
+    self._joint_names: list[str] = []
 
   def set_joint_symmetry(self, joint_names: list[str]) -> None:
-    """Configure obs joint flip from ordered joint names.
+    """Bind robot joint names; flip itself follows Homie ``flip_g1_*`` hardcoding.
 
-    Matches Homie phase-1 symmetry: mirror legs + waist signs; **zero arms**
-    in the flipped obs (do not L/R-swap shoulder/elbow/wrist). Random arm
-    curriculum makes arm-mirroring fight the loco policy.
+    Homie ``him_ppo.flip_g1_actor_obs``:
+      - ``zeros_like`` then fill cmd/IMU/legs/waist/leg-actions only
+      - arm shoulder/elbow/wrist blocks are **commented out** → stay 0
+    We do the same: never L↔R-mirror arms in PPO symmetry.
     """
-    n = len(joint_names)
-    name_to_idx = {n_: i for i, n_ in enumerate(joint_names)}
-    perm = list(range(n))
-    sign = [1.0] * n
-    arm_ids: list[int] = []
-    for i, name in enumerate(joint_names):
-      is_arm = any(k in name for k in ("shoulder", "elbow", "wrist"))
-      if is_arm:
-        arm_ids.append(i)
-        continue  # keep identity; zeroed in ``_flip_one_step``
-      if name.startswith("left_"):
-        right = "right_" + name[len("left_") :]
-        if right in name_to_idx:
-          perm[i] = name_to_idx[right]
-      elif name.startswith("right_"):
-        left = "left_" + name[len("right_") :]
-        if left in name_to_idx:
-          perm[i] = name_to_idx[left]
-      # Mirror-sensitive axes (roll / yaw) get a sign flip.
-      if any(k in name for k in ("roll", "yaw")) and (
-        name.startswith("left_") or name.startswith("right_") or name.startswith("waist_")
-      ):
-        sign[i] = -1.0
-    self._joint_perm = perm
-    self._joint_sign = sign
-    self._arm_joint_ids = arm_ids
-    self.num_dof = n
+    self._joint_names = list(joint_names)
+    self.num_dof = len(joint_names)
+    n_arm = sum(
+      1
+      for n in joint_names
+      if any(k in n for k in ("shoulder", "elbow", "wrist"))
+    )
     print(
-      f"[INFO] Joint symmetry: ndof={n}, arm_zeroed={len(arm_ids)} "
-      f"(Homie-style; arms not mirrored)"
+      f"[INFO] Joint symmetry (Homie flip_g1): ndof={self.num_dof}, "
+      f"arms_never_flipped={n_arm}"
     )
 
   def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
@@ -363,112 +342,89 @@ class HIMPPO:
       mean_loss_keep / num_updates,
     )
 
-  # ---- symmetry helpers (unified Homie obs layout) ----
-  # one-step actor: proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3
-  # critic: same + trailing lin_vel(3)
+  # ---- symmetry helpers (Homie ``flip_g1_*`` phase-1 layout) ----
+  # G1 hinge order in obs: L6 | R6 | waist3 | arms14  (29 total)
+  # Homie fills ONLY legs+waist (+ leg actions); arms / grasp / SDF stay 0.
   _ACT_OBS = 17
   _GRASP = 7
-  _SDF = 128
-  _CLEAR = 6
-  _EE = 3
-
-  @staticmethod
-  def _action_obs_slots(step_dim: int, num_actions: int, a0: int) -> int:
-    """Obs action-history width: 17 for unified layout, else policy act dim."""
-    if step_dim >= a0 + 17 + 7:
-      return 17
-    return int(num_actions)
+  _N_DOF = 29
+  _Q0 = 10
+  _A0 = 10 + 2 * 29  # 68
 
   def _flip_one_step(self, step: torch.Tensor, with_lin_vel: bool) -> torch.Tensor:
-    out = step.clone()
-    n = self.num_dof
+    """Port of Homie ``flip_g1_actor_obs`` / ``flip_g1_critic_obs``.
+
+    Uses ``zeros_like`` then writes only the loco channels Homie wrote.
+    Arms (idx 15..28 in the 29-DoF block) are never written → stay 0.
+    Grasp / SDF / clearance / EE trail also stay 0 (Homie never filled them).
+    """
+    out = torch.zeros_like(step)
     # commands
+    out[..., 0] = step[..., 0]
     out[..., 1] = -step[..., 1]
     out[..., 2] = -step[..., 2]
+    out[..., 3] = step[..., 3]
     # ang vel
     out[..., 4] = -step[..., 4]
+    out[..., 5] = step[..., 5]
     out[..., 6] = -step[..., 6]
     # gravity
+    out[..., 7] = step[..., 7]
     out[..., 8] = -step[..., 8]
-    # joints: legs L↔R + waist signs; arms zeroed (Homie commented-out arm flip)
-    q0 = 10
-    if self._joint_perm is not None:
-      perm = self._joint_perm
-      sign = self._joint_sign
-      for i in range(n):
-        out[..., q0 + i] = sign[i] * step[..., q0 + perm[i]]
-        out[..., q0 + n + i] = sign[i] * step[..., q0 + n + perm[i]]
-    if self._arm_joint_ids:
-      for i in self._arm_joint_ids:
-        out[..., q0 + i] = 0
-        out[..., q0 + n + i] = 0
-    # actions: [L6|R6] (+ waist14) (+ EE17). Pad slots beyond num_actions stay 0.
-    a0 = 10 + 2 * n
+    out[..., 9] = step[..., 9]
+
+    q0 = self._Q0
+    # ---- joint pos: legs L↔R (Homie indices 10..21), waist signs (22..24) ----
+    # left <- right
+    out[..., q0 + 0] = step[..., q0 + 6]
+    out[..., q0 + 1] = -step[..., q0 + 7]
+    out[..., q0 + 2] = -step[..., q0 + 8]
+    out[..., q0 + 3] = step[..., q0 + 9]
+    out[..., q0 + 4] = step[..., q0 + 10]
+    out[..., q0 + 5] = -step[..., q0 + 11]
+    # right <- left
+    out[..., q0 + 6] = step[..., q0 + 0]
+    out[..., q0 + 7] = -step[..., q0 + 1]
+    out[..., q0 + 8] = -step[..., q0 + 2]
+    out[..., q0 + 9] = step[..., q0 + 3]
+    out[..., q0 + 10] = step[..., q0 + 4]
+    out[..., q0 + 11] = -step[..., q0 + 5]
+    # waist: yaw-, roll-, pitch keep (arms 15..28 left at 0)
+    out[..., q0 + 12] = -step[..., q0 + 12]
+    out[..., q0 + 13] = -step[..., q0 + 13]
+    out[..., q0 + 14] = step[..., q0 + 14]
+
+    # ---- joint vel: same pattern at q0+29 ----
+    v0 = q0 + self._N_DOF
+    out[..., v0 + 0] = step[..., v0 + 6]
+    out[..., v0 + 1] = -step[..., v0 + 7]
+    out[..., v0 + 2] = -step[..., v0 + 8]
+    out[..., v0 + 3] = step[..., v0 + 9]
+    out[..., v0 + 4] = step[..., v0 + 10]
+    out[..., v0 + 5] = -step[..., v0 + 11]
+    out[..., v0 + 6] = step[..., v0 + 0]
+    out[..., v0 + 7] = -step[..., v0 + 1]
+    out[..., v0 + 8] = -step[..., v0 + 2]
+    out[..., v0 + 9] = step[..., v0 + 3]
+    out[..., v0 + 10] = step[..., v0 + 4]
+    out[..., v0 + 11] = -step[..., v0 + 5]
+    out[..., v0 + 12] = -step[..., v0 + 12]
+    out[..., v0 + 13] = -step[..., v0 + 13]
+    out[..., v0 + 14] = step[..., v0 + 14]
+
+    # ---- last actions in obs (Homie only fills 12 legs; we also flip waist/EE if present) ----
+    a0 = self._A0
     n_act = int(self.actor_critic.num_actions)
-    act_slots = self._action_obs_slots(int(step.shape[-1]), n_act, a0)
     if step.shape[-1] >= a0 + n_act:
       out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
-    # grasp: [is_target, is_waist, extend, tx, ty, tz, arm] — mirror ty, swap arm 1↔2
-    g0 = a0 + act_slots
-    if step.shape[-1] >= g0 + self._GRASP:
-      out[..., g0 : g0 + self._GRASP] = step[..., g0 : g0 + self._GRASP]
-      out[..., g0 + 4] = -step[..., g0 + 4]
-      arm = step[..., g0 + 6]
-      out[..., g0 + 6] = torch.where(
-        arm > 1.5, torch.ones_like(arm), torch.where(arm > 0.5, torch.full_like(arm, 2.0), arm)
-      )
-      # SDF: phi||valid — mirror by y-flip of the fixed base-frame query grid
-      s0 = g0 + self._GRASP
-      if step.shape[-1] >= s0 + self._SDF:
-        k = self._SDF // 2
-        perm = self._sdf_y_flip_perm(k, step.device)
-        phi = step[..., s0 : s0 + k]
-        valid = step[..., s0 + k : s0 + self._SDF]
-        out[..., s0 : s0 + k] = phi[..., perm]
-        out[..., s0 + k : s0 + self._SDF] = valid[..., perm]
-        # clearance: [L_sh, L_el, L_wr, R_sh, R_el, R_wr] → swap L/R blocks
-        c0 = s0 + self._SDF
-        if step.shape[-1] >= c0 + self._CLEAR:
-          clr = step[..., c0 : c0 + self._CLEAR]
-          out[..., c0 : c0 + 3] = clr[..., 3:6]
-          out[..., c0 + 3 : c0 + 6] = clr[..., 0:3]
-          e0 = c0 + self._CLEAR
-          if step.shape[-1] >= e0 + self._EE:
-            out[..., e0 : e0 + self._EE] = step[..., e0 : e0 + self._EE]
-            out[..., e0 + 1] = -step[..., e0 + 1]
-    # critic lin_vel is always the trailing 3 dims (after grasp/SDF/…), not after acts
+
+    # critic: lin_vel is trailing 3 (our layout); Homie used a hardcoded mid index
     if with_lin_vel and step.shape[-1] >= 3:
       lv = int(step.shape[-1]) - 3
       out[..., lv] = step[..., lv]
       out[..., lv + 1] = -step[..., lv + 1]
       out[..., lv + 2] = step[..., lv + 2]
     return out
-
-  _sdf_perm_cache: dict[tuple[int, str], torch.Tensor] = {}
-
-  @classmethod
-  def _sdf_y_flip_perm(cls, count: int, device: torch.device) -> torch.Tensor:
-    """Index perm mapping query i → query with (x,-y,z) for the fixed SDF grid."""
-    key = (int(count), str(device))
-    cached = cls._sdf_perm_cache.get(key)
-    if cached is not None:
-      return cached
-    from homierl_mjlab.mdp.sdf_geometry import make_shoulder_query_grid
-
-    grid = make_shoulder_query_grid(
-      count=count,
-      x_range=(0.10, 0.70),
-      y_range=(-0.45, 0.45),
-      z_range=(-0.25, 0.35),
-      device=device,
-    )
-    mirrored = grid.clone()
-    mirrored[:, 1] = -mirrored[:, 1]
-    # Nearest neighbour match (grid is symmetric in y by construction).
-    d = torch.cdist(mirrored, grid)
-    perm = torch.argmin(d, dim=-1)
-    cls._sdf_perm_cache[key] = perm
-    return perm
 
   def flip_actor_obs(self, obs: torch.Tensor) -> torch.Tensor:
     h = self.actor_critic.actor_history_length
@@ -485,9 +441,10 @@ class HIMPPO:
     return y.reshape(obs.shape[0], h * d)
 
   def flip_actions(self, actions: torch.Tensor) -> torch.Tensor:
-    """Mirror leg (+ waist) actions. Legs: [L6|R6]; waist roll sign-flip, pitch keep."""
+    """Homie ``flip_g1_actions`` (12 legs) + waist/EE for later phases."""
     flat = actions.reshape(-1, actions.shape[-1])
     out = torch.zeros_like(flat)
+    # phase-1: exactly Homie 12-leg L6|R6
     out[:, 0] = flat[:, 6]
     out[:, 1] = -flat[:, 7]
     out[:, 2] = -flat[:, 8]
@@ -501,10 +458,8 @@ class HIMPPO:
     out[:, 10] = flat[:, 4]
     out[:, 11] = -flat[:, 5]
     if flat.shape[-1] >= 14:
-      # phase-2/3 loco: waist_roll, waist_pitch (yaw held, not in action)
-      out[:, 12] = -flat[:, 12]
-      out[:, 13] = flat[:, 13]
-      # phase-3 EE residual (Δx,Δy,Δz): mirror y
+      out[:, 12] = -flat[:, 12]  # waist_roll
+      out[:, 13] = flat[:, 13]  # waist_pitch
       if flat.shape[-1] >= 17:
         out[:, 14] = flat[:, 14]
         out[:, 15] = -flat[:, 15]
