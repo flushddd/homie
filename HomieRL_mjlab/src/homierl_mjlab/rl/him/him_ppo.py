@@ -76,14 +76,26 @@ class HIMPPO:
     # Build left-right joint permutation for G1 naming convention.
     self._joint_perm: list[int] | None = None
     self._joint_sign: list[float] | None = None
+    # Homie ``flip_g1_*`` leaves arm DOFs at 0 in flipped obs (arm flip commented out).
+    self._arm_joint_ids: list[int] = []
 
   def set_joint_symmetry(self, joint_names: list[str]) -> None:
-    """Configure obs joint flip from ordered joint names."""
+    """Configure obs joint flip from ordered joint names.
+
+    Matches Homie phase-1 symmetry: mirror legs + waist signs; **zero arms**
+    in the flipped obs (do not L/R-swap shoulder/elbow/wrist). Random arm
+    curriculum makes arm-mirroring fight the loco policy.
+    """
     n = len(joint_names)
     name_to_idx = {n_: i for i, n_ in enumerate(joint_names)}
     perm = list(range(n))
     sign = [1.0] * n
+    arm_ids: list[int] = []
     for i, name in enumerate(joint_names):
+      is_arm = any(k in name for k in ("shoulder", "elbow", "wrist"))
+      if is_arm:
+        arm_ids.append(i)
+        continue  # keep identity; zeroed in ``_flip_one_step``
       if name.startswith("left_"):
         right = "right_" + name[len("left_") :]
         if right in name_to_idx:
@@ -99,7 +111,12 @@ class HIMPPO:
         sign[i] = -1.0
     self._joint_perm = perm
     self._joint_sign = sign
+    self._arm_joint_ids = arm_ids
     self.num_dof = n
+    print(
+      f"[INFO] Joint symmetry: ndof={n}, arm_zeroed={len(arm_ids)} "
+      f"(Homie-style; arms not mirrored)"
+    )
 
   def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
     self.storage = HIMRolloutStorage(
@@ -373,7 +390,7 @@ class HIMPPO:
     out[..., 6] = -step[..., 6]
     # gravity
     out[..., 8] = -step[..., 8]
-    # joints
+    # joints: legs L↔R + waist signs; arms zeroed (Homie commented-out arm flip)
     q0 = 10
     if self._joint_perm is not None:
       perm = self._joint_perm
@@ -381,6 +398,10 @@ class HIMPPO:
       for i in range(n):
         out[..., q0 + i] = sign[i] * step[..., q0 + perm[i]]
         out[..., q0 + n + i] = sign[i] * step[..., q0 + n + perm[i]]
+    if self._arm_joint_ids:
+      for i in self._arm_joint_ids:
+        out[..., q0 + i] = 0
+        out[..., q0 + n + i] = 0
     # actions: [L6|R6] (+ waist14) (+ EE17). Pad slots beyond num_actions stay 0.
     a0 = 10 + 2 * n
     n_act = int(self.actor_critic.num_actions)

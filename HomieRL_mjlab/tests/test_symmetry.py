@@ -40,15 +40,51 @@ def test_flip_actions_involution():
   assert torch.allclose(x17, y17, atol=1e-5)
 
 
+def _bind_homie_leg_symmetry(ppo: HIMPPO) -> None:
+  """G1 29-DoF: L6|R6 + waist; arms marked for Homie-style zeroing."""
+  names = (
+    [f"left_hip_{a}_joint" for a in ("pitch", "roll", "yaw")]
+    + ["left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint"]
+    + [f"right_hip_{a}_joint" for a in ("pitch", "roll", "yaw")]
+    + ["right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint"]
+    + ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+    + [f"left_shoulder_{a}_joint" for a in ("pitch", "roll", "yaw")]
+    + ["left_elbow_joint"]
+    + [f"left_wrist_{a}_joint" for a in ("roll", "pitch", "yaw")]
+    + [f"right_shoulder_{a}_joint" for a in ("pitch", "roll", "yaw")]
+    + ["right_elbow_joint"]
+    + [f"right_wrist_{a}_joint" for a in ("roll", "pitch", "yaw")]
+  )
+  assert len(names) == 29
+  ppo.set_joint_symmetry(names)
+
+
 def test_flip_actor_obs_involution_legacy80():
-  """Legacy loco-only one-step (68+12) still round-trips."""
+  """Legacy loco-only one-step (68+12): legs round-trip; arms stay zeroed."""
   ac = HIMActorCritic(480, 83, 80, 83, 6, 1, 12)
   ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
-  ppo._joint_perm = list(range(29))
-  ppo._joint_sign = [1.0] * 29
+  _bind_homie_leg_symmetry(ppo)
   x = torch.randn(4, 480)
+  # Homie zeros arms in flipped obs — start with arms already 0 for involution.
+  for t in range(6):
+    q0 = t * 80 + 10
+    x[:, q0 + 15 : q0 + 29] = 0
+    x[:, q0 + 29 + 15 : q0 + 58] = 0
   y = ppo.flip_actor_obs(ppo.flip_actor_obs(x))
   assert torch.allclose(x, y, atol=1e-5)
+
+
+def test_flip_zeros_arms_like_homie():
+  """Flipped obs must zero arm q/dq (Homie commented-out arm flip)."""
+  ac = HIMActorCritic(480, 83, 80, 83, 6, 1, 12)
+  ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
+  _bind_homie_leg_symmetry(ppo)
+  x = torch.randn(4, 480)
+  y = ppo.flip_actor_obs(x)
+  for t in range(6):
+    q0 = t * 80 + 10
+    assert torch.allclose(y[:, q0 + 15 : q0 + 29], torch.zeros(4, 14))
+    assert torch.allclose(y[:, q0 + 29 + 15 : q0 + 58], torch.zeros(4, 14))
 
 
 def test_flip_actor_obs_involution_unified229():
@@ -56,14 +92,15 @@ def test_flip_actor_obs_involution_unified229():
   hist = 6
   ac = HIMActorCritic(hist * d, d + 3, d, d + 3, hist, 1, 17)
   ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
-  ppo._joint_perm = list(range(29))
-  ppo._joint_sign = [1.0] * 29
+  _bind_homie_leg_symmetry(ppo)
   x = torch.randn(4, hist * d)
-  # Discrete arm channel: 0 / 1 / 2
   g0 = HOMIE_PROPRIO_DIM + HOMIE_ACTION_OBS_DIM
   for t in range(hist):
-    base = t * d + g0
-    x[:, base + 6] = torch.tensor([0.0, 1.0, 2.0, 1.0])
+    base = t * d
+    # Arms zero for involution (Homie leaves them 0 after flip).
+    x[:, base + 10 + 15 : base + 10 + 29] = 0
+    x[:, base + 10 + 29 + 15 : base + 10 + 58] = 0
+    x[:, base + g0 + 6] = torch.tensor([0.0, 1.0, 2.0, 1.0])
   y = ppo.flip_actor_obs(ppo.flip_actor_obs(x))
   assert torch.allclose(x, y, atol=1e-4)
   assert HOMIE_IS_WAIST_IDX == g0 + 1
