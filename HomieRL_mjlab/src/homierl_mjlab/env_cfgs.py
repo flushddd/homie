@@ -68,7 +68,7 @@ def _add_arm_random_curriculum(cfg: ManagerBasedRlEnvCfg) -> None:
 def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
   """Phase-1: waist held; arms random-pose curriculum.
 
-  Phase-2: policy roll/pitch; yaw held; arms keep random curriculum (anti-disturbance).
+  Phase-2: policy roll/pitch; yaw+arms held (Homie waist-only / Oct-15 working p2).
   Phase-3: yaw held; arms driven by EE residual IK (no random / no hold_arms).
   """
   cfg.events.pop("init_upper_curriculum", None)
@@ -100,8 +100,15 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     },
   )
   if int(phase) == 2:
-    # Same arm disturbance as phase-1 so loco+waist stay robust before EE IK.
-    _add_arm_random_curriculum(cfg)
+    # Match Homie waist stage + prior good p2: arms fixed at default.
+    # Random arms + Homie flip (zeros arm channels) fights loco while learning bend.
+    cfg.events["hold_arms_default"] = EventTermCfg(
+      func=homie_mdp.hold_joints_at_default,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+      },
+    )
 
 
 def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:

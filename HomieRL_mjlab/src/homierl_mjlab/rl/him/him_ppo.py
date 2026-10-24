@@ -489,36 +489,13 @@ class HIMPPO:
     )
 
   def _teacher_obs(self, obs_batch: torch.Tensor) -> torch.Tensor:
-    """Zero channels the frozen teacher never trained on.
+    """Student obs fed to the frozen teacher (stable phase-2 behavior).
 
-    Shared layout: proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3.
-    Phase-2 teacher (p1): loco a12 only; grasp/SDF stay 0.
-    Phase-3 teacher (p2): loco a14 + grasp; SDF/EE-act stay 0.
+    Pre-229 / ``2a2c0b1`` path: ``teacher.act(obs_batch)`` with the **full**
+    student observation — no grasp/SDF/action-slot zeroing. Keep still only
+    locks the first ``keep_loco_dims`` action means via ``loss_keep``.
     """
-    if self.teacher_actor_critic is None:
-      return obs_batch
-    d = int(self.actor_critic.num_one_step_obs)
-    h = int(self.actor_critic.actor_history_length)
-    proprio = 68
-    act_slots = self._ACT_OBS if d >= proprio + self._ACT_OBS + self._GRASP else int(
-      self.actor_critic.num_actions
-    )
-    a_t = min(int(self.keep_loco_dims), act_slots)
-    # p3 keep_loco_dims=14 → teacher saw grasp; p2 keep=12 → teacher did not.
-    copy_grasp = int(self.keep_loco_dims) >= 14
-    grasp_dim = self._GRASP
-    obs_t = torch.zeros_like(obs_batch)
-    for t in range(h):
-      o0 = t * d
-      src = obs_batch[:, o0 : o0 + d]
-      frame = obs_t[:, o0 : o0 + d]
-      frame[:, :proprio] = src[:, :proprio]
-      frame[:, proprio : proprio + a_t] = src[:, proprio : proprio + a_t]
-      if copy_grasp:
-        grasp0 = proprio + act_slots
-        if src.shape[-1] >= grasp0 + grasp_dim:
-          frame[:, grasp0 : grasp0 + grasp_dim] = src[:, grasp0 : grasp0 + grasp_dim]
-    return torch.nan_to_num(obs_t, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.nan_to_num(obs_batch, nan=0.0, posinf=0.0, neginf=0.0)
 
   # Unified one-step: proprio68|a17|grasp7|sdf… → is_waist @ 86
 
