@@ -676,9 +676,14 @@ class HomieOnPolicyRunner:
         continue
 
       if key == "std" and src.ndim == 1 and dst_shape[0] > src.shape[0]:
-        # Keep loco std from ckpt; new EE dims tiny so residual starts near 0.
-        std = torch.full(dst_shape, 0.05, device=src.device, dtype=src.dtype)
-        std[: src.shape[0]] = torch.nan_to_num(src, nan=1.0).abs().clamp(min=1e-4)
+        # p1→p2 (12→14): new waist dims keep init_std (~1.0) so bend can explore.
+        # p2→p3 (14→17): new EE dims stay tiny so residual starts near 0.
+        n_old = int(src.shape[0])
+        if n_old >= 14:
+          std = torch.full(dst_shape, 0.05, device=src.device, dtype=src.dtype)
+        else:
+          std = cur[key].clone()
+        std[:n_old] = torch.nan_to_num(src, nan=1.0).abs().clamp(min=1e-4)
         out[key] = std
         continue
       if (
@@ -687,14 +692,22 @@ class HomieOnPolicyRunner:
         and dst_shape[0] > src.shape[0]
         and dst_shape[1] == src.shape[1]
       ):
-        # Expanding action head rows: zero new EE rows (avoid random arm fling).
-        w = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
-        w[: src.shape[0]] = src
+        # p1→p2: random-init new waist rows (stable Oct-15). p2→p3: zero EE rows.
+        n_old = int(src.shape[0])
+        if n_old >= 14:
+          w = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
+        else:
+          w = cur[key].clone()
+        w[:n_old] = src
         out[key] = w
         continue
       if key.endswith("bias") and src.ndim == 1 and dst_shape[0] > src.shape[0]:
-        b = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
-        b[: src.shape[0]] = src
+        n_old = int(src.shape[0])
+        if n_old >= 14:
+          b = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
+        else:
+          b = cur[key].clone()
+        b[:n_old] = src
         out[key] = b
         continue
 
