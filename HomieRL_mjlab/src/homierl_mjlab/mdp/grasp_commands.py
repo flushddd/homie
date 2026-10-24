@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 # Homie waist-bend training ranges (``g1_inspire_wiast_config1.target.ranges``).
 # Narrow paper defaults (0.15..0.35 / -0.05..0.1) never exceed arm reach 0.49
 # → ``need_waist`` stays 0 → ``deviation_waist_joint`` only has zero_loss (keep upright).
+# Phase-2 uses these full ranges as before; phase-3 curricula start→end.
 _DEFAULT_POS_X = (0.05, 0.65)
 _DEFAULT_POS_Y = (-0.35, 0.35)
 _DEFAULT_POS_Z = (-1.0, 0.2)
@@ -200,7 +201,11 @@ class GraspTargetCommand(CommandTerm):
     return a / s, b / s, c / s
 
   def _current_pos_ranges(self) -> tuple[tuple[float, float], ...]:
-    """XY/Z sample ranges: start (near) → end (far) via target-range curriculum."""
+    """XY/Z sample ranges.
+
+    Phase-2: fixed full ``pos_*`` (same as prior phase-2 / config1).
+    Phase-3: start (near) → end (far) via target-range curriculum.
+    """
     if not self.arm_on:
       return self.cfg.pos_x, self.cfg.pos_y, self.cfg.pos_z
     alpha = self._range_progress()

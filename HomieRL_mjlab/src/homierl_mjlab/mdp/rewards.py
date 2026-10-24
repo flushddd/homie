@@ -894,7 +894,8 @@ def stand_sway(
   # ``stand_height_threshold`` / ``base_height_target`` kept for cfg compat.
   _ = (base_height_target, stand_height_threshold)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < cmd_threshold).float()
-  gate = zero_cmd * 0
+  # Was accidentally ``zero_cmd * 0`` (phase-3 commit) → entire term always 0.
+  gate = zero_cmd
 
   lin_xy = torch.sum(torch.square(asset.data.root_link_lin_vel_b[:, :2]), dim=-1)
   ang_xy = torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=-1)

@@ -1,4 +1,4 @@
-"""Symmetry flip sanity checks — aligned with Homie ``flip_g1_*`` phase-1."""
+"""Symmetry flip sanity checks — G1 legs+waist; arms kept; grasp ty/arm mirrored."""
 
 import torch
 
@@ -37,47 +37,61 @@ def test_flip_actions_matches_homie12():
   assert torch.allclose(x, y, atol=1e-5)
 
 
-def test_flip_zeros_arms_like_homie():
-  """Homie leaves arm q/dq at 0 in flipped obs (arm flip commented out)."""
+def test_flip_keeps_arms_unchanged():
+  """Arms are random curriculum — flip must not L↔R-swap or zero them."""
   ac = HIMActorCritic(480, 83, 80, 83, 6, 1, 12)
   ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
   x = torch.randn(4, 480)
   y = ppo.flip_actor_obs(x)
   for t in range(6):
     q0 = t * 80 + 10
-    # arms = local 15..28 within 29-DoF block
-    assert torch.allclose(y[:, q0 + 15 : q0 + 29], torch.zeros(4, 14), atol=1e-7)
+    assert torch.allclose(y[:, q0 + 15 : q0 + 29], x[:, q0 + 15 : q0 + 29])
     assert torch.allclose(
-      y[:, q0 + 29 + 15 : q0 + 58], torch.zeros(4, 14), atol=1e-7
+      y[:, q0 + 29 + 15 : q0 + 58], x[:, q0 + 29 + 15 : q0 + 58]
     )
 
 
 def test_flip_actor_obs_involution_legs():
-  """Legs + waist + actions round-trip; arms stay 0 (Homie zeros_like)."""
+  """Legs + waist + actions round-trip under double flip."""
   ac = HIMActorCritic(480, 83, 80, 83, 6, 1, 12)
   ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
   x = torch.randn(4, 480)
-  # Zero arms / anything past loco so involution can hold (Homie never fills them).
-  for t in range(6):
-    base = t * 80
-    q0 = base + 10
-    x[:, q0 + 15 : q0 + 29] = 0
-    x[:, q0 + 29 + 15 : q0 + 58] = 0
-    if 80 > 68 + 12:
-      x[:, base + 68 + 12 : base + 80] = 0
   y = ppo.flip_actor_obs(ppo.flip_actor_obs(x))
   assert torch.allclose(x, y, atol=1e-5)
 
 
-def test_flip_does_not_copy_grasp_sdf_tail():
-  """Homie zeros_like → grasp/SDF stay 0 in flipped obs even if present."""
+def test_flip_mirrors_grasp_ty_and_arm():
+  """Unified layout: grasp after a17; mirror ty, swap arm 1↔2; keep flags."""
+  d = HOMIE_ONE_STEP_OBS
+  ac = HIMActorCritic(d, d + 3, d, d + 3, 1, 1, 14)
+  ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
+  x = torch.zeros(2, d)
+  g0 = HOMIE_PROPRIO_DIM + HOMIE_ACTION_OBS_DIM
+  x[:, g0 + 0] = 0.0  # is_target
+  x[:, g0 + 1] = 1.0  # is_waist
+  x[:, g0 + 2] = 0.15  # extend_dist
+  x[:, g0 + 3] = 0.3  # tx
+  x[:, g0 + 4] = 0.2  # ty
+  x[:, g0 + 5] = -0.1  # tz
+  x[:, g0 + 6] = 1.0  # arm left
+  y = ppo.flip_actor_obs(x)
+  assert torch.allclose(y[:, g0 + 1], x[:, g0 + 1])
+  assert torch.allclose(y[:, g0 + 4], -x[:, g0 + 4])
+  assert torch.allclose(y[:, g0 + 6], torch.full_like(x[:, g0 + 6], 2.0))
+  z = ppo.flip_actor_obs(y)
+  assert torch.allclose(z[:, g0 + 4], x[:, g0 + 4])
+  assert torch.allclose(z[:, g0 + 6], x[:, g0 + 6])
+
+
+def test_flip_does_not_zero_sdf_tail():
+  """SDF/clearance/EE trail stay as-is (zeros in p1/p2; live in p3)."""
   d = HOMIE_ONE_STEP_OBS
   ac = HIMActorCritic(d, d + 3, d, d + 3, 1, 1, 12)
   ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
   x = torch.randn(2, d)
   y = ppo.flip_actor_obs(x)
-  # after proprio68 + a12 (we write n_act=12), rest of 17-pad + grasp/SDF = 0
-  assert torch.allclose(y[:, 68 + 12 :], torch.zeros_like(y[:, 68 + 12 :]))
+  tail0 = HOMIE_PROPRIO_DIM + HOMIE_ACTION_OBS_DIM + HOMIE_GRASP_DIM
+  assert torch.allclose(y[:, tail0:], x[:, tail0:])
 
 
 def test_flip_critic_lin_vel_at_tail():
@@ -96,8 +110,9 @@ def test_flip_critic_lin_vel_at_tail():
 if __name__ == "__main__":
   test_unified_layout_constants()
   test_flip_actions_matches_homie12()
-  test_flip_zeros_arms_like_homie()
+  test_flip_keeps_arms_unchanged()
   test_flip_actor_obs_involution_legs()
-  test_flip_does_not_copy_grasp_sdf_tail()
+  test_flip_mirrors_grasp_ty_and_arm()
+  test_flip_does_not_zero_sdf_tail()
   test_flip_critic_lin_vel_at_tail()
   print("ok")

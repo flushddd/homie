@@ -127,14 +127,24 @@ HOMIE_INIT_STATE = EntityCfg.InitialStateCfg(
   joint_vel={".*": 0.0},
 )
 
-# Policy actions phase-1: 12 lower-limb joints only.
+# Policy actions phase-1: 12 legs, Homie / MJCF order L6|R6 (pitch-roll-yaw…).
+# Explicit names (not ``.*_hip_yaw`` then ``.*_hip_roll``): regex + preserve_order
+# interleaves L/R per axis and breaks ``flip_g1_actions``. JointPositionAction
+# uses ``find_joints_by_actuator_names`` (joint-id order) which already yields
+# this layout; keep the list explicit so order stays obvious and stable.
 LEG_JOINT_NAMES = (
-  ".*_hip_yaw_joint",
-  ".*_hip_roll_joint",
-  ".*_hip_pitch_joint",
-  ".*_knee_joint",
-  ".*_ankle_pitch_joint",
-  ".*_ankle_roll_joint",
+  "left_hip_pitch_joint",
+  "left_hip_roll_joint",
+  "left_hip_yaw_joint",
+  "left_knee_joint",
+  "left_ankle_pitch_joint",
+  "left_ankle_roll_joint",
+  "right_hip_pitch_joint",
+  "right_hip_roll_joint",
+  "right_hip_yaw_joint",
+  "right_knee_joint",
+  "right_ankle_pitch_joint",
+  "right_ankle_roll_joint",
 )
 
 # Phase-2 policy actions: 12 legs + roll + pitch (Homie effective control).
