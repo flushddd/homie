@@ -73,11 +73,11 @@ class HIMPPO:
     self.keep_loco_always = False
     self.teacher_one_step_obs = 0
 
-    # Flip hardcodes legs+waist; arms left unchanged (random curriculum).
+    # Homie flip_g1: legs+waist only; arms stay 0 in flipped obs.
     self._joint_names: list[str] = []
 
   def set_joint_symmetry(self, joint_names: list[str]) -> None:
-    """Bind robot joint names; flip hardcodes G1 legs+waist (arms not mirrored)."""
+    """Bind robot joint names; flip follows Homie ``flip_g1_*`` (arms never filled)."""
     self._joint_names = list(joint_names)
     self.num_dof = len(joint_names)
     n_arm = sum(
@@ -86,8 +86,8 @@ class HIMPPO:
       if any(k in n for k in ("shoulder", "elbow", "wrist"))
     )
     print(
-      f"[INFO] Joint symmetry: ndof={self.num_dof}, "
-      f"arms_keep_original={n_arm} (no L/R flip)"
+      f"[INFO] Joint symmetry (Homie flip_g1): ndof={self.num_dof}, "
+      f"arms_never_flipped={n_arm}"
     )
 
   def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
@@ -335,8 +335,9 @@ class HIMPPO:
       mean_loss_keep / num_updates,
     )
 
-  # ---- symmetry helpers (G1 legs+waist; arms unchanged) ----
-  # hinge order: L6 | R6 | waist3 | arms14  (29). Action obs slots always 17.
+  # ---- symmetry helpers (Homie ``flip_g1_*``) ----
+  # G1 hinge order: L6 | R6 | waist3 | arms14. Homie fills ONLY legs+waist
+  # (+ loco actions); arms / grasp / SDF stay 0 via zeros_like.
   _ACT_OBS = 17
   _GRASP = 7
   _N_DOF = 29
@@ -344,25 +345,28 @@ class HIMPPO:
   _A0 = 10 + 2 * 29  # 68
 
   def _flip_one_step(self, step: torch.Tensor, with_lin_vel: bool) -> torch.Tensor:
-    """Homie loco flip: legs+waist only; arms / grasp kept (not L↔R-swapped as blocks).
+    """Port of Homie ``flip_g1_actor_obs`` / ``flip_g1_critic_obs``.
 
-    Arms are random curriculum — do **not** mirror them (leave original values).
-    Grasp (phase-2+): keep flags/dist/tz; mirror ``ty`` and swap arm 1↔2.
-    SDF/clearance/EE trail (phase-3): left as original zeros or values (Homie never
-    had these; zeroing grasp was breaking phase-2 waist symmetry).
+    ``zeros_like`` then write only the loco channels Homie writes. Arms
+    (idx 15..28) and grasp/SDF/clearance/EE trail are never written → stay 0.
     """
-    out = step.clone()
+    out = torch.zeros_like(step)
     # commands
+    out[..., 0] = step[..., 0]
     out[..., 1] = -step[..., 1]
     out[..., 2] = -step[..., 2]
+    out[..., 3] = step[..., 3]
     # ang vel
     out[..., 4] = -step[..., 4]
+    out[..., 5] = step[..., 5]
     out[..., 6] = -step[..., 6]
     # gravity
+    out[..., 7] = step[..., 7]
     out[..., 8] = -step[..., 8]
+    out[..., 9] = step[..., 9]
 
     q0 = self._Q0
-    # ---- joint pos: legs L↔R, waist signs; arms (15..28) unchanged ----
+    # joint pos: legs L↔R, waist signs (arms left at 0)
     out[..., q0 + 0] = step[..., q0 + 6]
     out[..., q0 + 1] = -step[..., q0 + 7]
     out[..., q0 + 2] = -step[..., q0 + 8]
@@ -378,7 +382,6 @@ class HIMPPO:
     out[..., q0 + 12] = -step[..., q0 + 12]
     out[..., q0 + 13] = -step[..., q0 + 13]
     out[..., q0 + 14] = step[..., q0 + 14]
-    # arms: intentionally not written — keep clone
 
     v0 = q0 + self._N_DOF
     out[..., v0 + 0] = step[..., v0 + 6]
@@ -397,25 +400,17 @@ class HIMPPO:
     out[..., v0 + 13] = -step[..., v0 + 13]
     out[..., v0 + 14] = step[..., v0 + 14]
 
+    # last actions: Homie fills 12 legs; we also flip waist/EE if present
     a0 = self._A0
     n_act = int(self.actor_critic.num_actions)
     if step.shape[-1] >= a0 + n_act:
       out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
 
-    # grasp7 after action slots (unified layout: a0+17): mirror ty, swap arm
-    g0 = a0 + self._ACT_OBS
-    if step.shape[-1] >= g0 + self._GRASP:
-      out[..., g0 + 4] = -step[..., g0 + 4]  # ty
-      arm = step[..., g0 + 6]
-      out[..., g0 + 6] = torch.where(
-        arm > 1.5,
-        torch.ones_like(arm),
-        torch.where(arm > 0.5, torch.full_like(arm, 2.0), arm),
-      )
-
     if with_lin_vel and step.shape[-1] >= 3:
       lv = int(step.shape[-1]) - 3
+      out[..., lv] = step[..., lv]
       out[..., lv + 1] = -step[..., lv + 1]
+      out[..., lv + 2] = step[..., lv + 2]
     return out
 
   def flip_actor_obs(self, obs: torch.Tensor) -> torch.Tensor:
