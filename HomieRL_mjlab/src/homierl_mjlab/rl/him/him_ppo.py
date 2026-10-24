@@ -69,7 +69,7 @@ class HIMPPO:
     self.freeze_std_dims = 12
     self.stand_height = 0.74
     self.keep_height_tol = 0.02
-    self.is_waist_one_step_idx = 86  # unified: 68+17+1
+    self.is_waist_one_step_idx = 83  # phase-2: 68+14+1; phase-3 cfg sets 86
     self.keep_loco_always = False
     self.teacher_one_step_obs = 0
 
@@ -463,7 +463,7 @@ class HIMPPO:
     freeze_std_dims: int = 12,
     stand_height: float = 0.74,
     keep_height_tol: float = 0.02,
-    is_waist_one_step_idx: int = 86,
+    is_waist_one_step_idx: int = 83,
     keep_loco_always: bool = False,
     teacher_one_step_obs: int = 0,
   ) -> None:
@@ -497,7 +497,8 @@ class HIMPPO:
     """
     return torch.nan_to_num(obs_batch, nan=0.0, posinf=0.0, neginf=0.0)
 
-  # Unified one-step: proprio68|a17|grasp7|sdf… → is_waist @ 86
+  # Phase-2: proprio68|a14|grasp7|container10 → is_waist @ 83
+  # Phase-3: proprio68|a17|grasp7|sdf… → is_waist @ 86
 
   def _loco_mask(self, obs_batch: torch.Tensor) -> torch.Tensor:
     """Mask for loco keep. Phase-2: only non-waist envs. Phase-3: always on."""

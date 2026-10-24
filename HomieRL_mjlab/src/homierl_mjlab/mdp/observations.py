@@ -11,10 +11,12 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
-# Unified actor one-step (all phases):
-#   proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3 = 229
+# Layouts (Oct-15 stable p1/p2; phase-3 reach):
+#   p1: proprio68 | a12 | container10 = 90
+#   p2: proprio68 | a14 | grasp7 | container10 = 99  → is_waist @ 83
+#   p3: proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229 → is_waist @ 86
 HOMIE_PROPRIO_DIM = 68
-HOMIE_ACTION_OBS_DIM = 17
+HOMIE_ACTION_OBS_DIM = 17  # phase-3 action history width
 HOMIE_GRASP_DIM = 7
 HOMIE_SDF_DIM = 128  # 64 phi + 64 valid
 HOMIE_CLEARANCE_DIM = 6
@@ -27,8 +29,8 @@ HOMIE_ONE_STEP_OBS = (
   + HOMIE_CLEARANCE_DIM
   + HOMIE_EE_ERR_DIM
 )
-# grasp[1] = is_waist → 68 + 17 + 1 = 86
-HOMIE_IS_WAIST_IDX = HOMIE_PROPRIO_DIM + HOMIE_ACTION_OBS_DIM + 1
+# Phase-2 is_waist (legacy); phase-3 uses 86 via rl_cfg.
+HOMIE_IS_WAIST_IDX = HOMIE_PROPRIO_DIM + 14 + 1  # 83
 
 
 def height_command(

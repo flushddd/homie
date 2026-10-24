@@ -43,24 +43,26 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
   """
   phase = int(phase)
   use_teacher = phase >= 2
-  # Unified actor layout for all phases: is_waist @ 68+17+1 = 86
-  is_waist_idx = 86
+  # Oct-15 layouts: p2 is_waist @ 68+14+1=83; p3 @ 68+17+1=86
   if phase >= 3:
     keep_dims = 14
     run_name = "phase3"
+    is_waist_idx = 86
     keep_always = True  # arm-reach keeps is_waist≈1; still lock 14 loco dims
-    # Same 229 layout as student; _teacher_obs zeros EE acts + SDF trail.
-    teacher_one_step = 229
+    # Teacher is expanded p2 clone (same 229 net); pass full obs (keep locks means).
+    teacher_one_step = 0
     keep_loco_weight = 5.0  # stronger than phase-2; new SDF/EE must not wreck loco
   elif phase == 2:
     keep_dims = 12
     run_name = "phase2"
+    is_waist_idx = 83
     keep_always = False
-    teacher_one_step = 229
+    teacher_one_step = 0  # full student obs → teacher (Oct-15 / 2a2c0b1)
     keep_loco_weight = 2.0
   else:
     keep_dims = 12
     run_name = ""
+    is_waist_idx = 83
     keep_always = False
     teacher_one_step = 0
     keep_loco_weight = 2.0

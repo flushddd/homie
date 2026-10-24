@@ -493,10 +493,10 @@ class HomieOnPolicyRunner:
     }
     torch.save(payload, path)
 
-  # Homie one-step layouts (actor):
-  #   legacy p1: proprio68 | a12 | container10 = 90
-  #   legacy p2: proprio68 | a14 | grasp7 | container10 = 99
-  #   unified:   proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
+  # Homie one-step layouts (actor) — Oct-15 stable p1/p2, then p3 reach:
+  #   p1: proprio68 | a12 | container10 = 90
+  #   p2: proprio68 | a14 | grasp7 | container10 = 99
+  #   p3: proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
   _HOMIE_PROPRIO = 68
   _HOMIE_GRASP = 7
   _HOMIE_CONTAINER = 10
@@ -504,10 +504,41 @@ class HomieOnPolicyRunner:
 
   @classmethod
   def _act_obs_slots(cls, one_step: int, num_actions: int) -> int:
-    """Action-history width in one-step obs (17 once unified layout is used)."""
-    if one_step >= cls._HOMIE_PROPRIO + cls._HOMIE_ACT_OBS + cls._HOMIE_GRASP:
+    """Action-history width in one-step obs.
+
+    Phase-3 (SDF trail, ≥156) uses padded 17; legacy p1/p2 use real ``num_actions``
+    (12 / 14). Do **not** treat p2's 99 as unified — ``68+17+7=92`` would false-positive.
+    """
+    p3_min = (
+      cls._HOMIE_PROPRIO + cls._HOMIE_ACT_OBS + cls._HOMIE_GRASP + 64
+    )  # sdf phi block
+    if one_step >= p3_min:
       return cls._HOMIE_ACT_OBS
     return int(num_actions)
+
+  @classmethod
+  def _parse_actor_trail(
+    cls, one_step: int, act_slots: int
+  ) -> tuple[int, int, int]:
+    """Return ``(grasp_dim, container_dim, other_trail)`` after proprio|actions."""
+    proprio = cls._HOMIE_PROPRIO
+    grasp = cls._HOMIE_GRASP
+    container = cls._HOMIE_CONTAINER
+    after = int(one_step) - proprio - int(act_slots)
+    if after < 0:
+      return 0, 0, 0
+    # Phase-3: grasp + SDF/clearance/EE (no container10).
+    if one_step >= proprio + cls._HOMIE_ACT_OBS + grasp + 64:
+      return grasp, 0, after - grasp
+    # Legacy p2: grasp7 + container10.
+    if after >= grasp + container:
+      return grasp, container, after - grasp - container
+    # Legacy p1: container10 only (exactly 10 — do not misread as grasp).
+    if after == container:
+      return 0, container, 0
+    if after >= grasp:
+      return grasp, 0, after - grasp
+    return 0, 0, after
 
   def _remap_homie_actor_frame(
     self,
@@ -523,42 +554,25 @@ class HomieOnPolicyRunner:
     if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
       return old_w
     proprio = self._HOMIE_PROPRIO
-    grasp = self._HOMIE_GRASP
-    container = self._HOMIE_CONTAINER
     old_slots = self._act_obs_slots(old_one, old_act)
     new_slots = self._act_obs_slots(new_one, new_act)
+    old_grasp, old_cont, _old_rest = self._parse_actor_trail(old_one, old_slots)
+    new_grasp, new_cont, _new_rest = self._parse_actor_trail(new_one, new_slots)
 
-    old_after = old_one - proprio - old_slots
-    # Legacy container10 vs unified SDF trail vs grasp-only.
-    if old_one >= proprio + self._HOMIE_ACT_OBS + grasp:
-      old_grasp = grasp
-      old_cont = 0  # SDF/… trail — do not copy into new
-    else:
-      old_has_grasp = old_after >= grasp
-      old_grasp = grasp if old_has_grasp else 0
-      old_cont = (
-        container
-        if (old_after - old_grasp) >= container
-        else max(old_after - old_grasp, 0)
+    if proprio + old_slots + old_grasp + old_cont > old_one:
+      print(
+        f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
+        "using generic proprio|act copy"
       )
-      if proprio + old_slots + old_grasp + old_cont != old_one:
-        print(
-          f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
-          "using generic proprio|act copy"
-        )
-        proprio = old_one - old_slots
-        old_grasp = 0
-        old_cont = 0
-
-    new_after = new_one - proprio - new_slots
-    new_grasp = grasp if new_after >= grasp else 0
-    if proprio + new_slots + new_grasp > new_one:
+      old_grasp, old_cont = 0, 0
+    if proprio + new_slots + new_grasp + new_cont > new_one:
       print(f"[WARN] new actor layout too small: one={new_one} act_slots={new_slots}")
       return old_w
 
     new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
     a_copy = min(old_slots, new_slots, old_act, new_act)
     g_copy = min(old_grasp, new_grasp)
+    c_copy = min(old_cont, new_cont)
     for t in range(hist):
       o0 = t * old_one
       n0 = t * new_one
@@ -570,6 +584,10 @@ class HomieOnPolicyRunner:
         o_g = o0 + proprio + old_slots
         n_g = n0 + proprio + new_slots
         new_w[:, n_g : n_g + g_copy] = old_w[:, o_g : o_g + g_copy]
+      if c_copy > 0:
+        o_c = o0 + proprio + old_slots + old_grasp
+        n_c = n0 + proprio + new_slots + new_grasp
+        new_w[:, n_c : n_c + c_copy] = old_w[:, o_c : o_c + c_copy]
     return new_w
 
   def _remap_homie_critic_frame(
@@ -595,18 +613,19 @@ class HomieOnPolicyRunner:
     if old_one >= lin_vel:
       maybe_actor = old_one - lin_vel
       legacy = {
-        proprio + old_act,
+        proprio + old_act,  # 80-D p1
         proprio + old_act + grasp,
-        proprio + old_act + grasp + self._HOMIE_CONTAINER,
-        proprio + old_act + self._HOMIE_CONTAINER,
+        proprio + old_act + grasp + self._HOMIE_CONTAINER,  # 99-D p2
+        proprio + old_act + self._HOMIE_CONTAINER,  # 90-D p1
       }
-      unified_min = proprio + self._HOMIE_ACT_OBS + grasp
-      if maybe_actor in legacy or maybe_actor >= unified_min:
+      p3_actor_min = proprio + self._HOMIE_ACT_OBS + grasp + 64
+      if maybe_actor in legacy or maybe_actor >= p3_actor_min:
         old_has_lin = True
         old_actor_one = maybe_actor
 
-    new_slots = self._act_obs_slots(new_one - lin_vel if new_one >= lin_vel else new_one, new_act)
-    new_has_lin = new_one >= lin_vel and (new_one - lin_vel) >= proprio + new_slots
+    new_actor_guess = new_one - lin_vel if new_one >= lin_vel else new_one
+    new_slots = self._act_obs_slots(new_actor_guess, new_act)
+    new_has_lin = new_one >= lin_vel and new_actor_guess >= proprio + new_slots
     new_actor_one = new_one - lin_vel if new_has_lin else new_one
 
     actor_old = old_w.new_zeros(old_w.shape[0], hist * old_actor_one)
@@ -761,13 +780,82 @@ class HomieOnPolicyRunner:
         f"[WARN] skip incompatible ckpt key {key}: "
         f"{tuple(src.shape)} -> {tuple(dst_shape)}"
       )
+
+    # Unified 229: one_step width unchanged p1→p2, so encoder/actor.0 copy
+    # equal-shape and keep random columns for slots that were always-zero in
+    # phase-1 (action pad 12:17, grasp7). Zero those newly-live cols.
+    if old_act < new_act and old_one == new_one:
+      self._scrub_unified_newly_live_obs_cols(
+        out,
+        old_act=old_act,
+        new_act=new_act,
+        one_step=new_one,
+        hist_a=hist_a,
+        one_step_c=new_one_c,
+        hist_c=hist_c,
+      )
     return out
+
+  def _scrub_unified_newly_live_obs_cols(
+    self,
+    sd: dict[str, torch.Tensor],
+    *,
+    old_act: int,
+    new_act: int,
+    one_step: int,
+    hist_a: int,
+    one_step_c: int,
+    hist_c: int,
+  ) -> None:
+    """Zero encoder/actor/critic input cols for channels that light up at p2.
+
+    Phase-1 pads actions to 17 and leaves grasp/SDF at 0, so those weight
+    columns never train. At phase-2 the waist action slots + grasp become
+    live; leaving random weights there destabilizes loco right after expand.
+    """
+    proprio = self._HOMIE_PROPRIO
+    act_slots = self._HOMIE_ACT_OBS
+    grasp = self._HOMIE_GRASP
+    if one_step < proprio + act_slots + grasp:
+      return
+    a0, a1 = proprio + int(old_act), proprio + int(new_act)
+    g0, g1 = proprio + act_slots, proprio + act_slots + grasp
+
+    def _scrub(w: torch.Tensor, hist: int, one: int) -> None:
+      if w.ndim != 2 or hist <= 0 or w.shape[1] < hist * one:
+        return
+      for t in range(hist):
+        b = t * one
+        if a1 > a0:
+          w[:, b + a0 : b + a1] = 0
+        w[:, b + g0 : b + g1] = 0
+
+    enc = sd.get("estimator.encoder.0.weight")
+    if enc is not None:
+      _scrub(enc, hist_a, one_step)
+      print(
+        f"[INFO] Scrubbed newly-live obs cols in encoder "
+        f"(act[{old_act}:{new_act}], grasp) for unified {one_step}-D layout"
+      )
+    tgt = sd.get("estimator.target.0.weight")
+    if tgt is not None:
+      _scrub(tgt, 1, one_step)
+    actor0 = sd.get("actor.0.weight")
+    if actor0 is not None and actor0.ndim == 2 and actor0.shape[1] >= one_step:
+      # actor.0 = [one_step | latent]; only scrub the obs prefix.
+      if a1 > a0:
+        actor0[:, a0:a1] = 0
+      actor0[:, g0:g1] = 0
+    crit0 = sd.get("critic.0.weight")
+    if crit0 is not None:
+      _scrub(crit0, hist_c, one_step_c)
 
   def load(self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location=None):
     del load_cfg
     loaded = torch.load(path, map_location=map_location or self.device, weights_only=False)
     loaded_sd = loaded["model_state_dict"]
     cur_sd = self.alg.actor_critic.state_dict()
+    old_act = int(loaded_sd["std"].shape[0]) if "std" in loaded_sd else 12
     need_expand = any(
       k in loaded_sd and loaded_sd[k].shape != cur_sd[k].shape for k in cur_sd
     )
@@ -787,12 +875,18 @@ class HomieOnPolicyRunner:
       )
     self.current_learning_iteration = int(loaded.get("iter", 0))
     infos = loaded.get("infos") or {}
-    # Cross-phase expand (p2→p3): do NOT restore phase-2 step counter — it
-    # instantly maxes phase-3 reach/target curriculum and skews metrics.
-    if "env_state" in infos and not need_expand:
+    # p1→p2: restore counter so velocity curriculum matches Oct-15 (wide
+    # ranges once phase-1 has already passed step 250000).
+    # p2→p3: do NOT restore — would instantly max reach/target curricula.
+    if "env_state" in infos and (not need_expand or old_act < 14):
       self.adapter.unwrapped.common_step_counter = infos["env_state"][
         "common_step_counter"
       ]
+      if need_expand and old_act < 14:
+        print(
+          "[INFO] Restored common_step_counter after p1→p2 expand "
+          f"(act {old_act}→{int(cur_sd['std'].shape[0])})"
+        )
     elif need_expand:
       print(
         "[INFO] Skipping common_step_counter restore after obs/action-dim expand"

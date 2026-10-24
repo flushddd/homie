@@ -16,7 +16,8 @@ from homierl_mjlab.rl.him.him_actor_critic import HIMActorCritic
 from homierl_mjlab.rl.him.him_ppo import HIMPPO
 
 
-def test_unified_layout_constants():
+def test_layout_constants():
+  # Phase-3 full width constant; phase-2 is_waist @ 68+14+1.
   assert HOMIE_ONE_STEP_OBS == (
     HOMIE_PROPRIO_DIM
     + HOMIE_ACTION_OBS_DIM
@@ -26,7 +27,7 @@ def test_unified_layout_constants():
     + HOMIE_EE_ERR_DIM
   )
   assert HOMIE_ONE_STEP_OBS == 229
-  assert HOMIE_IS_WAIST_IDX == 86
+  assert HOMIE_IS_WAIST_IDX == 83
 
 
 def test_flip_actions_matches_homie12():
@@ -92,7 +93,7 @@ def test_flip_critic_lin_vel_at_tail():
 
 
 if __name__ == "__main__":
-  test_unified_layout_constants()
+  test_layout_constants()
   test_flip_actions_matches_homie12()
   test_flip_zeros_arms_like_homie()
   test_flip_actor_obs_involution_legs()

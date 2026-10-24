@@ -341,14 +341,14 @@
     {
       "id": "homiePhase1Run",
       "type": "promptString",
-      "description": "Phase-1 run folder name under logs/rsl_rl/homie_g1/",
-      "default": "2026-10-10_16-30-36"
+      "description": "Phase-1 run (legacy ~80/90-D obs; NOT unified 229 phase1/)",
+      "default": "2026-10-09_17-56-27"
     },
     {
       "id": "homiePhase1Ckpt",
       "type": "promptString",
-      "description": "Phase-1 checkpoint filename",
-      "default": "model_11000.pt"
+      "description": "Phase-1 checkpoint filename (Oct-15-style: high-iter 12-act)",
+      "default": "model_17000.pt"
     },
     {
       "id": "homieResumeRun",
