@@ -346,17 +346,15 @@ def homie_g1_flat_env_cfg(
   critic_terms = {
     **actor_terms,
     "joint_pos": ObservationTermCfg(func=vel_mdp.joint_pos_rel, scale=1.0),
-    # Homie critic appends base_lin_vel * obs_scales.lin_vel (2.0).
+    # Homie critic appends base_lin_vel * obs_scales.lin_vel (2.0) as the
+    # **final** terms. PPO flip assumes lin_vel is the last 3 dims — do NOT
+    # move container after it (that broke critic symmetry on the 90/99 layout).
     "base_lin_vel": ObservationTermCfg(
       func=vel_mdp.builtin_sensor,
       params={"sensor_name": "robot/imu_lin_vel"},
       scale=2.0,
     ),
   }
-  # Phase-1/2: container stays last on critic after lin_vel (Oct-15).
-  if int(phase) < 3 and "container_geom" in critic_terms:
-    c_term = critic_terms.pop("container_geom")
-    critic_terms["container_geom"] = c_term
   cfg.observations = {
     "actor": ObservationGroupCfg(
       terms=actor_terms,

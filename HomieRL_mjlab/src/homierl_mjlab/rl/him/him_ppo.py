@@ -406,6 +406,7 @@ class HIMPPO:
     if step.shape[-1] >= a0 + n_act:
       out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
 
+    # Critic: Homie / mjlab append lin_vel as the last 3 dims of one-step.
     if with_lin_vel and step.shape[-1] >= 3:
       lv = int(step.shape[-1]) - 3
       out[..., lv] = step[..., lv]

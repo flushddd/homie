@@ -92,6 +92,22 @@ def test_flip_critic_lin_vel_at_tail():
   assert torch.allclose(y[:, -1], x[:, -1])
 
 
+def test_phase1_critic_lin_vel_last_not_container():
+  """p1 critic = actor90 (…|container10) + lin_vel3; flip must hit lin_vel."""
+  d_actor, d_crit = 90, 93
+  ac = HIMActorCritic(d_actor * 6, d_crit, d_actor, d_crit, 6, 1, 12)
+  ppo = HIMPPO(ac, use_flip=True, device="cpu", num_dof=29)
+  x = torch.zeros(2, d_crit)
+  # container pad (zeros) then lin_vel at tail
+  x[:, -3:] = torch.tensor([[1.0, 2.0, 3.0], [0.5, -1.0, 0.25]])
+  y = ppo.flip_critic_obs(x)
+  assert torch.allclose(y[:, -3], x[:, -3])
+  assert torch.allclose(y[:, -2], -x[:, -2])
+  assert torch.allclose(y[:, -1], x[:, -1])
+  # if someone put container after lin_vel, -3 would be wrong — guard length
+  assert d_crit == d_actor + 3
+
+
 if __name__ == "__main__":
   test_layout_constants()
   test_flip_actions_matches_homie12()
@@ -99,4 +115,5 @@ if __name__ == "__main__":
   test_flip_actor_obs_involution_legs()
   test_flip_zeros_grasp_sdf_tail()
   test_flip_critic_lin_vel_at_tail()
+  test_phase1_critic_lin_vel_last_not_container()
   print("ok")
