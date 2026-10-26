@@ -296,6 +296,15 @@ class HIMPPO:
         + self.keep_loco_weight * loss_keep
       )
 
+      if not torch.isfinite(loss):
+        # NaN/Inf batch: skip step so std / weights are not poisoned.
+        if not getattr(self, "_warned_nonfinite_loss", False):
+          print("[WARN] non-finite PPO loss; skipping optimizer step")
+          self._warned_nonfinite_loss = True
+        self.optimizer.zero_grad(set_to_none=True)
+        continue
+      self._warned_nonfinite_loss = False
+
       self.optimizer.zero_grad()
       loss.backward()
       # Freeze exploration noise on locked loco dims (Homie freeze_std).
@@ -308,6 +317,8 @@ class HIMPPO:
         self.actor_critic.std.grad[: self.freeze_std_dims].zero_()
       nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
       self.optimizer.step()
+      if hasattr(self.actor_critic, "project_std_"):
+        self.actor_critic.project_std_()
 
       mean_value_loss += value_loss.item()
       mean_surrogate_loss += surrogate_loss.item()

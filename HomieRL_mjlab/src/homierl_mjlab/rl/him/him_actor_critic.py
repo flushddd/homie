@@ -235,6 +235,8 @@ class HIMActorCritic(nn.Module):
                 (obs_history[:, -self.num_one_step_obs :], vel, dynamic_latent),
                 dim=-1,
             )
+        # Estimator can emit NaN once obs blow up; scrub before the actor MLP.
+        actor_input = torch.nan_to_num(actor_input, nan=0.0, posinf=1e2, neginf=-1e2)
         return self._sanitize_action_mean(self.actor(actor_input))
 
     def reset(self, dones=None):
@@ -255,10 +257,23 @@ class HIMActorCritic(nn.Module):
     def entropy(self):
         return self.distribution.entropy().sum(dim=-1)
 
+    def _positive_std(self) -> torch.Tensor:
+        """Finite, strictly positive noise (NaN bypasses ``clamp(min=...)``)."""
+        std = torch.nan_to_num(self.std, nan=1e-2, posinf=1.0, neginf=1e-2)
+        return std.clamp(min=1e-4, max=1.0)
+
+    def project_std_(self) -> None:
+        """Keep ``self.std`` trainable but always a valid Normal scale."""
+        with torch.no_grad():
+            self.std.data.copy_(
+                torch.nan_to_num(self.std.data, nan=1e-2, posinf=1.0, neginf=1e-2).clamp(
+                    min=1e-4, max=1.0
+                )
+            )
+
     def update_distribution(self, obs_history):
         action_mean = self._actor_forward(obs_history)
-        # Keep std positive; expand to batch for broadcasting safety.
-        std = self.std.clamp(min=1e-4).expand_as(action_mean)
+        std = self._positive_std().expand_as(action_mean)
         self.distribution = Normal(action_mean, std, validate_args=False)
 
     def act(self, obs_history=None, **kwargs):

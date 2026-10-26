@@ -593,18 +593,27 @@ def homie_g1_flat_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
-    # Play: freeze random arm curriculum; hold arms at default.
-    cfg.events.pop("init_upper_curriculum", None)
-    cfg.events.pop("upper_body_curriculum", None)
-    cfg.events.pop("reset_upper_curriculum", None)
-    if "hold_arms_default" not in cfg.events:
-      cfg.events["hold_arms_default"] = EventTermCfg(
-        func=homie_mdp.hold_joints_at_default,
-        mode="step",
-        params={
-          "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
-        },
-      )
+    if int(phase) <= 1:
+      # Keep Homie random-arm motion; start at full ratio so play is visible.
+      init_ev = cfg.events.get("init_upper_curriculum")
+      if init_ev is not None:
+        init_ev.params["init_ratio"] = 1.0
+      bump = cfg.events.get("upper_body_curriculum")
+      if bump is not None:
+        bump.params["ratio_step"] = 0.0
+    else:
+      # Phase-2+: arms PD-held (same as train).
+      cfg.events.pop("init_upper_curriculum", None)
+      cfg.events.pop("upper_body_curriculum", None)
+      cfg.events.pop("reset_upper_curriculum", None)
+      if "hold_arms_default" not in cfg.events:
+        cfg.events["hold_arms_default"] = EventTermCfg(
+          func=homie_mdp.hold_joints_at_default,
+          mode="step",
+          params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+          },
+        )
     # Stop random resample / standing-zero fighting the Viser slider.
     # Keep ranges.height=(-0.5, 0) so the absolute-height slider stays movable.
     twist = cfg.commands["twist"]
