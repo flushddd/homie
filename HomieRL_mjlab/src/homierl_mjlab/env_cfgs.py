@@ -69,16 +69,19 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
         "asset_cfg": arm_cfg,
         # Homie upper_interval_s=1 → ~50 control steps at dt=0.02.
         "upper_interval": 50,
-        "ratio_step": 0.05,
-        "warmup_steps": 0,
-        # ~one episode (20s @ 50Hz) between ratio bumps.
-        "steps_per_ratio_bump": 1000,
       },
     )
+    # Homie: bump ratio on reset when tracking_x_vel is good
+    # (``update_action_curriculum``), not on a fixed wall-clock schedule.
     cfg.events["reset_upper_curriculum"] = EventTermCfg(
       func=homie_mdp.reset_upper_body_curriculum,
       mode="reset",
-      params={"asset_cfg": arm_cfg},
+      params={
+        "asset_cfg": arm_cfg,
+        "reward_name": "tracking_x_vel",
+        "threshold_frac": 0.8,
+        "ratio_step": 0.05,
+      },
     )
     return
 
@@ -100,7 +103,7 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 
 
 def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: 12 legs. Phase-2: 12 legs + waist roll/pitch (yaw held)."""
+  """Phase-1: 12 legs. Phase-2: 12 legs + waist roll/pitch (14; yaw PD-held)."""
   if int(phase) <= 1:
     names = LEG_JOINT_NAMES
     scale = HOMIE_LEG_ACTION_SCALE
@@ -201,7 +204,7 @@ def homie_g1_flat_env_cfg(
   )
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (feet_ground_cfg, self_collision_cfg)
 
-  # ---- Actions: phase-1 = 12 legs; phase-2 = 12 legs + 3 waist ----
+  # ---- Actions: phase-1 = 12 legs; phase-2 = 12 legs + roll/pitch (yaw held) ----
   _configure_phase_actions(cfg, phase=phase)
 
   # ---- Commands: twist + height (Homie ranges + resampling_time=4s) ----
@@ -594,13 +597,10 @@ def homie_g1_flat_env_cfg(
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
     if int(phase) <= 1:
-      # Keep Homie random-arm motion; start at full ratio so play is visible.
+      # Homie play: ``action_curriculum_ratio = 1.0`` (full random arms).
       init_ev = cfg.events.get("init_upper_curriculum")
       if init_ev is not None:
         init_ev.params["init_ratio"] = 1.0
-      bump = cfg.events.get("upper_body_curriculum")
-      if bump is not None:
-        bump.params["ratio_step"] = 0.0
     else:
       # Phase-2+: arms PD-held (same as train).
       cfg.events.pop("init_upper_curriculum", None)

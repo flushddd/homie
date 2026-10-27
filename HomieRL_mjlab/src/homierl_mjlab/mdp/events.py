@@ -73,6 +73,48 @@ def init_upper_body_curriculum(
   setattr(env, _ENV_STATE_KEY, state)
 
 
+def bump_upper_body_curriculum_from_tracking(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  reward_name: str = "tracking_x_vel",
+  threshold_frac: float = 0.8,
+  ratio_step: float = 0.05,
+) -> None:
+  """Homie ``update_action_curriculum`` (legged_robot1jieduan).
+
+  Only when ``common_step_counter % max_episode_length == 0`` and mean episode
+  ``tracking_x_vel`` exceeds ``threshold_frac * weight``, bump ratio by
+  ``ratio_step``. Must run in a reset event *before* ``reward_manager.reset``.
+  """
+  state = _get_state(env)
+  if state is None or env_ids is None or len(env_ids) == 0:
+    return
+  max_len = int(env.max_episode_length)
+  if max_len <= 0 or int(env.common_step_counter) % max_len != 0:
+    return
+  rm = getattr(env, "reward_manager", None)
+  if rm is None or not hasattr(rm, "_episode_sums"):
+    return
+  sums = rm._episode_sums.get(reward_name)
+  if sums is None:
+    return
+  # Resolve weight from reward cfg (Homie compares to ``reward_scales[name]``).
+  weight = 1.5
+  term = rm.cfg.get(reward_name) if isinstance(rm.cfg, dict) else None
+  if term is not None:
+    weight = float(getattr(term, "weight", weight))
+  # mjlab stores Σ(func * weight * dt); / episode_length_s → mean(func)*weight.
+  ep_len_s = float(env.max_episode_length_s)
+  if ep_len_s <= 0.0:
+    return
+  mean_ep = torch.mean(sums[env_ids]).item() / ep_len_s
+  if mean_ep > threshold_frac * weight:
+    state.ratio = min(1.0, state.ratio + float(ratio_step))
+    # Mirror Homie extras["episode"]["action_curriculum_ratio"].
+    log = env.extras.setdefault("log", {})
+    log["Curriculum/arm_action_ratio"] = torch.tensor(state.ratio, device=env.device)
+
+
 def update_upper_body_pose_curriculum(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None,
@@ -85,18 +127,15 @@ def update_upper_body_pose_curriculum(
     ),
   ),
   upper_interval: int = 50,
-  ratio_step: float = 0.01,
-  warmup_steps: int = 20_000,
-  steps_per_ratio_bump: int = 5_000,
 ) -> None:
   """Homie ``random_upper_actions`` (legged_robot1jieduan when ``not arm_on``).
 
   Every ``upper_interval`` steps sample a new arm target toward a random joint
   limit with exponential bias controlled by ``ratio``; each step interpolates
-  ``current → target``. Ratio grows by ``ratio_step`` after ``warmup_steps``,
-  every ``steps_per_ratio_bump`` env steps (Homie bumps on tracking; we use a
-  fixed schedule).
+  ``current → target``. Ratio is bumped separately via tracking
+  (``bump_upper_body_curriculum_from_tracking``), matching Homie.
   """
+  del env_ids
   state = _get_state(env)
   if state is None:
     init_upper_body_curriculum(env, None, asset_cfg=asset_cfg)
@@ -106,10 +145,6 @@ def update_upper_body_pose_curriculum(
 
   asset: Entity = env.scene[asset_cfg.name]
   step = int(env.common_step_counter)
-
-  if step >= warmup_steps and steps_per_ratio_bump > 0:
-    if (step - warmup_steps) % steps_per_ratio_bump == 0:
-      state.ratio = min(1.0, state.ratio + ratio_step)
 
   # Homie: resample when ``common_step_counter % upper_interval == 0``.
   if step % upper_interval == 0:
@@ -156,8 +191,19 @@ def reset_upper_body_curriculum(
       ".*_wrist_.*",
     ),
   ),
+  reward_name: str = "tracking_x_vel",
+  threshold_frac: float = 0.8,
+  ratio_step: float = 0.05,
 ) -> None:
-  """On reset: snap curriculum pose to default for finished envs."""
+  """On reset: Homie action-curriculum bump (if due), then snap arm pose."""
+  # Episode sums still valid here (event reset runs before reward_manager.reset).
+  bump_upper_body_curriculum_from_tracking(
+    env,
+    env_ids,
+    reward_name=reward_name,
+    threshold_frac=threshold_frac,
+    ratio_step=ratio_step,
+  )
   state = _get_state(env)
   if state is None or state.joint_ids is None:
     return
