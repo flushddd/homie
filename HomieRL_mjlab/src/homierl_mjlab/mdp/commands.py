@@ -202,6 +202,16 @@ class TwistHeightCommand(UniformVelocityCommand):
 
     with server.gui.add_folder(name.capitalize()):
       enabled = server.gui.add_checkbox("Enable", initial_value=False)
+      arm_random = server.gui.add_checkbox(
+        "Enable random arms",
+        initial_value=False,
+        hint="OFF=arms held at default. ON=Homie-style random arm motion.",
+      )
+      self._env._homie_play_arm_random = False
+
+      @arm_random.on_update
+      def _(_ev, _arm=arm_random, _env=self._env) -> None:
+        _env._homie_play_arm_random = bool(_arm.value)
 
       for label, max_val in axes:
         max_input = server.gui.add_slider(

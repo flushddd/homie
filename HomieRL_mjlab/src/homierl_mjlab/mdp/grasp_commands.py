@@ -1,7 +1,8 @@
-"""Homie waist-grasp target (phase-2 waist-only; arm training disabled).
+"""Homie waist-grasp target (phase-2 waist bend; arms via env random curriculum).
 
 Uses ``waist_curriculum`` + random grasp points as obs for the waist policy.
-``arm_on`` / ``is_target`` stay off so arm reach is not trained (arms PD-held).
+``arm_on`` / ``is_target`` stay off (no arm-reach policy); arm pose comes from
+the shared upper-body random curriculum in ``env_cfgs`` events.
 
 Viser play: ``create_gui`` exposes target_x/y/z so you can drive waist mode
 manually (Enable ON → force ``is_waist`` + stand still on the viewed env).
@@ -32,7 +33,7 @@ if TYPE_CHECKING:
 # Narrow paper defaults (0.15..0.35 / -0.05..0.1) never exceed arm reach 0.49
 # → ``need_waist`` stays 0 → ``deviation_waist_joint`` only has zero_loss (keep upright).
 _DEFAULT_POS_X = (0.05, 0.65)
-_DEFAULT_POS_Y = (-0.15, 0.15)
+_DEFAULT_POS_Y = (-0.35, 0.35)
 _DEFAULT_POS_Z = (-1.0, 0.2)
 
 _ARM_REACH = 0.49
@@ -104,6 +105,17 @@ class GraspTargetCommand(CommandTerm):
     self._gui_enabled: viser.GuiCheckboxHandle | None = None
     self._gui_sliders: list[viser.GuiSliderHandle] = []
     self._gui_get_env_idx: Callable[[], int] | None = None
+    self._gui_extend_dist: Any | None = None
+    self._gui_shoulder_dist: Any | None = None
+    self._gui_waist_pitch_rad: Any | None = None
+    self._gui_waist_pitch_deg: Any | None = None
+    self._waist_pitch_joint_id: int | None = None
+    try:
+      ids, _ = self.robot.find_joints("waist_pitch_joint", preserve_order=True)
+      if len(ids):
+        self._waist_pitch_joint_id = int(ids[0])
+    except Exception:  # noqa: BLE001
+      pass
 
   @property
   def command(self) -> torch.Tensor:
@@ -393,6 +405,46 @@ class GraspTargetCommand(CommandTerm):
     z = float(self._gui_sliders[2].value)
     self._apply_manual_target(idx, x, y, z)
 
+  def _shoulder_target_dist(self, idx: int) -> float:
+    """Live ‖shoulder_w − target_w‖ for the viewed env (Homie ``dist``)."""
+    arm = float(self.target_arm[idx, 0].item())
+    body_id = None
+    if arm == 1.0:
+      body_id = self._left_shoulder_id
+    elif arm == 2.0:
+      body_id = self._right_shoulder_id
+    if body_id is None:
+      sh = self.robot.data.root_link_pos_w[idx]
+    else:
+      sh = self.robot.data.body_link_pos_w[idx, body_id]
+    tgt = self.target_pos_w[idx]
+    return float(torch.linalg.norm(sh - tgt).item())
+
+  def _sync_gui_readouts(self) -> None:
+    """Push live extend_dist / shoulder dist / waist_pitch (rad+deg) to Viser."""
+    if self._gui_get_env_idx is None:
+      return
+    if (
+      self._gui_extend_dist is None
+      and self._gui_shoulder_dist is None
+      and self._gui_waist_pitch_rad is None
+      and self._gui_waist_pitch_deg is None
+    ):
+      return
+    idx = int(self._gui_get_env_idx())
+    d = self._shoulder_target_dist(idx)
+    if self._gui_shoulder_dist is not None:
+      self._gui_shoulder_dist.value = d
+    if self._gui_extend_dist is not None:
+      # Same as Homie: clamp(dist - 0.49, min=0). Not ‖pelvis→target‖.
+      self._gui_extend_dist.value = float(self.extend_dist[idx, 0].item())
+    if self._waist_pitch_joint_id is not None:
+      q = float(self.robot.data.joint_pos[idx, self._waist_pitch_joint_id].item())
+      if self._gui_waist_pitch_rad is not None:
+        self._gui_waist_pitch_rad.value = q
+      if self._gui_waist_pitch_deg is not None:
+        self._gui_waist_pitch_deg.value = q * (180.0 / np.pi)
+
   def create_gui(
     self,
     name: str,
@@ -444,6 +496,34 @@ class GraspTargetCommand(CommandTerm):
         initial_value=z0,
         hint="z<0 → squat h_ref; far/low → need_waist for bend reward.",
       )
+      shoulder_readout = server.gui.add_number(
+        "shoulder→target (m)",
+        initial_value=0.0,
+        step=0.001,
+        disabled=True,
+        hint="Live ‖shoulder_pitch_link − target_w‖. target_x=0.65 is from pelvis, not shoulder.",
+      )
+      extend_readout = server.gui.add_number(
+        "extend_dist (m)",
+        initial_value=0.0,
+        step=0.001,
+        disabled=True,
+        hint="Homie: max(0, shoulder→target − 0.49).",
+      )
+      pitch_rad = server.gui.add_number(
+        "waist_pitch (rad)",
+        initial_value=0.0,
+        step=0.001,
+        disabled=True,
+        hint="Live waist_pitch_joint in radians.",
+      )
+      pitch_deg = server.gui.add_number(
+        "waist_pitch (deg)",
+        initial_value=0.0,
+        step=0.1,
+        disabled=True,
+        hint="Live waist_pitch_joint in degrees.",
+      )
       reset_btn = server.gui.add_button("Reset target", icon=Icon.REFRESH)
 
       @reset_btn.on_click
@@ -454,6 +534,10 @@ class GraspTargetCommand(CommandTerm):
 
     self._gui_enabled = enabled
     self._gui_sliders = [sx, sy, sz]
+    self._gui_shoulder_dist = shoulder_readout
+    self._gui_extend_dist = extend_readout
+    self._gui_waist_pitch_rad = pitch_rad
+    self._gui_waist_pitch_deg = pitch_deg
     self._gui_get_env_idx = get_env_idx
 
   def compute(
@@ -467,6 +551,7 @@ class GraspTargetCommand(CommandTerm):
       self._apply_gui_target()
     else:
       self._release_gui_env()
+    self._sync_gui_readouts()
 
   def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
     """Draw grasp target sphere (world) when waist is active."""

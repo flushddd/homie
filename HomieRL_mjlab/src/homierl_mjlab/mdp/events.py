@@ -127,6 +127,7 @@ def update_upper_body_pose_curriculum(
     ),
   ),
   upper_interval: int = 50,
+  respect_play_arm_gate: bool = False,
 ) -> None:
   """Homie ``random_upper_actions`` (legged_robot1jieduan when ``not arm_on``).
 
@@ -134,6 +135,10 @@ def update_upper_body_pose_curriculum(
   limit with exponential bias controlled by ``ratio``; each step interpolates
   ``current → target``. Ratio is bumped separately via tracking
   (``bump_upper_body_curriculum_from_tracking``), matching Homie.
+
+  When ``respect_play_arm_gate`` is True (play), motion runs only if
+  ``env._homie_play_arm_random`` is set by the Viser checkbox; otherwise arms
+  are held at default.
   """
   del env_ids
   state = _get_state(env)
@@ -144,6 +149,17 @@ def update_upper_body_pose_curriculum(
   assert state.joint_pos_limits is not None
 
   asset: Entity = env.scene[asset_cfg.name]
+
+  if respect_play_arm_gate and not bool(
+    getattr(env, "_homie_play_arm_random", False)
+  ):
+    default = asset.data.default_joint_pos[:, state.joint_ids]
+    state.current[:] = default
+    state.target[:] = default
+    state.delta.zero_()
+    asset.set_joint_position_target(state.current, joint_ids=state.joint_ids)
+    return
+
   step = int(env.common_step_counter)
 
   # Homie: resample when ``common_step_counter % upper_interval == 0``.
