@@ -30,6 +30,38 @@ def height_command(
   return h
 
 
+def is_target_height_command(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+) -> torch.Tensor:
+  """Homie ``is_target_height`` flag ``(N, 1)`` (phase-1 twist; phase-2 grasp)."""
+  grasp = None
+  try:
+    grasp = env.command_manager.get_term("grasp")
+  except Exception:  # noqa: BLE001
+    pass
+  if grasp is not None and hasattr(grasp, "is_target_height"):
+    return grasp.is_target_height
+  term = env.command_manager.get_term(command_name)
+  return term.is_target_height
+
+
+def target_z_command(
+  env: ManagerBasedRlEnv,
+  command_name: str = "twist",
+) -> torch.Tensor:
+  """Homie body-frame ``target_position[:, 2]`` as ``(N, 1)``."""
+  grasp = None
+  try:
+    grasp = env.command_manager.get_term("grasp")
+  except Exception:  # noqa: BLE001
+    pass
+  if grasp is not None and hasattr(grasp, "target_position"):
+    return grasp.target_position[:, 2:3]
+  term = env.command_manager.get_term(command_name)
+  return term.target_z.unsqueeze(-1)
+
+
 def twist_command_xy_yaw(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",

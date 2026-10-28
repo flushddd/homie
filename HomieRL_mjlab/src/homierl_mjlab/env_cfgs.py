@@ -120,10 +120,12 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 def _configure_phase_commands_and_obs(
   cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
 ) -> None:
-  """Phase-2 grasp trail; both phases append 10-D container geometry at the end."""
+  """Phase-1 target-height obs; phase-2 grasp trail; container last."""
   if int(phase) <= 1:
     cfg.commands.pop("grasp", None)
     actor_terms.pop("grasp_target", None)
+    # Phase-1: no extra obs dims (keeps old ckpts loadable). Homie
+    # is_target_height / target_z are folded into twist height_command.
   else:
     cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
       entity_name="robot",

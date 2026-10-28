@@ -107,6 +107,7 @@ class GraspTargetCommand(CommandTerm):
     self._gui_get_env_idx: Callable[[], int] | None = None
     self._gui_extend_dist: Any | None = None
     self._gui_shoulder_dist: Any | None = None
+    self._gui_need_waist: Any | None = None
     self._gui_waist_pitch_rad: Any | None = None
     self._gui_waist_pitch_deg: Any | None = None
     self._waist_pitch_joint_id: int | None = None
@@ -177,7 +178,7 @@ class GraspTargetCommand(CommandTerm):
     return self.is_waist[env_ids]
 
   def _resample_command(self, env_ids: torch.Tensor) -> None:
-    """Homie ``_resample_target_commands`` gated by ``is_waist`` (not arm)."""
+    """Homie ``_resample_target_commands``: XY (+ arm/need_waist); z from twist."""
     self._refresh_curriculum(reshuffle_waist=True, env_ids=env_ids)
     if len(env_ids) == 0:
       return
@@ -186,22 +187,17 @@ class GraspTargetCommand(CommandTerm):
 
     rx = torch.empty(n, 1, device=self.device).uniform_(*self.cfg.pos_x)
     ry = torch.empty(n, 1, device=self.device).uniform_(*self.cfg.pos_y)
-    # Waist envs: sample full xyz (incl. low z) so need_waist / bend can fire.
-    # Homie xy-only + z from height band left most waist targets reachable →
-    # extend_dist≈0 and deviation_waist only kept upright (zero_loss).
-    rz = torch.empty(n, 1, device=self.device).uniform_(*self.cfg.pos_z)
     self.target_position[env_ids, 0:1] = rx * gate
     self.target_position[env_ids, 1:2] = ry * gate
-    self.target_position[env_ids, 2:3] = rz * gate + 0.3
-    self._finalize_waist_targets(env_ids, gate)
-
+    # Re-apply Homie z after waist reshuffle (twist may have used stale is_waist).
+    # is_target_height already implies is_height in Homie bands.
+    self.resample_target_z(env_ids)
     self.init_robot_poses[env_ids] = self.robot.data.root_link_pos_w[env_ids, :3]
-    self._refresh_world_target(env_ids)
 
   def _finalize_waist_targets(
     self, env_ids: torch.Tensor, gate: torch.Tensor
   ) -> None:
-    """Arm side, need_waist, and is_target_height from body-frame target."""
+    """Arm side + ``need_waist`` (does not own ``is_target_height``)."""
     n = len(env_ids)
     is_left = self.target_position[env_ids, 1] > 0.0
     self.target_arm[env_ids] = torch.where(
@@ -212,13 +208,17 @@ class GraspTargetCommand(CommandTerm):
     left_ref = torch.tensor(_LEFT_REF, device=self.device)
     right_ref = torch.tensor(_RIGHT_REF, device=self.device)
     ref = torch.where(is_left.unsqueeze(-1), left_ref, right_ref)
-    dist = torch.linalg.norm(self.target_position[env_ids] - ref, dim=-1)
-    self.need_waist[env_ids] = ((dist - _ARM_REACH) > 0.0).float().unsqueeze(-1) * gate
-    # Low / non-neutral z → squat h_ref path in height rewards.
-    tz = self.target_position[env_ids, 2:3]
-    self.is_target_height[env_ids] = (
-      (torch.abs(tz - 0.3) > 1e-3).float() * gate
+    # Homie default: 3D to standing shoulder. Low target_z alone then forces
+    # need_waist → bend reward while height rewards ask for squat.
+    # When ``is_target_height`` (height squat path): XY-only so squat is not
+    # mislabeled as bend; otherwise keep Homie 3D for far horizontal reach.
+    dist_3d = torch.linalg.norm(self.target_position[env_ids, 0:3] - ref, dim=-1)
+    dist_xy = torch.linalg.norm(
+      self.target_position[env_ids, 0:2] - ref[:, 0:2], dim=-1
     )
+    ith = self.is_target_height[env_ids].squeeze(-1) > 0.5
+    dist = torch.where(ith, dist_xy, dist_3d)
+    self.need_waist[env_ids] = ((dist - _ARM_REACH) > 0.0).float().unsqueeze(-1) * gate
 
   def resample_target_z(
     self,
@@ -226,25 +226,29 @@ class GraspTargetCommand(CommandTerm):
     is_height: torch.Tensor | None = None,
     is_target_height: torch.Tensor | None = None,
   ) -> None:
-    """Refresh target_z.
+    """Homie ``target_z = U(pos_z)*is_height*is_target_height*is_waist + 0.3``.
 
-    Waist envs: always full ``pos_z`` range (bend curriculum).
-    Non-waist: Homie ``U(pos_z)*is_height*is_target_height+0.3`` when flags given.
+    Two squat paths (Homie ``_resample_commands``):
+    - height-cmd: ``is_height & is_waist & ~is_target_height`` → z stays 0.3,
+      height offset on twist.
+    - target-height: ``is_height & is_target_height & is_waist`` → sample z;
+      ``h_ref`` from ``target_z`` in height rewards.
     """
-    del is_target_height  # waist path owns height flag via _finalize_waist_targets
     if len(env_ids) == 0:
       return
     n = len(env_ids)
     gate = self._waist_gate(env_ids)
     rz = torch.empty(n, 1, device=self.device).uniform_(*self.cfg.pos_z)
-    z_waist = rz + 0.3
-    if is_height is not None:
+    if is_height is not None and is_target_height is not None:
       h = is_height.float().view(n, 1)
-      # Non-waist keep Homie neutral z=0.3 unless height band (unused for bend).
-      z_other = 0.3 * torch.ones(n, 1, device=self.device)
-      self.target_position[env_ids, 2:3] = torch.where(gate > 0.5, z_waist, z_other)
+      ith = is_target_height.float().view(n, 1)
+      self.target_position[env_ids, 2:3] = rz * h * ith * gate + 0.3
+    elif is_target_height is not None:
+      ith = is_target_height.float().view(n, 1)
+      self.target_position[env_ids, 2:3] = rz * ith * gate + 0.3
     else:
-      self.target_position[env_ids, 2:3] = z_waist * gate + 0.3 * (1.0 - gate)
+      ith = self.is_target_height[env_ids]
+      self.target_position[env_ids, 2:3] = rz * ith * gate + 0.3
     self._finalize_waist_targets(env_ids, gate)
     self._refresh_world_target(env_ids)
 
@@ -368,24 +372,24 @@ class GraspTargetCommand(CommandTerm):
     self.waist_on = True
     self.is_waist[idx] = 1.0
     self.is_target[idx] = 0.0
-    # Low / non-neutral z → Homie ``is_target_height`` path (squat h_ref).
+    # Play: no twist band — treat non-neutral z as Homie ``is_target_height``.
     self.is_target_height[idx] = 1.0 if abs(z - 0.3) > 1e-3 else 0.0
     self.target_position[idx, 0] = x
     self.target_position[idx, 1] = y
     self.target_position[idx, 2] = z
     self.target_arm[idx] = 1.0 if y > 0.0 else 2.0
     ref = _LEFT_REF if y > 0.0 else _RIGHT_REF
-    dist = float(
-      np.linalg.norm(
-        np.array([x, y, z], dtype=np.float64) - np.array(ref, dtype=np.float64)
-      )
-    )
+    # Match train: target-height (non-neutral z) → XY need_waist; else 3D.
+    if abs(z - 0.3) > 1e-3:
+      dist = float(np.hypot(x - ref[0], y - ref[1]))
+    else:
+      dist = float(np.linalg.norm([x - ref[0], y - ref[1], z - ref[2]]))
     self.need_waist[idx] = 1.0 if (dist - _ARM_REACH) > 0.0 else 0.0
     env_ids = torch.tensor([idx], device=self.device, dtype=torch.long)
     self._refresh_world_target(env_ids)
     self._update_extend_dist()
     self._apply_twist_override()
-    # Mirror Homie squat when target is low.
+    # Mirror Homie squat when target is low (h_ref from target_z).
     if z < 0.0:
       try:
         twist = self._env.command_manager.get_term("twist")
@@ -457,8 +461,8 @@ class GraspTargetCommand(CommandTerm):
     del on_change, request_action
     from viser import Icon
 
-    # Body-frame ranges (match obs). Train stores z as U(pos_z)+0.3 when
-    # is_target_height; play exposes the full stored range so need_waist can fire.
+    # Body-frame ranges (match obs). Train: z = U(pos_z)+0.3 only when
+    # is_height & is_target_height & is_waist; else 0.3 (height-cmd squat).
     x_lo, x_hi = float(self.cfg.pos_x[0]), float(self.cfg.pos_x[1])
     y_lo, y_hi = float(self.cfg.pos_y[0]), float(self.cfg.pos_y[1])
     z_lo = float(self.cfg.pos_z[0]) + 0.3  # e.g. -0.7
@@ -494,7 +498,7 @@ class GraspTargetCommand(CommandTerm):
         max=z_hi,
         step=0.01,
         initial_value=z0,
-        hint="z<0 → squat h_ref; far/low → need_waist for bend reward.",
+        hint="z=0.3: height-cmd squat if Twist height. Else target-height path; low z → h_ref + 3D need_waist.",
       )
       shoulder_readout = server.gui.add_number(
         "shoulder→target (m)",

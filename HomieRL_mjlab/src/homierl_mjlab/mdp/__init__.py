@@ -16,6 +16,8 @@ from .observations import (
   container_geometry_command,
   grasp_target_command,
   height_command,
+  is_target_height_command,
+  target_z_command,
   twist_command_xy_yaw,
 )
 from .rewards import (
@@ -90,6 +92,7 @@ __all__ = [
   "height_command",
   "hold_joints_at_default",
   "init_upper_body_curriculum",
+  "is_target_height_command",
   "joint_power",
   "joint_tracking_error",
   "knee_distance_lateral",
@@ -101,6 +104,7 @@ __all__ = [
   "loco_waist_roll_sway",
   "stand_still",
   "stand_sway",
+  "target_z_command",
   "torque_limits",
   "torques_l2",
   "tracking_ang_vel",

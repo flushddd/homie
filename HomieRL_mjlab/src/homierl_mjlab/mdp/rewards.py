@@ -109,19 +109,26 @@ def _command_height_target(
   """Absolute base-height target (Homie ``tracking_base_height`` / ``lin_vel_z``).
 
   Default: ``base + twist_height_offset``.
-  When grasp ``is_target_height``: ``h_ref`` from body-frame ``target_z``::
+  When ``is_target_height`` (grasp phase-2, or twist phase-1 ``1jieduan``)::
 
       h_ref = clamp(target_z + 0.64, 0.25, 0.74)  if target_z < 0 else 0.74
   """
   cmd = env.command_manager.get_command(command_name)
   h = base_height_target + cmd[:, 3]
   grasp = _grasp_term(env)
-  if grasp is None:
-    return h
-  mask = grasp.is_target_height.squeeze(-1) > 0.5
+  if grasp is not None:
+    mask = grasp.is_target_height.squeeze(-1) > 0.5
+    tz = grasp.target_position[:, 2]
+  else:
+    twist = env.command_manager.get_term(command_name)
+    ith = getattr(twist, "is_target_height", None)
+    tz_buf = getattr(twist, "target_z", None)
+    if ith is None or tz_buf is None:
+      return h
+    mask = ith.squeeze(-1) > 0.5
+    tz = tz_buf
   if not torch.any(mask):
     return h
-  tz = grasp.target_position[:, 2]
   h_ref = torch.where(
     tz < 0.0,
     torch.clamp(tz + 0.64, min=0.25, max=0.74),

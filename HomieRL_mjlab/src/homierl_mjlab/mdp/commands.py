@@ -56,8 +56,13 @@ class TwistHeightCommand(UniformVelocityCommand):
     self.is_standing_env = torch.zeros_like(self.is_heading_env)
     self.is_world_env = torch.zeros_like(self.is_heading_env)
     self.is_forward_env = torch.zeros_like(self.is_heading_env)
-    # Homie-style: height-only envs (vel forced 0, height offset sampled).
+    # Homie-style: height-cmd squat envs (vel forced 0, height offset sampled).
     self.is_height_env = torch.zeros_like(self.is_heading_env)
+    # Homie ``1jieduan`` target-height squat (phase-1; no waist gate on z).
+    self.is_target_height = torch.zeros(self.num_envs, 1, device=self.device)
+    self.target_z = torch.full(
+      (self.num_envs,), 0.3, device=self.device, dtype=torch.float32
+    )
 
     self.commanded_displacement_w = torch.zeros(self.num_envs, 2, device=self.device)
     self.episode_start_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
@@ -65,6 +70,7 @@ class TwistHeightCommand(UniformVelocityCommand):
     self.metrics["error_vel_xy"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_vel_yaw"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_height"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["is_target_height"] = torch.zeros(self.num_envs, device=self.device)
 
     self._joystick_enabled: viser.GuiCheckboxHandle | None = None
     self._joystick_sliders: list[viser.GuiSliderHandle] = []
@@ -137,21 +143,45 @@ class TwistHeightCommand(UniformVelocityCommand):
       )
       self.is_height_env[env_ids] = allow_h
       # Homie refreshes target_z inside _resample_commands:
-      #   z = U(pos_z) * is_height * is_target_height + 0.3
+      #   z = U(pos_z) * is_height * is_target_height * is_waist + 0.3
+      # Height-cmd squat uses twist height_offset with z left at 0.3.
       grasp.resample_target_z(env_ids, is_height=is_height, is_target_height=is_target_height)
       # Homie zeros vel on waist / target, but keeps height sample above.
+      # Phase-2: grasp owns is_target_height / target_z; clear twist copies.
+      self.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
+      self.target_z[env_ids] = grasp.target_position[env_ids, 2]
       return
 
-    # Phase-1 (no grasp): original set_x bands.
-    self.is_height_env[env_ids] = is_height
+    # Phase-1 (Homie ``legged_robot1jieduan``; is_target=is_waist=0):
+    #   height-cmd:  offset = U(height) when is_height & ~is_target_height
+    #   target-z:    tz = U(pos_z)*is_height*is_target_height+0.3 (no is_waist)
+    #                then fold h_ref into height_command so obs dim unchanged
+    #                (old phase-1 ckpts keep working; Homie puts tz in obs instead).
+    self.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
     self.is_standing_env[env_ids] = ~is_vel
     self.vel_command_b[env_ids[~is_vel]] = 0.0
     self.vel_command_w[env_ids[~is_vel]] = 0.0
+    base = float(self.cfg.base_height_target)
     r = torch.empty(n, device=self.device)
     h_off = r.uniform_(*self.cfg.ranges.height)
-    self.height_command[env_ids] = torch.where(
-      is_height, h_off, torch.zeros_like(h_off)
+    allow_h = is_height & (~is_target_height)
+    rz = torch.empty(n, device=self.device).uniform_(*self.cfg.pos_z)
+    tz = rz * is_height.float() * is_target_height.float() + 0.3
+    self.target_z[env_ids] = tz
+    h_ref = torch.where(
+      tz < 0.0,
+      torch.clamp(tz + 0.64, min=0.25, max=0.74),
+      torch.full_like(tz, base),
     )
+    # Fold Homie h_ref into the existing height channel (offset = abs - base).
+    h_from_tz = h_ref - base
+    self.height_command[env_ids] = torch.where(
+      allow_h,
+      h_off,
+      torch.where(is_target_height, h_from_tz, torch.zeros_like(h_off)),
+    )
+    # Both squat paths count as height envs (idle wipe must not clear them).
+    self.is_height_env[env_ids] = is_height
 
   def _update_metrics(self) -> None:
     super()._update_metrics()
@@ -162,6 +192,7 @@ class TwistHeightCommand(UniformVelocityCommand):
     self.metrics["error_height"] += (
       torch.abs(base_z - target_z) / max_command_step
     )
+    self.metrics["is_target_height"][:] = self.is_target_height.squeeze(-1)
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
     super()._update_command(env_ids)
@@ -280,8 +311,11 @@ class TwistHeightCommand(UniformVelocityCommand):
       h_off = abs_h - float(self.cfg.base_height_target)
       self.height_command[idx] = h_off
       # Keep idle-wipe / standing flags consistent with the slider.
+      # Play height slider = Homie height-cmd path (not target_z / h_ref).
       squatting = abs(h_off) > 1e-3
       self.is_height_env[idx] = squatting
+      self.is_target_height[idx] = 0.0
+      self.target_z[idx] = 0.3
       if squatting:
         self.is_standing_env[idx] = True
     # Velocity: Enable ON → follow sliders; Enable OFF → force zero (stand still).
@@ -303,6 +337,8 @@ class TwistHeightCommandCfg(UniformVelocityCommandCfg):
 
   ranges: Ranges  # type: ignore[assignment]
   base_height_target: float = 0.74
+  # Homie ``target_command_ranges.target_pos_z`` (1jieduan / config1).
+  pos_z: tuple[float, float] = (-1.0, 0.2)
 
   def build(self, env: ManagerBasedRlEnv) -> TwistHeightCommand:
     return TwistHeightCommand(self, env)
