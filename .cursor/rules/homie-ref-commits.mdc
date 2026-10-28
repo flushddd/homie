@@ -8,4 +8,7 @@ alwaysApply: true
 - **`2e0a98b50d03d8bd87198d9b2f54498ba9839289`** (`2e0a98b`): "Match Homie arm curriculum: bump ratio from tracking_x_vel, not wall-clock."
   - Phase-1: random arm curriculum (tracking-gated ratio bumps).
   - Phase-2 at this commit: arms **held** (`hold_arms_default`), no random arms.
-  - User pointed this out as a reference baseline; later work may re-enable phase-2 random arms on top of it.
+  - Held-arm phase-2 baseline. After enabling phase-2 random arms, **do not resume**
+    ckpts trained under this held-arm setup — restart phase-2 from a phase-1 ckpt.
+  - Phase-2 random arms align with Homie `legged_robot422 2jieduan` (`not arm_on`
+    path); use `init_ratio=1.0` so phase-2 does not re-warm the arm curriculum.

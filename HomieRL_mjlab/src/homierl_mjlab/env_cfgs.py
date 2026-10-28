@@ -34,10 +34,13 @@ from homierl_mjlab.robot.g1_constants import (
 
 
 def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
-  """Phase-1: waist held; arms random-pose curriculum.
+  """Phase-1: waist held; arms random-pose curriculum (ratio from 0).
 
-  Phase-2: policy roll/pitch; yaw held; arms also random-pose curriculum
-  (same Homie ``random_upper_actions`` schedule as phase-1).
+  Phase-2: policy roll/pitch; yaw held; arms random like Homie
+  ``legged_robot422 2jieduan`` when ``not arm_on`` (waist bend + random arms
+  coexist). Start at ``init_ratio=1.0`` so phase-2 does not re-warm from 0.
+  Baseline ``2e0a98b`` still held arms in phase-2; do not resume held-arm
+  phase-2 ckpts after enabling random arms — restart phase-2 from phase-1.
   """
   cfg.events.pop("init_upper_curriculum", None)
   cfg.events.pop("upper_body_curriculum", None)
@@ -48,11 +51,12 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
   cfg.events.pop("hold_arms_default", None)
 
   arm_cfg = SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES)
-  # Homie-style arm curriculum (both phases): tracking_x_vel bumps ratio.
+  # Phase-1: climb ratio via tracking. Phase-2: full amplitude from the start.
+  init_ratio = 0.0 if int(phase) <= 1 else 1.0
   cfg.events["init_upper_curriculum"] = EventTermCfg(
     func=homie_mdp.init_upper_body_curriculum,
     mode="startup",
-    params={"asset_cfg": arm_cfg, "init_ratio": 0.0},
+    params={"asset_cfg": arm_cfg, "init_ratio": init_ratio},
   )
   cfg.events["upper_body_curriculum"] = EventTermCfg(
     func=homie_mdp.update_upper_body_pose_curriculum,
