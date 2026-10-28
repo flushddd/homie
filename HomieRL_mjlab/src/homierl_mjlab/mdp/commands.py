@@ -153,35 +153,24 @@ class TwistHeightCommand(UniformVelocityCommand):
       return
 
     # Phase-1 (Homie ``legged_robot1jieduan``; is_target=is_waist=0):
-    #   height-cmd:  offset = U(height) when is_height & ~is_target_height
-    #   target-z:    tz = U(pos_z)*is_height*is_target_height+0.3 (no is_waist)
-    #                then fold h_ref into height_command so obs dim unchanged
-    #                (old phase-1 ckpts keep working; Homie puts tz in obs instead).
+    #   height = U(height)*is_height*(1-is_target_height)  (+ base in obs)
+    #   target_z = U(pos_z)*is_height*is_target_height+0.3  (no is_waist)
+    # Obs exposes is_target_height + target_z; rewards use h_ref when ith.
     self.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
     self.is_standing_env[env_ids] = ~is_vel
     self.vel_command_b[env_ids[~is_vel]] = 0.0
     self.vel_command_w[env_ids[~is_vel]] = 0.0
-    base = float(self.cfg.base_height_target)
     r = torch.empty(n, device=self.device)
     h_off = r.uniform_(*self.cfg.ranges.height)
     allow_h = is_height & (~is_target_height)
-    rz = torch.empty(n, device=self.device).uniform_(*self.cfg.pos_z)
-    tz = rz * is_height.float() * is_target_height.float() + 0.3
-    self.target_z[env_ids] = tz
-    h_ref = torch.where(
-      tz < 0.0,
-      torch.clamp(tz + 0.64, min=0.25, max=0.74),
-      torch.full_like(tz, base),
-    )
-    # Fold Homie h_ref into the existing height channel (offset = abs - base).
-    h_from_tz = h_ref - base
     self.height_command[env_ids] = torch.where(
-      allow_h,
-      h_off,
-      torch.where(is_target_height, h_from_tz, torch.zeros_like(h_off)),
+      allow_h, h_off, torch.zeros_like(h_off)
     )
-    # Both squat paths count as height envs (idle wipe must not clear them).
-    self.is_height_env[env_ids] = is_height
+    self.is_height_env[env_ids] = allow_h
+    rz = torch.empty(n, device=self.device).uniform_(*self.cfg.pos_z)
+    self.target_z[env_ids] = (
+      rz * is_height.float() * is_target_height.float() + 0.3
+    )
 
   def _update_metrics(self) -> None:
     super()._update_metrics()

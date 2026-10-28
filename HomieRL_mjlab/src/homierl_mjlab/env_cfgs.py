@@ -124,8 +124,15 @@ def _configure_phase_commands_and_obs(
   if int(phase) <= 1:
     cfg.commands.pop("grasp", None)
     actor_terms.pop("grasp_target", None)
-    # Phase-1: no extra obs dims (keeps old ckpts loadable). Homie
-    # is_target_height / target_z are folded into twist height_command.
+    # Homie ``1jieduan``: after actions → is_target_height, target_z.
+    actor_terms["is_target_height"] = ObservationTermCfg(
+      func=homie_mdp.is_target_height_command,
+      params={"command_name": "twist"},
+    )
+    actor_terms["target_z"] = ObservationTermCfg(
+      func=homie_mdp.target_z_command,
+      params={"command_name": "twist"},
+    )
   else:
     cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
       entity_name="robot",
