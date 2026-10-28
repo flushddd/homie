@@ -12,3 +12,11 @@ alwaysApply: true
     ckpts trained under this held-arm setup — restart phase-2 from a phase-1 ckpt.
   - Phase-2 random arms align with Homie `legged_robot422 2jieduan` (`not arm_on`
     path); use `init_ratio=1.0` so phase-2 does not re-warm the arm curriculum.
+
+- **`3fe8f49cfbd181f0d4399e9db6ab6c81a285c5dc`** (`3fe8f49`): "Expose Homie 1jieduan target-height squat in phase-1 obs."
+  - Phase-1 dual squat like Homie `legged_robot1jieduan`: height-cmd vs
+    `is_target_height` + `target_z` (no `is_waist` gate on z); both in actor obs.
+  - Rewards use `h_ref` from `target_z` when `is_target_height`.
+  - Obs dim changed → **retrain phase-1** from this commit (do not resume older
+    phase-1 ckpts that lack `is_target_height` / `target_z`).
+  - Related prior: `4bf310e` (gated z + XY `need_waist` when target-height).
