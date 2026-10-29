@@ -39,12 +39,12 @@ _DEFAULT_POS_X = (0.05, 0.65)
 _DEFAULT_POS_Y = (-0.35, 0.35)
 _DEFAULT_POS_Z = (-1.0, 0.2)
 # Phase-3 curriculum starts closer / shallower, then expands to the defaults.
-_START_POS_X = (0.15, 0.40)
-_START_POS_Y = (-0.18, 0.18)
-_START_POS_Z = (-0.45, 0.10)
-# Small reach from iter 0 (IK on ~10% envs), then ramp up — not a zero-IK warmup.
-_START_MODE_PROBS = (0.45, 0.45, 0.10)  # loco / waist_only / reach
-_END_MODE_PROBS = (0.2, 0.2, 0.6)
+_START_POS_X = (0.15, 0.30)
+_START_POS_Y = (-0.12, 0.12)
+_START_POS_Z = (-0.25, 0.05)
+# Zero reach at start (loco + light waist); ramp reach after warmup in env_cfgs.
+_START_MODE_PROBS = (0.80, 0.20, 0.0)  # loco / waist_only / reach
+_END_MODE_PROBS = (0.25, 0.25, 0.50)
 
 _ARM_REACH = 0.49
 _LEFT_REF = (0.0, 0.1, 0.29)
@@ -113,25 +113,10 @@ class GraspTargetCommand(CommandTerm):
       warmup=50 * 8000,
       ramp=8000,
     )
-    # Phase-3 only: 0→1 progress for mode mix + target range expansion.
-    # Latch t0 on first use so a resumed step counter does not max the ramp.
-    self.reach_mode_curriculum = CurriculumScheduler(
-      start_step=0,
-      end_step=int(cfg.mode_curriculum_ramp) + int(cfg.mode_curriculum_warmup),
-      min_value=0.0,
-      max_value=1.0,
-      warmup=int(cfg.mode_curriculum_warmup),
-      ramp=int(cfg.mode_curriculum_ramp),
-    )
-    self.target_range_curriculum = CurriculumScheduler(
-      start_step=0,
-      end_step=int(cfg.target_range_ramp) + int(cfg.target_range_warmup),
-      min_value=0.0,
-      max_value=1.0,
-      warmup=int(cfg.target_range_warmup),
-      ramp=int(cfg.target_range_ramp),
-    )
-    self._curriculum_t0: int | None = None
+    # Phase-3: reach share / target-range expand with ``reach_ratio`` (0→1).
+    # Ratio is bumped from tracking_x_vel (same gate as loco arm curriculum),
+    # not wall-clock — see ``bump_reach_mode_curriculum_from_tracking``.
+    self.reach_ratio = float(cfg.init_reach_ratio)
     self.arm_on = False
     self.waist_on = False
 
@@ -188,18 +173,13 @@ class GraspTargetCommand(CommandTerm):
       dim=-1,
     )
 
-  def _phase3_local_step(self) -> int:
-    """Env steps since phase-3 curriculum started (not inherited counter)."""
-    step = int(self._env.common_step_counter)
-    if self._curriculum_t0 is None:
-      self._curriculum_t0 = step
-    return max(0, step - self._curriculum_t0)
-
   def _mode_progress(self) -> float:
-    return float(self.reach_mode_curriculum.value(self._phase3_local_step()))
+    """0→1 reach curriculum from tracking-gated bumps (not wall-clock)."""
+    return float(min(max(self.reach_ratio, 0.0), 1.0))
 
   def _range_progress(self) -> float:
-    return float(self.target_range_curriculum.value(self._phase3_local_step()))
+    """Target ranges expand with the same tracking-gated reach ratio."""
+    return self._mode_progress()
 
   def _normalized_mode_probs(self) -> tuple[float, float, float]:
     """Phase-3 mix: ``(p_loco, p_waist_only, p_reach)``, curriculum + renormalized."""
@@ -211,7 +191,7 @@ class GraspTargetCommand(CommandTerm):
     return a / s, b / s, c / s
 
   def _current_pos_ranges(self) -> tuple[tuple[float, float], ...]:
-    """XY/Z sample ranges: start (near) → end (far) via target-range curriculum."""
+    """XY/Z sample ranges: start (near) → end (far) with reach_ratio."""
     alpha = self._range_progress()
     return (
       _lerp_pair(self.cfg.pos_x_start, self.cfg.pos_x, alpha),
@@ -797,16 +777,22 @@ class GraspTargetCommandCfg(CommandTermCfg):
   enable_arm_reach: bool = False
   # Phase-2 fraction is hard-coded 0.5 in ``_refresh_curriculum`` (not this field).
   is_waist_prob: float = 0.5
-  # Phase-3 ternary mix (loco, waist_only, reach); curriculum start → end.
+  # Phase-3 ternary mix (loco, waist_only, reach); lerp via tracking-gated ratio.
   mode_probs_start: tuple[float, float, float] = _START_MODE_PROBS
   mode_probs: tuple[float, float, float] = _END_MODE_PROBS
+  # Kept for API/back-compat; mode progress is tracking-gated, not wall-clock.
   mode_curriculum_warmup: int = 0
-  mode_curriculum_ramp: int = 50 * 8000  # ~8k iters to full reach share
+  mode_curriculum_ramp: int = 50 * 10000
   pos_x_start: tuple[float, float] = _START_POS_X
   pos_y_start: tuple[float, float] = _START_POS_Y
   pos_z_start: tuple[float, float] = _START_POS_Z
   target_range_warmup: int = 0
-  target_range_ramp: int = 50 * 10000
+  target_range_ramp: int = 50 * 12000
+  # Same gate as loco arm random curriculum (``bump_upper_body…``).
+  init_reach_ratio: float = 0.0
+  reach_reward_name: str = "tracking_x_vel"
+  reach_threshold_frac: float = 0.8
+  reach_ratio_step: float = 0.05
 
   def build(self, env: ManagerBasedRlEnv) -> GraspTargetCommand:
     return GraspTargetCommand(self, env)

@@ -3,6 +3,7 @@
 from .commands import TwistHeightCommand, TwistHeightCommandCfg
 from .curriculum import CurriculumScheduler
 from .events import (
+  bump_reach_mode_curriculum_from_tracking,
   bump_upper_body_curriculum_from_tracking,
   get_curriculum_ratio,
   hold_joints_at_default,
@@ -89,6 +90,7 @@ __all__ = [
   "action_vanish",
   "ang_vel_xy",
   "arm_clearance_field",
+  "bump_reach_mode_curriculum_from_tracking",
   "bump_upper_body_curriculum_from_tracking",
   "clearance_penalty",
   "contact_momentum",

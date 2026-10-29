@@ -73,6 +73,38 @@ def init_upper_body_curriculum(
   setattr(env, _ENV_STATE_KEY, state)
 
 
+def _episode_mean_reward(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  reward_name: str,
+  default_weight: float = 1.5,
+) -> tuple[float, float] | None:
+  """Mean episode reward + term weight for ``env_ids``, or None if unavailable.
+
+  mjlab stores Σ(func * weight * dt); divide by episode_length_s → mean(func)*weight.
+  Must be called from a reset event *before* ``reward_manager.reset``.
+  """
+  if env_ids is None or len(env_ids) == 0:
+    return None
+  max_len = int(env.max_episode_length)
+  if max_len <= 0 or int(env.common_step_counter) % max_len != 0:
+    return None
+  rm = getattr(env, "reward_manager", None)
+  if rm is None or not hasattr(rm, "_episode_sums"):
+    return None
+  sums = rm._episode_sums.get(reward_name)
+  if sums is None:
+    return None
+  weight = float(default_weight)
+  term = rm.cfg.get(reward_name) if isinstance(rm.cfg, dict) else None
+  if term is not None:
+    weight = float(getattr(term, "weight", weight))
+  ep_len_s = float(env.max_episode_length_s)
+  if ep_len_s <= 0.0:
+    return None
+  return torch.mean(sums[env_ids]).item() / ep_len_s, weight
+
+
 def bump_upper_body_curriculum_from_tracking(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,
@@ -87,32 +119,49 @@ def bump_upper_body_curriculum_from_tracking(
   ``ratio_step``. Must run in a reset event *before* ``reward_manager.reset``.
   """
   state = _get_state(env)
-  if state is None or env_ids is None or len(env_ids) == 0:
+  if state is None:
     return
-  max_len = int(env.max_episode_length)
-  if max_len <= 0 or int(env.common_step_counter) % max_len != 0:
+  got = _episode_mean_reward(env, env_ids, reward_name)
+  if got is None:
     return
-  rm = getattr(env, "reward_manager", None)
-  if rm is None or not hasattr(rm, "_episode_sums"):
-    return
-  sums = rm._episode_sums.get(reward_name)
-  if sums is None:
-    return
-  # Resolve weight from reward cfg (Homie compares to ``reward_scales[name]``).
-  weight = 1.5
-  term = rm.cfg.get(reward_name) if isinstance(rm.cfg, dict) else None
-  if term is not None:
-    weight = float(getattr(term, "weight", weight))
-  # mjlab stores Σ(func * weight * dt); / episode_length_s → mean(func)*weight.
-  ep_len_s = float(env.max_episode_length_s)
-  if ep_len_s <= 0.0:
-    return
-  mean_ep = torch.mean(sums[env_ids]).item() / ep_len_s
+  mean_ep, weight = got
   if mean_ep > threshold_frac * weight:
     state.ratio = min(1.0, state.ratio + float(ratio_step))
     # Mirror Homie extras["episode"]["action_curriculum_ratio"].
     log = env.extras.setdefault("log", {})
     log["Curriculum/arm_action_ratio"] = torch.tensor(state.ratio, device=env.device)
+
+
+def bump_reach_mode_curriculum_from_tracking(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  reward_name: str = "tracking_x_vel",
+  threshold_frac: float = 0.8,
+  ratio_step: float = 0.05,
+) -> None:
+  """Phase-3: bump reach-mode alpha when loco tracking clears the threshold.
+
+  Same gate as upper-arm random curriculum (``tracking_x_vel`` ≥
+  ``threshold_frac * weight``). Raises ``grasp.reach_ratio`` 0→1; mode mix
+  lerps ``mode_probs_start`` → ``mode_probs`` with that ratio (reach share
+  opens only after loco is stable).
+  """
+  try:
+    grasp = env.command_manager.get_term("grasp")
+  except Exception:  # noqa: BLE001
+    return
+  if grasp is None or not bool(getattr(grasp.cfg, "enable_arm_reach", False)):
+    return
+  got = _episode_mean_reward(env, env_ids, reward_name)
+  if got is None:
+    return
+  mean_ep, weight = got
+  if mean_ep > threshold_frac * weight:
+    grasp.reach_ratio = min(1.0, float(grasp.reach_ratio) + float(ratio_step))
+    log = env.extras.setdefault("log", {})
+    log["Curriculum/reach_mode_ratio"] = torch.tensor(
+      grasp.reach_ratio, device=env.device
+    )
 
 
 def update_upper_body_pose_curriculum(

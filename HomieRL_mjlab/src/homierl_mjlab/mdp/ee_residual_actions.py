@@ -257,10 +257,11 @@ class EeResidualIkActionCfg(ActionTermCfg):
   """Config for 3-D EE residual (base frame) + multi-iter DLS IK."""
 
   entity_name: str = "robot"
-  ee_delta_scale: tuple[float, float, float] = (0.05, 0.05, 0.08)
-  ee_delta_clip: tuple[float, float, float] = (0.06, 0.06, 0.10)
-  ik_damping: float = 0.05
-  max_joint_delta: float = 0.12
+  # Conservative defaults (phase-3 env_cfgs may tighten further).
+  ee_delta_scale: tuple[float, float, float] = (0.03, 0.03, 0.05)
+  ee_delta_clip: tuple[float, float, float] = (0.04, 0.04, 0.06)
+  ik_damping: float = 0.08
+  max_joint_delta: float = 0.08
   ik_iterations: int = 4
   fd_eps: float = 1e-3
 

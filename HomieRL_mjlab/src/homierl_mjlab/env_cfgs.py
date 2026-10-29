@@ -56,11 +56,21 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
 
   if int(phase) >= 3:
     # Phase-3: yaw held; arms driven by EE residual IK (no random curriculum).
+    # Open reach share only when tracking_x_vel clears the loco threshold.
     cfg.events["hold_waist_yaw_default"] = EventTermCfg(
       func=homie_mdp.hold_joints_at_default,
       mode="step",
       params={
         "asset_cfg": SceneEntityCfg("robot", joint_names=WAIST_YAW_JOINT_NAMES),
+      },
+    )
+    cfg.events["bump_reach_curriculum"] = EventTermCfg(
+      func=homie_mdp.bump_reach_mode_curriculum_from_tracking,
+      mode="reset",
+      params={
+        "reward_name": "tracking_x_vel",
+        "threshold_frac": 0.8,
+        "ratio_step": 0.05,
       },
     )
     return
@@ -131,12 +141,13 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
+    # Smaller residuals / joint steps so early IK does not yank COM over.
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
-      ee_delta_scale=(0.05, 0.05, 0.08),
-      ee_delta_clip=(0.06, 0.06, 0.10),
-      ik_damping=0.05,
-      max_joint_delta=0.12,
+      ee_delta_scale=(0.03, 0.03, 0.05),
+      ee_delta_clip=(0.04, 0.04, 0.06),
+      ik_damping=0.08,
+      max_joint_delta=0.08,
       ik_iterations=4,
     )
 
@@ -147,6 +158,8 @@ def _configure_phase_commands_and_obs(
   """Phase-1 target-height obs; phase-2 grasp trail; phase-3 SDF reach."""
   phase = int(phase)
   if phase >= 3:
+    # Soft start: loco + light waist; reach opens when tracking_x_vel ≥ 0.8*weight
+    # (same gate as phase-1/2 arm-random curriculum), +0.05 ratio per bump.
     cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
@@ -154,8 +167,15 @@ def _configure_phase_commands_and_obs(
       base_height_target=0.74,
       enable_arm_reach=True,
       is_waist_prob=0.5,
-      mode_probs_start=(0.45, 0.45, 0.10),
-      mode_probs=(0.2, 0.2, 0.6),
+      mode_probs_start=(0.80, 0.20, 0.0),
+      mode_probs=(0.25, 0.25, 0.50),
+      pos_x_start=(0.15, 0.30),
+      pos_y_start=(-0.12, 0.12),
+      pos_z_start=(-0.25, 0.05),
+      init_reach_ratio=0.0,
+      reach_reward_name="tracking_x_vel",
+      reach_threshold_frac=0.8,
+      reach_ratio_step=0.05,
     )
     actor_terms["actions"] = ObservationTermCfg(
       func=homie_mdp.padded_last_action,
@@ -170,7 +190,8 @@ def _configure_phase_commands_and_obs(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
       sample_around_grasp=True,
-      presence_prob=0.75,
+      # Fewer walls early so clearance does not fight balance before reach is on.
+      presence_prob=0.40,
       debug_vis=False,
     )
     actor_terms.pop("container_geom", None)
