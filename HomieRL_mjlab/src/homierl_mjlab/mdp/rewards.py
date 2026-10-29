@@ -338,6 +338,89 @@ def _grasp_term(env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"):
     return None
 
 
+def _reach_active_mask(
+  env: ManagerBasedRlEnv, grasp_command_name: str = "grasp"
+) -> torch.Tensor:
+  """Only arm-reach envs (``is_target=1``), not waist-only bend."""
+  grasp = env.command_manager.get_term(grasp_command_name)
+  return (
+    (grasp.is_target.squeeze(-1) > 0.5) & (grasp.target_arm.squeeze(-1) > 0.5)
+  ).float()
+
+
+def reach_ee_position(
+  env: ManagerBasedRlEnv,
+  grasp_command_name: str = "grasp",
+  sigma: float = 0.08,
+) -> torch.Tensor:
+  """Exp reward on EE→target distance for arm-reach envs (phase-3)."""
+  from homierl_mjlab.mdp.sdf_observations import ee_target_error
+
+  err = ee_target_error(env, grasp_command_name=grasp_command_name)
+  dist2 = torch.sum(err * err, dim=-1)
+  return torch.exp(-dist2 / (sigma**2)) * _reach_active_mask(env, grasp_command_name)
+
+
+def reach_ee_progress(
+  env: ManagerBasedRlEnv,
+  grasp_command_name: str = "grasp",
+) -> torch.Tensor:
+  """Reward decrease in EE→target distance vs previous step (phase-3)."""
+  from homierl_mjlab.mdp.sdf_observations import ee_target_error
+
+  err = ee_target_error(env, grasp_command_name=grasp_command_name)
+  dist = torch.linalg.norm(err, dim=-1)
+  key = "_homie_prev_ee_dist"
+  prev = getattr(env, key, None)
+  if prev is None or prev.shape != dist.shape:
+    prev = dist.detach().clone()
+  progress = (prev - dist).clamp(min=-0.05, max=0.05)
+  setattr(env, key, dist.detach().clone())
+  return progress * _reach_active_mask(env, grasp_command_name)
+
+
+def reach_success(
+  env: ManagerBasedRlEnv,
+  grasp_command_name: str = "grasp",
+  threshold: float = 0.03,
+) -> torch.Tensor:
+  """Binary bonus when EE is within ``threshold`` of target (phase-3)."""
+  from homierl_mjlab.mdp.sdf_observations import ee_target_error
+
+  err = ee_target_error(env, grasp_command_name=grasp_command_name)
+  dist = torch.linalg.norm(err, dim=-1)
+  ok = (dist < float(threshold)).float()
+  return ok * _reach_active_mask(env, grasp_command_name)
+
+
+def clearance_penalty(
+  env: ManagerBasedRlEnv,
+  command_name: str = "container",
+  d_safe: float = 0.03,
+  d_max: float = 0.40,
+) -> torch.Tensor:
+  """Penalty when arm proxy spheres violate safe distance to container walls."""
+  from homierl_mjlab.mdp.sdf_observations import arm_clearance_field
+
+  c = arm_clearance_field(env, command_name=command_name, d_max=d_max)
+  c_m = c * float(d_max)
+  viol = torch.clamp(float(d_safe) - c_m, min=0.0)
+  cont = env.command_manager.get_term(command_name)
+  present = cont.present
+  active = _reach_active_mask(env)
+  return -torch.mean(viol * viol, dim=-1) * present * active
+
+
+def ee_residual_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
+  """Penalize large EE residual commands (after scale/clip)."""
+  try:
+    term = env.action_manager.get_term("ee_residual")
+  except KeyError:
+    return torch.zeros(env.num_envs, device=env.device)
+  delta = term.ee_delta
+  return -torch.sum(delta * delta, dim=-1) * _reach_active_mask(env)
+
+
 def deviation_waist_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",

@@ -20,6 +20,10 @@ from mjlab.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from homierl_mjlab import mdp as homie_mdp
+from homierl_mjlab.robot.container_spec import (
+  CONTAINER_ENTITY_NAME,
+  get_container_walls_cfg,
+)
 from homierl_mjlab.robot.g1_constants import (
   ARM_JOINT_NAMES,
   FOOT_COLLISION_GEOM_NAMES,
@@ -49,6 +53,17 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
   cfg.events.pop("hold_waist_default", None)
   cfg.events.pop("hold_waist_yaw_default", None)
   cfg.events.pop("hold_arms_default", None)
+
+  if int(phase) >= 3:
+    # Phase-3: yaw held; arms driven by EE residual IK (no random curriculum).
+    cfg.events["hold_waist_yaw_default"] = EventTermCfg(
+      func=homie_mdp.hold_joints_at_default,
+      mode="step",
+      params={
+        "asset_cfg": SceneEntityCfg("robot", joint_names=WAIST_YAW_JOINT_NAMES),
+      },
+    )
+    return
 
   arm_cfg = SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES)
   # Phase-1: climb ratio via tracking. Phase-2: full amplitude from the start.
@@ -115,13 +130,70 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
       use_default_offset=True,
     ),
   }
+  if int(phase) >= 3:
+    cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
+      entity_name="robot",
+      ee_delta_scale=(0.05, 0.05, 0.08),
+      ee_delta_clip=(0.06, 0.06, 0.10),
+      ik_damping=0.05,
+      max_joint_delta=0.12,
+      ik_iterations=4,
+    )
 
 
 def _configure_phase_commands_and_obs(
   cfg: ManagerBasedRlEnvCfg, phase: int, actor_terms: dict
 ) -> None:
-  """Phase-1 target-height obs; phase-2 grasp trail; container last."""
-  if int(phase) <= 1:
+  """Phase-1 target-height obs; phase-2 grasp trail; phase-3 SDF reach."""
+  phase = int(phase)
+  if phase >= 3:
+    cfg.commands["grasp"] = homie_mdp.GraspTargetCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 4.0),
+      debug_vis=True,
+      base_height_target=0.74,
+      enable_arm_reach=True,
+      is_waist_prob=0.5,
+      mode_probs_start=(0.45, 0.45, 0.10),
+      mode_probs=(0.2, 0.2, 0.6),
+    )
+    actor_terms["actions"] = ObservationTermCfg(
+      func=homie_mdp.padded_last_action,
+      params={"target_dim": homie_mdp.HOMIE_ACTION_OBS_DIM},
+    )
+    actor_terms["grasp_target"] = ObservationTermCfg(
+      func=homie_mdp.grasp_target_command,
+      params={"command_name": "grasp"},
+    )
+    # Container params drive analytic SDF only — not a raw 10-D geom obs.
+    cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
+      entity_name="robot",
+      resampling_time_range=(4.0, 4.0),
+      sample_around_grasp=True,
+      presence_prob=0.75,
+      debug_vis=False,
+    )
+    actor_terms.pop("container_geom", None)
+    actor_terms["sdf_field"] = ObservationTermCfg(
+      func=homie_mdp.sdf_query_field,
+      params={
+        "command_name": "container",
+        "query_count": 64,
+        "d_max": 0.40,
+        "include_valid": True,
+      },
+    )
+    actor_terms["arm_clearance"] = ObservationTermCfg(
+      func=homie_mdp.arm_clearance_field,
+      params={"command_name": "container", "d_max": 0.40},
+    )
+    actor_terms["ee_target_error"] = ObservationTermCfg(
+      func=homie_mdp.ee_target_error,
+      params={"grasp_command_name": "grasp"},
+    )
+    return
+
+  if phase <= 1:
     cfg.commands.pop("grasp", None)
     actor_terms.pop("grasp_target", None)
     # Homie ``1jieduan``: after actions → is_target_height, target_z.
@@ -165,7 +237,7 @@ def homie_g1_flat_env_cfg(
   """Paper HOMIE G1 flat: phase-1 loco/squat; phase-2 waist + grasp targets."""
   cfg = make_velocity_env_cfg()
 
-  cfg.sim.njmax = 300
+  cfg.sim.njmax = 512 if int(phase) >= 3 else 300
   cfg.sim.mujoco.ccd_iterations = 50
   cfg.sim.contact_sensor_maxmatch = 64
   cfg.sim.nconmax = None
@@ -176,6 +248,9 @@ def homie_g1_flat_env_cfg(
   cfg.scene.terrain.terrain_generator = None
 
   cfg.scene.entities = {"robot": get_g1_robot_cfg()}
+  if int(phase) >= 3:
+    # Mocap open-box walls; pose/size synced from the container command.
+    cfg.scene.entities[CONTAINER_ENTITY_NAME] = get_container_walls_cfg()
 
   # Drop height-scan sensors (flat).
   cfg.scene.sensors = tuple(
@@ -564,6 +639,32 @@ def homie_g1_flat_env_cfg(
     ),
   }
 
+  if int(phase) >= 3:
+    cfg.rewards["reach_ee_position"] = RewardTermCfg(
+      func=homie_mdp.reach_ee_position,
+      weight=2.0,
+      params={"grasp_command_name": "grasp", "sigma": 0.08},
+    )
+    cfg.rewards["reach_ee_progress"] = RewardTermCfg(
+      func=homie_mdp.reach_ee_progress,
+      weight=1.0,
+      params={"grasp_command_name": "grasp"},
+    )
+    cfg.rewards["reach_success"] = RewardTermCfg(
+      func=homie_mdp.reach_success,
+      weight=0.5,
+      params={"grasp_command_name": "grasp", "threshold": 0.03},
+    )
+    cfg.rewards["clearance_penalty"] = RewardTermCfg(
+      func=homie_mdp.clearance_penalty,
+      weight=2.0,
+      params={"command_name": "container", "d_safe": 0.03, "d_max": 0.40},
+    )
+    cfg.rewards["ee_residual_l2"] = RewardTermCfg(
+      func=homie_mdp.ee_residual_l2,
+      weight=0.05,
+    )
+
   # ---- Terminations ----
   cfg.terminations = {
     "time_out": TerminationTermCfg(func=vel_mdp.time_out, time_out=True),
@@ -602,33 +703,35 @@ def homie_g1_flat_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.curriculum = {}
-    # Play: arm curriculum gated by Viser "Enable random arms" (default OFF).
-    cfg.events.pop("hold_arms_default", None)
-    arm_cfg = SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES)
-    cfg.events["init_upper_curriculum"] = EventTermCfg(
-      func=homie_mdp.init_upper_body_curriculum,
-      mode="startup",
-      params={"asset_cfg": arm_cfg, "init_ratio": 1.0},
-    )
-    cfg.events["upper_body_curriculum"] = EventTermCfg(
-      func=homie_mdp.update_upper_body_pose_curriculum,
-      mode="step",
-      params={
-        "asset_cfg": arm_cfg,
-        "upper_interval": 50,
-        "respect_play_arm_gate": True,
-      },
-    )
-    cfg.events["reset_upper_curriculum"] = EventTermCfg(
-      func=homie_mdp.reset_upper_body_curriculum,
-      mode="reset",
-      params={
-        "asset_cfg": arm_cfg,
-        "reward_name": "tracking_x_vel",
-        "threshold_frac": 0.8,
-        "ratio_step": 0.0,
-      },
-    )
+    # Play phase-1/2: arm curriculum gated by Viser "Enable random arms".
+    # Phase-3 play: arms driven by EE IK (no random curriculum).
+    if int(phase) < 3:
+      cfg.events.pop("hold_arms_default", None)
+      arm_cfg = SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES)
+      cfg.events["init_upper_curriculum"] = EventTermCfg(
+        func=homie_mdp.init_upper_body_curriculum,
+        mode="startup",
+        params={"asset_cfg": arm_cfg, "init_ratio": 1.0},
+      )
+      cfg.events["upper_body_curriculum"] = EventTermCfg(
+        func=homie_mdp.update_upper_body_pose_curriculum,
+        mode="step",
+        params={
+          "asset_cfg": arm_cfg,
+          "upper_interval": 50,
+          "respect_play_arm_gate": True,
+        },
+      )
+      cfg.events["reset_upper_curriculum"] = EventTermCfg(
+        func=homie_mdp.reset_upper_body_curriculum,
+        mode="reset",
+        params={
+          "asset_cfg": arm_cfg,
+          "reward_name": "tracking_x_vel",
+          "threshold_frac": 0.8,
+          "ratio_step": 0.0,
+        },
+      )
     # Stop random resample / standing-zero fighting the Viser slider.
     # Keep ranges.height=(-0.5, 0) so the absolute-height slider stays movable.
     twist = cfg.commands["twist"]
@@ -638,5 +741,15 @@ def homie_g1_flat_env_cfg(
     grasp = cfg.commands.get("grasp")
     if grasp is not None:
       grasp.resampling_time_range = (1e9, 1e9)
+    cont = cfg.commands.get("container")
+    if cont is not None and int(phase) >= 3:
+      cont.presence_prob = 1.0
+      cont.resampling_time_range = (1e9, 1e9)
+    # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
+    cfg.events["log_waist_pitch"] = EventTermCfg(
+      func=homie_mdp.log_waist_pitch,
+      mode="step",
+      params={"env_index": 0, "every_steps": 25},
+    )
 
   return cfg

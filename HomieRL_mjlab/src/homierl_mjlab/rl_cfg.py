@@ -40,9 +40,25 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
 
   ``phase=2`` enables teacher mean+KL loco lock after resume from phase-1 ckpt
   (Homie ``task_registry`` deepcopy + ``set_teacher``).
+  ``phase=3`` locks the first 14 loco dims (legs + roll/pitch) on every env.
   """
   phase = int(phase)
   use_teacher = phase >= 2
+  if phase >= 3:
+    keep_dims = 14
+    run_name = "phase3"
+    keep_always = True
+    keep_loco_weight = 5.0
+    is_waist_idx = 86  # proprio68 + padded a17 + grasp is_waist
+    teacher_one_step = 229
+  else:
+    keep_dims = 12
+    run_name = "" if phase <= 1 else "phase2"
+    keep_always = False
+    keep_loco_weight = 2.0
+    # Phase-2 grasp is_waist: proprio68 + a14 + 1.
+    is_waist_idx = 83
+    teacher_one_step = 0
   return HomieRlOnPolicyRunnerCfg(
     actor=RslRlModelCfg(
       # Pre-alignment mjlab size (Homie paper cfg uses 512/256/256).
@@ -68,9 +84,9 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
       use_clipped_value_loss=True,
       clip_param=0.2,
     ),
-    # Same experiment dir so phase-2 ``--agent.resume`` can find phase-1 runs.
+    # Same experiment dir so later phases can resume prior runs.
     experiment_name="homie_g1",
-    run_name="" if phase <= 1 else "phase2",
+    run_name=run_name,
     max_iterations=100_000,
     num_steps_per_env=50,  # Homie G1_*CfgPPO.runner
     save_interval=200,
@@ -90,11 +106,14 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
       # Phase switch (env is separate via task registration).
       "phase": phase,
       "use_teacher": use_teacher,
-      # Homie keep_loco: lock phase-1 leg means; waist (dims 12:15) learns free.
-      "keep_loco_weight": 2.0,
-      "keep_loco_dims": 12,
-      "freeze_std_dims": 12,
+      # Phase-2: lock 12 legs. Phase-3: lock 14 loco (no waist yaw), always on.
+      "keep_loco_weight": keep_loco_weight,
+      "keep_loco_dims": keep_dims,
+      "freeze_std_dims": keep_dims,
       "stand_height": 0.74,
       "keep_height_tol": 0.02,
+      "is_waist_one_step_idx": is_waist_idx,
+      "keep_loco_always": keep_always,
+      "teacher_one_step_obs": teacher_one_step,
     },
   )

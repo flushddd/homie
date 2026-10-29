@@ -22,6 +22,15 @@ alwaysApply: true
     phase-1 ckpts that lack `is_target_height` / `target_z`).
   - Related prior: `4bf310e` (gated z + XY `need_waist` when target-height).
 
-- **Branch `phase1-href-above-target`**: on Homie-aligned phase-1 (`3fe8f49`+),
-  change target-height reward to **10 cm above** world target when `tz<=0`:
-  `h_ref = clamp(base+tz+0.10, 0.25, 0.74)`; height obs still fixed at 0.74.
+- **Branch `phase1-href-above-target`** / **`b1d183e2584ce36548ea8a67eabcf4a996ea3b85`**
+  (`b1d183e`): "Use h_ref 10cm above target when is_target_height."
+  - On Homie-aligned phase-1/2 (`3fe8f49`+ / `phase1-first-arm-random`):
+    when `tz<=0`, reward `h_ref = clamp(base+tz+0.10, 0.25, 0.74)` (10 cm
+    **above** world target); height obs still fixed at 0.74.
+  - Phase-2: random arms `init_ratio=1.0`. **Baseline for phase-3 work** —
+    modify phase-3 on top of this commit (do not regress phase-1/2 squat/arm).
+  - Phase-3 (on this base, not yet committed): task
+    `Mjlab-Homie-Flat-Unitree-G1-Phase3` — 14 loco + 3 EE residual IK,
+    analytic SDF container, reach/clearance rewards; teacher locks 14 loco
+    (`keep_loco_always`). Phase-1/2 keep their own obs layouts (no forced
+    229-D pad). Resume phase-2 → phase-3 expands 99→229 via runner remap.

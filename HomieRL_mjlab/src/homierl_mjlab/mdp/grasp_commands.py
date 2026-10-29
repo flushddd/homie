@@ -1,8 +1,10 @@
-"""Homie waist-grasp target (phase-2 waist bend; arms via env random curriculum).
+"""Homie waist-grasp target (phase-2 waist bend; phase-3 loco/waist/reach mix).
 
-Uses ``waist_curriculum`` + random grasp points as obs for the waist policy.
-``arm_on`` / ``is_target`` stay off (no arm-reach policy); arm pose comes from
-the shared upper-body random curriculum in ``env_cfgs`` events.
+Phase-2 (default): ``waist_curriculum`` + ``is_waist``; ``enable_arm_reach``
+stays False so ``is_target`` stays 0. Arm pose comes from the upper-body
+random curriculum in ``env_cfgs`` events.
+Phase-3: ``enable_arm_reach`` + ternary mode mix
+  ``(p_loco, p_waist_only, p_reach)`` → flags ``(0,0) / (1,0) / (1,1)``.
 
 Viser play: ``create_gui`` exposes target_x/y/z so you can drive waist mode
 manually (Enable ON → force ``is_waist`` + stand still on the viewed env).
@@ -21,6 +23,7 @@ from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
 from mjlab.utils.lab_api.math import quat_apply, yaw_quat
 
+from homierl_mjlab.mdp.base_frame import base_to_world, world_to_base
 from homierl_mjlab.mdp.curriculum import CurriculumScheduler
 
 if TYPE_CHECKING:
@@ -35,10 +38,40 @@ if TYPE_CHECKING:
 _DEFAULT_POS_X = (0.05, 0.65)
 _DEFAULT_POS_Y = (-0.35, 0.35)
 _DEFAULT_POS_Z = (-1.0, 0.2)
+# Phase-3 curriculum starts closer / shallower, then expands to the defaults.
+_START_POS_X = (0.15, 0.40)
+_START_POS_Y = (-0.18, 0.18)
+_START_POS_Z = (-0.45, 0.10)
+# Small reach from iter 0 (IK on ~10% envs), then ramp up — not a zero-IK warmup.
+_START_MODE_PROBS = (0.45, 0.45, 0.10)  # loco / waist_only / reach
+_END_MODE_PROBS = (0.2, 0.2, 0.6)
 
 _ARM_REACH = 0.49
 _LEFT_REF = (0.0, 0.1, 0.29)
 _RIGHT_REF = (0.0, -0.1, 0.29)
+
+
+def _lerp_pair(
+  start: tuple[float, float], end: tuple[float, float], alpha: float
+) -> tuple[float, float]:
+  a = float(alpha)
+  return (
+    start[0] + a * (end[0] - start[0]),
+    start[1] + a * (end[1] - start[1]),
+  )
+
+
+def _lerp_triple(
+  start: tuple[float, float, float],
+  end: tuple[float, float, float],
+  alpha: float,
+) -> tuple[float, float, float]:
+  a = float(alpha)
+  return (
+    start[0] + a * (end[0] - start[0]),
+    start[1] + a * (end[1] - start[1]),
+    start[2] + a * (end[2] - start[2]),
+  )
 
 
 class GraspTargetCommand(CommandTerm):
@@ -80,6 +113,25 @@ class GraspTargetCommand(CommandTerm):
       warmup=50 * 8000,
       ramp=8000,
     )
+    # Phase-3 only: 0→1 progress for mode mix + target range expansion.
+    # Latch t0 on first use so a resumed step counter does not max the ramp.
+    self.reach_mode_curriculum = CurriculumScheduler(
+      start_step=0,
+      end_step=int(cfg.mode_curriculum_ramp) + int(cfg.mode_curriculum_warmup),
+      min_value=0.0,
+      max_value=1.0,
+      warmup=int(cfg.mode_curriculum_warmup),
+      ramp=int(cfg.mode_curriculum_ramp),
+    )
+    self.target_range_curriculum = CurriculumScheduler(
+      start_step=0,
+      end_step=int(cfg.target_range_ramp) + int(cfg.target_range_warmup),
+      min_value=0.0,
+      max_value=1.0,
+      warmup=int(cfg.target_range_warmup),
+      ramp=int(cfg.target_range_ramp),
+    )
+    self._curriculum_t0: int | None = None
     self.arm_on = False
     self.waist_on = False
 
@@ -100,6 +152,10 @@ class GraspTargetCommand(CommandTerm):
     self.metrics["extend_dist"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["need_waist"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["waist_curriculum"] = torch.zeros(self.num_envs, device=self.device)
+    if bool(cfg.enable_arm_reach):
+      self.metrics["reach_mode_alpha"] = torch.zeros(self.num_envs, device=self.device)
+      self.metrics["target_range_alpha"] = torch.zeros(self.num_envs, device=self.device)
+      self.metrics["reach_prob"] = torch.zeros(self.num_envs, device=self.device)
 
     # Viser play GUI (set by create_gui).
     self._gui_enabled: viser.GuiCheckboxHandle | None = None
@@ -132,6 +188,48 @@ class GraspTargetCommand(CommandTerm):
       dim=-1,
     )
 
+  def _phase3_local_step(self) -> int:
+    """Env steps since phase-3 curriculum started (not inherited counter)."""
+    step = int(self._env.common_step_counter)
+    if self._curriculum_t0 is None:
+      self._curriculum_t0 = step
+    return max(0, step - self._curriculum_t0)
+
+  def _mode_progress(self) -> float:
+    return float(self.reach_mode_curriculum.value(self._phase3_local_step()))
+
+  def _range_progress(self) -> float:
+    return float(self.target_range_curriculum.value(self._phase3_local_step()))
+
+  def _normalized_mode_probs(self) -> tuple[float, float, float]:
+    """Phase-3 mix: ``(p_loco, p_waist_only, p_reach)``, curriculum + renormalized."""
+    p = _lerp_triple(self.cfg.mode_probs_start, self.cfg.mode_probs, self._mode_progress())
+    a, b, c = float(p[0]), float(p[1]), float(p[2])
+    s = a + b + c
+    if s <= 0.0:
+      return _END_MODE_PROBS
+    return a / s, b / s, c / s
+
+  def _current_pos_ranges(self) -> tuple[tuple[float, float], ...]:
+    """XY/Z sample ranges: start (near) → end (far) via target-range curriculum."""
+    alpha = self._range_progress()
+    return (
+      _lerp_pair(self.cfg.pos_x_start, self.cfg.pos_x, alpha),
+      _lerp_pair(self.cfg.pos_y_start, self.cfg.pos_y, alpha),
+      _lerp_pair(self.cfg.pos_z_start, self.cfg.pos_z, alpha),
+    )
+
+  def _sample_mode_flags(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Phase-3 ternary modes: loco | waist_only | reach → (0,0) | (1,0) | (1,1)."""
+    p_loco, p_wo, _p_reach = self._normalized_mode_probs()
+    u = torch.rand(n, device=self.device)
+    mode = torch.zeros(n, dtype=torch.long, device=self.device)
+    mode = torch.where(u >= p_loco, torch.ones_like(mode), mode)
+    mode = torch.where(u >= (p_loco + p_wo), torch.full_like(mode, 2), mode)
+    is_waist = (mode >= 1).float().unsqueeze(-1)
+    is_target = (mode == 2).float().unsqueeze(-1)
+    return is_waist, is_target
+
   def _refresh_curriculum(
     self,
     *,
@@ -149,9 +247,19 @@ class GraspTargetCommand(CommandTerm):
     being target-resampled). Reshuffling *all* envs while only writing targets
     for a subset leaves new waist envs with zero targets → ``need_waist=0``
     forever (TB: need_waist/extend_dist ≈ 0).
+
+    Phase-3 (``enable_arm_reach``): always on; ternary mix
+    ``mode_probs_start`` → ``mode_probs``. ``is_target`` is the reach mode.
     """
     step = int(self._env.common_step_counter)
-    self.arm_on = False  # arm reach training disabled
+    self.arm_on = bool(self.cfg.enable_arm_reach)
+    if self.arm_on:
+      self._refresh_reach_curriculum(
+        step, reshuffle_waist=reshuffle_waist, env_ids=env_ids
+      )
+      return
+    # Phase-2: arm reach stays off; is_target stays 0.
+    self.arm_on = False
     self.is_target.zero_()
     prob2 = self.waist_curriculum.value(step)
     was_on = self.waist_on
@@ -174,6 +282,40 @@ class GraspTargetCommand(CommandTerm):
     rand = torch.rand(n, 1, device=self.device)
     self.is_waist[env_ids] = (rand < 0.5).float()
 
+  def _refresh_reach_curriculum(
+    self,
+    step: int,
+    *,
+    reshuffle_waist: bool,
+    env_ids: torch.Tensor | None,
+  ) -> None:
+    """Phase-3: loco / waist-only / reach mix. Does not run in phase-2."""
+    del step
+    was_on = self.waist_on
+    self.waist_on = True
+    mode_alpha = self._mode_progress()
+    range_alpha = self._range_progress()
+    if "reach_mode_alpha" in self.metrics:
+      self.metrics["reach_mode_alpha"][:] = mode_alpha
+      self.metrics["target_range_alpha"][:] = range_alpha
+    _pl, _pw, pr = self._normalized_mode_probs()
+    self.metrics["waist_curriculum"][:] = pr
+    if "reach_prob" in self.metrics:
+      self.metrics["reach_prob"][:] = pr
+    if not (reshuffle_waist or not was_on):
+      return
+    if env_ids is None or (reshuffle_waist and not was_on):
+      is_w, is_t = self._sample_mode_flags(self.num_envs)
+      self.is_waist[:] = is_w
+      self.is_target[:] = is_t
+      return
+    n = len(env_ids)
+    if n == 0:
+      return
+    is_w, is_t = self._sample_mode_flags(n)
+    self.is_waist[env_ids] = is_w
+    self.is_target[env_ids] = is_t
+
   def _waist_gate(self, env_ids: torch.Tensor) -> torch.Tensor:
     return self.is_waist[env_ids]
 
@@ -181,6 +323,9 @@ class GraspTargetCommand(CommandTerm):
     """Homie ``_resample_target_commands``: XY (+ arm/need_waist); z from twist."""
     self._refresh_curriculum(reshuffle_waist=True, env_ids=env_ids)
     if len(env_ids) == 0:
+      return
+    if self.arm_on:
+      self._sample_phase3_targets(env_ids)
       return
     n = len(env_ids)
     gate = self._waist_gate(env_ids)
@@ -233,7 +378,13 @@ class GraspTargetCommand(CommandTerm):
       height offset on twist.
     - target-height: ``is_height & is_target_height & is_waist`` → sample z;
       ``h_ref`` from ``target_z`` in height rewards.
+
+    Phase-3 (``enable_arm_reach``): ignore the twist band and sample the
+    curriculum box so reach / bend are not gated by ``is_height``.
     """
+    if self.arm_on:
+      self._sample_phase3_targets(env_ids)
+      return
     if len(env_ids) == 0:
       return
     n = len(env_ids)
@@ -252,6 +403,27 @@ class GraspTargetCommand(CommandTerm):
     self._finalize_waist_targets(env_ids, gate)
     self._refresh_world_target(env_ids)
 
+  def _sample_phase3_targets(self, env_ids: torch.Tensor) -> None:
+    """Phase-3 xyz from the range curriculum. ``need_waist`` stays XY-when-ith."""
+    if len(env_ids) == 0:
+      return
+    n = len(env_ids)
+    gate = self._waist_gate(env_ids)
+    pos_x, pos_y, pos_z = self._current_pos_ranges()
+    rx = torch.empty(n, 1, device=self.device).uniform_(*pos_x)
+    ry = torch.empty(n, 1, device=self.device).uniform_(*pos_y)
+    rz = torch.empty(n, 1, device=self.device).uniform_(*pos_z)
+    self.target_position[env_ids, 0:1] = rx * gate
+    self.target_position[env_ids, 1:2] = ry * gate
+    z = rz * gate + 0.3
+    self.target_position[env_ids, 2:3] = z
+    # Non-neutral z → squat h_ref path. Set before need_waist so ith uses XY.
+    self.is_target_height[env_ids] = (torch.abs(z - 0.3) > 1e-3).float() * gate
+    self._finalize_waist_targets(env_ids, gate)
+    self.init_robot_poses[env_ids] = self.robot.data.root_link_pos_w[env_ids, :3]
+    # Freeze world anchor so the grasp point stays put while the base squats.
+    self._freeze_anchor_from_base(env_ids)
+
   def _refresh_world_target(self, env_ids: torch.Tensor | None = None) -> None:
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, device=self.device)
@@ -265,13 +437,36 @@ class GraspTargetCommand(CommandTerm):
       float(self.cfg.base_height_target) + self.target_position[env_ids, 2]
     )
 
+  def _freeze_anchor_from_base(self, env_ids: torch.Tensor | None = None) -> None:
+    """Phase-3 resample: set ``target_pos_w`` from the current base sample."""
+    if env_ids is None:
+      env_ids = torch.arange(self.num_envs, device=self.device)
+    if len(env_ids) == 0:
+      return
+    self.target_pos_w[env_ids] = base_to_world(
+      self.robot, self.target_position[env_ids], env_ids
+    )
+
+  def _reproject_base_from_anchor(self, env_ids: torch.Tensor | None = None) -> None:
+    """Phase-3 step: refresh base-frame target from the frozen world anchor."""
+    if env_ids is None:
+      env_ids = torch.arange(self.num_envs, device=self.device)
+    if len(env_ids) == 0:
+      return
+    self.target_position[env_ids] = world_to_base(
+      self.robot, self.target_pos_w[env_ids], env_ids
+    )
+
   def _update_extend_dist(self) -> None:
     active = (self.is_waist.squeeze(-1) > 0).nonzero(as_tuple=False).flatten()
     self.extend_dist.zero_()
     self.is_reachable.zero_()
     if len(active) == 0:
       return
-    self._refresh_world_target(active)
+    if self.arm_on:
+      self._reproject_base_from_anchor(active)
+    else:
+      self._refresh_world_target(active)
 
     left = active[(self.target_arm[active, 0] == 1)]
     right = active[(self.target_arm[active, 0] == 2)]
@@ -347,6 +542,9 @@ class GraspTargetCommand(CommandTerm):
         self.need_waist[off] = 0.0
         self.extend_dist[off] = 0.0
         self.is_reachable[off] = 0.0
+        if self.arm_on:
+          self.is_target[off] = 0.0
+          self.is_target_height[off] = 0.0
     self._update_extend_dist()
     self._apply_twist_override()
 
@@ -370,8 +568,10 @@ class GraspTargetCommand(CommandTerm):
   def _apply_manual_target(self, idx: int, x: float, y: float, z: float) -> None:
     """Force waist mode + body-frame target on one env (Viser play)."""
     self.waist_on = True
+    self.arm_on = bool(self.cfg.enable_arm_reach)
     self.is_waist[idx] = 1.0
-    self.is_target[idx] = 0.0
+    # Phase-2 play stays waist-only. Phase-3 play drives the reach (EE) path.
+    self.is_target[idx] = 1.0 if self.arm_on else 0.0
     # Play: no twist band — treat non-neutral z as Homie ``is_target_height``.
     self.is_target_height[idx] = 1.0 if abs(z - 0.3) > 1e-3 else 0.0
     self.target_position[idx, 0] = x
@@ -386,7 +586,10 @@ class GraspTargetCommand(CommandTerm):
       dist = float(np.linalg.norm([x - ref[0], y - ref[1], z - ref[2]]))
     self.need_waist[idx] = 1.0 if (dist - _ARM_REACH) > 0.0 else 0.0
     env_ids = torch.tensor([idx], device=self.device, dtype=torch.long)
-    self._refresh_world_target(env_ids)
+    if self.arm_on:
+      self._freeze_anchor_from_base(env_ids)
+    else:
+      self._refresh_world_target(env_ids)
     self._update_extend_dist()
     self._apply_twist_override()
     # Target-height squat: reward h_ref = base+z+0.10 via _command_height_target.
@@ -589,6 +792,21 @@ class GraspTargetCommandCfg(CommandTermCfg):
   pos_x: tuple[float, float] = _DEFAULT_POS_X
   pos_y: tuple[float, float] = _DEFAULT_POS_Y
   pos_z: tuple[float, float] = _DEFAULT_POS_Z
+  # Phase-3: enable arm reach (is_target) for EE residual + IK.
+  # Default False so phase-2 waist-only grasp is unchanged.
+  enable_arm_reach: bool = False
+  # Phase-2 fraction is hard-coded 0.5 in ``_refresh_curriculum`` (not this field).
+  is_waist_prob: float = 0.5
+  # Phase-3 ternary mix (loco, waist_only, reach); curriculum start → end.
+  mode_probs_start: tuple[float, float, float] = _START_MODE_PROBS
+  mode_probs: tuple[float, float, float] = _END_MODE_PROBS
+  mode_curriculum_warmup: int = 0
+  mode_curriculum_ramp: int = 50 * 8000  # ~8k iters to full reach share
+  pos_x_start: tuple[float, float] = _START_POS_X
+  pos_y_start: tuple[float, float] = _START_POS_Y
+  pos_z_start: tuple[float, float] = _START_POS_Z
+  target_range_warmup: int = 0
+  target_range_ramp: int = 50 * 10000
 
   def build(self, env: ManagerBasedRlEnv) -> GraspTargetCommand:
     return GraspTargetCommand(self, env)

@@ -209,6 +209,9 @@ class HomieOnPolicyRunner:
       freeze_std_dims=int(him_cfg.get("freeze_std_dims", 12)),
       stand_height=float(him_cfg.get("stand_height", 0.74)),
       keep_height_tol=float(him_cfg.get("keep_height_tol", 0.02)),
+      is_waist_one_step_idx=int(him_cfg.get("is_waist_one_step_idx", 83)),
+      keep_loco_always=bool(him_cfg.get("keep_loco_always", False)),
+      teacher_one_step_obs=int(him_cfg.get("teacher_one_step_obs", 0)),
     )
 
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -490,6 +493,151 @@ class HomieOnPolicyRunner:
     }
     torch.save(payload, path)
 
+  # Actor one-step layouts:
+  #   phase-1: proprio68 | a12 | ith+tz | container10  (~92)
+  #   phase-2: proprio68 | a14 | grasp7 | container10 = 99
+  #   phase-3: proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
+  _HOMIE_PROPRIO = 68
+  _HOMIE_GRASP = 7
+  _HOMIE_CONTAINER = 10
+  _HOMIE_ACT_OBS = 17
+  _HOMIE_SDF = 128
+
+  @classmethod
+  def _act_obs_slots(cls, one_step: int, num_actions: int) -> int:
+    """17 only for the phase-3 SDF layout. Phase-1/2 keep real action width."""
+    rich = cls._HOMIE_PROPRIO + cls._HOMIE_ACT_OBS + cls._HOMIE_GRASP + cls._HOMIE_SDF
+    if one_step >= rich:
+      return cls._HOMIE_ACT_OBS
+    return int(num_actions)
+
+  def _remap_homie_actor_frame(
+    self,
+    old_w: torch.Tensor,
+    *,
+    old_one: int,
+    new_one: int,
+    hist: int,
+    old_act: int,
+    new_act: int,
+  ) -> torch.Tensor:
+    """Copy proprio, overlapping actions, and grasp into a phase-3 frame.
+
+    New SDF / clearance / ee_err columns stay zero. Phase-1 (~92) is not
+    treated as a padded-17 layout.
+    """
+    if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
+      return old_w
+    proprio = self._HOMIE_PROPRIO
+    grasp = self._HOMIE_GRASP
+    container = self._HOMIE_CONTAINER
+    old_slots = self._act_obs_slots(old_one, old_act)
+    new_slots = self._act_obs_slots(new_one, new_act)
+    rich = proprio + self._HOMIE_ACT_OBS + grasp + self._HOMIE_SDF
+
+    old_after = old_one - proprio - old_slots
+    if old_one >= rich:
+      old_grasp = grasp
+    else:
+      old_has_grasp = old_after >= grasp
+      old_grasp = grasp if old_has_grasp else 0
+      old_cont = (
+        container if (old_after - old_grasp) >= container else max(old_after - old_grasp, 0)
+      )
+      if proprio + old_slots + old_grasp + old_cont != old_one:
+        print(
+          f"[WARN] unrecognized old actor layout one={old_one} act={old_act}; "
+          "using generic proprio|act copy"
+        )
+        proprio = old_one - old_slots
+        old_grasp = 0
+
+    new_after = new_one - proprio - new_slots
+    new_grasp = grasp if new_after >= grasp else 0
+    if proprio + new_slots + new_grasp > new_one:
+      print(f"[WARN] new actor layout too small: one={new_one} act_slots={new_slots}")
+      return old_w
+
+    new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
+    a_copy = min(old_slots, new_slots, old_act, new_act)
+    g_copy = min(old_grasp, new_grasp)
+    for t in range(hist):
+      o0 = t * old_one
+      n0 = t * new_one
+      new_w[:, n0 : n0 + proprio] = old_w[:, o0 : o0 + proprio]
+      new_w[:, n0 + proprio : n0 + proprio + a_copy] = old_w[
+        :, o0 + proprio : o0 + proprio + a_copy
+      ]
+      if g_copy > 0:
+        o_g = o0 + proprio + old_slots
+        n_g = n0 + proprio + new_slots
+        new_w[:, n_g : n_g + g_copy] = old_w[:, o_g : o_g + g_copy]
+    return new_w
+
+  def _remap_homie_critic_frame(
+    self,
+    old_w: torch.Tensor,
+    *,
+    old_one: int,
+    new_one: int,
+    hist: int,
+    old_act: int,
+    new_act: int,
+  ) -> torch.Tensor:
+    """Critic ≈ actor layout + trailing base_lin_vel(3)."""
+    if old_w.ndim != 2 or old_w.shape[1] != hist * old_one:
+      return old_w
+    proprio = self._HOMIE_PROPRIO
+    grasp = self._HOMIE_GRASP
+    lin_vel = 3
+    old_has_lin = False
+    old_actor_one = old_one
+    if old_one >= lin_vel:
+      maybe_actor = old_one - lin_vel
+      legacy = {
+        proprio + old_act,
+        proprio + old_act + grasp,
+        proprio + old_act + grasp + self._HOMIE_CONTAINER,
+        proprio + old_act + self._HOMIE_CONTAINER,
+        proprio + old_act + 2 + self._HOMIE_CONTAINER,  # phase-1 ith+tz+container
+      }
+      unified_min = proprio + self._HOMIE_ACT_OBS + grasp + self._HOMIE_SDF
+      if maybe_actor in legacy or maybe_actor >= unified_min:
+        old_has_lin = True
+        old_actor_one = maybe_actor
+
+    new_actor_guess = new_one - lin_vel if new_one >= lin_vel else new_one
+    new_slots = self._act_obs_slots(new_actor_guess, new_act)
+    new_has_lin = new_one >= lin_vel and new_actor_guess >= proprio + new_slots
+    new_actor_one = new_actor_guess if new_has_lin else new_one
+
+    actor_old = old_w.new_zeros(old_w.shape[0], hist * old_actor_one)
+    for t in range(hist):
+      o0 = t * old_one
+      actor_old[:, t * old_actor_one : (t + 1) * old_actor_one] = old_w[
+        :, o0 : o0 + old_actor_one
+      ]
+    actor_new = self._remap_homie_actor_frame(
+      actor_old,
+      old_one=old_actor_one,
+      new_one=new_actor_one,
+      hist=hist,
+      old_act=old_act,
+      new_act=new_act,
+    )
+    new_w = old_w.new_zeros(old_w.shape[0], hist * new_one)
+    for t in range(hist):
+      n0 = t * new_one
+      new_w[:, n0 : n0 + new_actor_one] = actor_new[
+        :, t * new_actor_one : (t + 1) * new_actor_one
+      ]
+      if old_has_lin and new_has_lin:
+        o0 = t * old_one
+        new_w[:, n0 + new_actor_one : n0 + new_actor_one + lin_vel] = old_w[
+          :, o0 + old_actor_one : o0 + old_actor_one + lin_vel
+        ]
+    return new_w
+
   @staticmethod
   def _remap_one_step_in_weight(
     old_w: torch.Tensor,
@@ -531,6 +679,110 @@ class HomieOnPolicyRunner:
         ]
     return new_w
 
+  def _expand_to_phase3_state_dict(
+    self,
+    loaded_sd: dict,
+    *,
+    old_one: int,
+    old_act: int,
+    new_act: int,
+    new_one: int,
+    new_one_c: int,
+    hist_a: int,
+    hist_c: int,
+  ) -> dict[str, torch.Tensor]:
+    """Map a phase-2 (or earlier non-SDF) checkpoint onto the phase-3 obs/action layout."""
+    ac = self.alg.actor_critic
+    cur = ac.state_dict()
+    crit_w = loaded_sd.get("critic.0.weight")
+    if crit_w is not None and crit_w.ndim == 2 and hist_c > 0:
+      old_one_c = int(crit_w.shape[1] // hist_c)
+    else:
+      old_one_c = old_one + 3
+    latent = 3 + int(getattr(ac, "dynamic_latent_dim", 32))
+    print(
+      f"[INFO] Remap phase-3 obs/act: one_step {old_one}->{new_one}, "
+      f"critic {old_one_c}->{new_one_c}, act {old_act}->{new_act}"
+    )
+    out: dict[str, torch.Tensor] = {}
+    for key, src in loaded_sd.items():
+      if key not in cur:
+        continue
+      dst_shape = cur[key].shape
+      if src.shape == dst_shape:
+        out[key] = src
+        continue
+      if key == "std" and src.ndim == 1 and dst_shape[0] > src.shape[0]:
+        std = torch.full(dst_shape, 0.05, device=src.device, dtype=src.dtype)
+        std[: src.shape[0]] = torch.nan_to_num(src, nan=1.0).abs().clamp(min=1e-4)
+        out[key] = std
+        continue
+      if (
+        key.endswith("weight")
+        and src.ndim == 2
+        and dst_shape[0] > src.shape[0]
+        and dst_shape[1] == src.shape[1]
+      ):
+        w = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
+        w[: src.shape[0]] = src
+        out[key] = w
+        continue
+      if key.endswith("bias") and src.ndim == 1 and dst_shape[0] > src.shape[0]:
+        b = torch.zeros(dst_shape, device=src.device, dtype=src.dtype)
+        b[: src.shape[0]] = src
+        out[key] = b
+        continue
+      if key.startswith("estimator.encoder.0.weight"):
+        out[key] = self._remap_homie_actor_frame(
+          src,
+          old_one=old_one,
+          new_one=new_one,
+          hist=hist_a,
+          old_act=old_act,
+          new_act=new_act,
+        )
+        continue
+      if key.startswith("estimator.target.0.weight"):
+        out[key] = self._remap_homie_actor_frame(
+          src,
+          old_one=old_one,
+          new_one=new_one,
+          hist=1,
+          old_act=old_act,
+          new_act=new_act,
+        )
+        continue
+      if key == "actor.0.weight" and src.ndim == 2:
+        w = cur[key].clone()
+        remapped = self._remap_homie_actor_frame(
+          src[:, :old_one],
+          old_one=old_one,
+          new_one=new_one,
+          hist=1,
+          old_act=old_act,
+          new_act=new_act,
+        )
+        w[:, :new_one] = remapped
+        if src.shape[1] >= old_one + latent and w.shape[1] >= new_one + latent:
+          w[:, new_one : new_one + latent] = src[:, old_one : old_one + latent]
+        out[key] = w
+        continue
+      if key == "critic.0.weight" and src.ndim == 2:
+        out[key] = self._remap_homie_critic_frame(
+          src,
+          old_one=old_one_c,
+          new_one=new_one_c,
+          hist=hist_c,
+          old_act=old_act,
+          new_act=new_act,
+        )
+        continue
+      print(
+        f"[WARN] skip incompatible ckpt key {key}: "
+        f"{tuple(src.shape)} -> {tuple(dst_shape)}"
+      )
+    return out
+
   def _expand_phase1_to_phase2_state_dict(
     self, loaded_sd: dict
   ) -> dict[str, torch.Tensor]:
@@ -548,6 +800,21 @@ class HomieOnPolicyRunner:
       old_one = int(enc.shape[1] // hist_a)
     else:
       old_one = new_one - (new_act - old_act)
+    rich_min = (
+      self._HOMIE_PROPRIO + self._HOMIE_ACT_OBS + self._HOMIE_GRASP + self._HOMIE_SDF
+    )
+    # Phase-2 (99) → phase-3 (229). Phase-1 → phase-2 stays on the trail remap below.
+    if new_one >= rich_min and old_one < rich_min:
+      return self._expand_to_phase3_state_dict(
+        loaded_sd,
+        old_one=old_one,
+        old_act=old_act,
+        new_act=new_act,
+        new_one=new_one,
+        new_one_c=new_one_c,
+        hist_a=hist_a,
+        hist_c=hist_c,
+      )
     # Trailing after actions: grasp (phase-2) + container(10); critic also has lin_vel.
     actor_new_trail = new_one - (old_one - old_act + new_act)
     actor_old_trail = 0
@@ -684,10 +951,19 @@ class HomieOnPolicyRunner:
       )
     self.current_learning_iteration = int(loaded.get("iter", 0))
     infos = loaded.get("infos") or {}
-    if "env_state" in infos:
+    phase = int((self.cfg.get("him") or {}).get("phase", 1))
+    # Phase-3 expand: do not restore the phase-2 step counter. It would
+    # skip the reach/target curriculum ramp (local t0 also latches, but
+    # velocity stages read common_step_counter directly).
+    skip_counter = need_expand and phase >= 3
+    if "env_state" in infos and not skip_counter:
       self.adapter.unwrapped.common_step_counter = infos["env_state"][
         "common_step_counter"
       ]
+    elif skip_counter:
+      print(
+        "[INFO] Skipping common_step_counter restore after phase-3 obs/action expand"
+      )
     return infos
 
   def add_git_repo_to_log(self, repo_file_path: str):

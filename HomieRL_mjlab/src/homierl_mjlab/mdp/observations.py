@@ -11,6 +11,25 @@ from mjlab.managers.scene_entity_config import SceneEntityCfg
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
+# Phase-3 actor one-step (not used to pad phase-1/2):
+#   proprio68 | a17 | grasp7 | sdf128 | clearance6 | ee_err3 = 229
+HOMIE_PROPRIO_DIM = 68
+HOMIE_ACTION_OBS_DIM = 17
+HOMIE_GRASP_DIM = 7
+HOMIE_SDF_DIM = 128  # 64 phi + 64 valid
+HOMIE_CLEARANCE_DIM = 6
+HOMIE_EE_ERR_DIM = 3
+HOMIE_ONE_STEP_OBS = (
+  HOMIE_PROPRIO_DIM
+  + HOMIE_ACTION_OBS_DIM
+  + HOMIE_GRASP_DIM
+  + HOMIE_SDF_DIM
+  + HOMIE_CLEARANCE_DIM
+  + HOMIE_EE_ERR_DIM
+)
+# grasp[1] = is_waist → 68 + 17 + 1 = 86 (phase-3 padded actions)
+HOMIE_IS_WAIST_IDX = HOMIE_PROPRIO_DIM + HOMIE_ACTION_OBS_DIM + 1
+
 
 def height_command(
   env: ManagerBasedRlEnv,
@@ -71,6 +90,25 @@ def twist_command_xy_yaw(
   cmd = env.command_manager.get_command(command_name)
   s = torch.tensor(scale, device=cmd.device, dtype=cmd.dtype)
   return cmd[:, :3] * s
+
+
+def padded_last_action(
+  env: ManagerBasedRlEnv,
+  target_dim: int = HOMIE_ACTION_OBS_DIM,
+) -> torch.Tensor:
+  """``last_action`` zero-padded to ``target_dim`` (phase-3 uses 17)."""
+  act = env.action_manager.action
+  if act.shape[-1] >= target_dim:
+    return act[:, :target_dim]
+  pad = torch.zeros(
+    act.shape[0], target_dim - act.shape[-1], device=act.device, dtype=act.dtype
+  )
+  return torch.cat((act, pad), dim=-1)
+
+
+def zeros_vector(env: ManagerBasedRlEnv, dim: int) -> torch.Tensor:
+  """Fixed zero observation block."""
+  return torch.zeros(env.num_envs, int(dim), device=env.device)
 
 
 def grasp_target_command(
