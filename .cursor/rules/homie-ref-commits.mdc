@@ -16,7 +16,12 @@ alwaysApply: true
 - **`3fe8f49cfbd181f0d4399e9db6ab6c81a285c5dc`** (`3fe8f49`): "Expose Homie 1jieduan target-height squat in phase-1 obs."
   - Phase-1 dual squat like Homie `legged_robot1jieduan`: height-cmd vs
     `is_target_height` + `target_z` (no `is_waist` gate on z); both in actor obs.
-  - Rewards use `h_ref` from `target_z` when `is_target_height`.
+  - Homie reward at this commit: `h_ref = clamp(tz+0.64)` when `tz<0` (10 cm
+    **below** world target) — tends to deep-squat for low `tz`.
   - Obs dim changed → **retrain phase-1** from this commit (do not resume older
     phase-1 ckpts that lack `is_target_height` / `target_z`).
   - Related prior: `4bf310e` (gated z + XY `need_waist` when target-height).
+
+- **Branch `phase1-href-above-target`**: on Homie-aligned phase-1 (`3fe8f49`+),
+  change target-height reward to **10 cm above** world target when `tz<=0`:
+  `h_ref = clamp(base+tz+0.10, 0.25, 0.74)`; height obs still fixed at 0.74.

@@ -106,12 +106,16 @@ def _command_height_target(
   command_name: str,
   base_height_target: float,
 ) -> torch.Tensor:
-  """Absolute base-height target (Homie ``tracking_base_height`` / ``lin_vel_z``).
+  """Absolute base-height target (``tracking_base_height`` / ``lin_vel_z``).
 
   Default: ``base + twist_height_offset``.
-  When ``is_target_height`` (grasp phase-2, or twist phase-1 ``1jieduan``)::
+  When ``is_target_height`` and body-frame ``target_z <= 0``: track **10 cm
+  above** the target (world target ≈ ``base + tz``)::
 
-      h_ref = clamp(target_z + 0.64, 0.25, 0.74)  if target_z < 0 else 0.74
+      h_ref = clamp(base + tz + 0.10, 0.25, 0.74)
+
+  If ``target_z > 0``: keep standing ``base`` (0.74).
+  Height obs stays at base when ith (Homie); only the reward target changes.
   """
   cmd = env.command_manager.get_command(command_name)
   h = base_height_target + cmd[:, 3]
@@ -129,10 +133,11 @@ def _command_height_target(
     tz = tz_buf
   if not torch.any(mask):
     return h
+  base = float(base_height_target)
   h_ref = torch.where(
-    tz < 0.0,
-    torch.clamp(tz + 0.64, min=0.25, max=0.74),
-    torch.full_like(tz, float(base_height_target)),
+    tz <= 0.0,
+    torch.clamp(tz + base + 0.10, min=0.25, max=0.74),
+    torch.full_like(tz, base),
   )
   return torch.where(mask, h_ref, h)
 

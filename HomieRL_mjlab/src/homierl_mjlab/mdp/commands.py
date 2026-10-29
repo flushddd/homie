@@ -158,8 +158,8 @@ class TwistHeightCommand(UniformVelocityCommand):
     # Phase-1 (Homie ``legged_robot1jieduan``; is_target=is_waist=0):
     #   no target:  height_cmd offset → abs obs/reward in ~[0.24, 0.74]
     #   has target: height_cmd=0 → height obs stays 0.74; reward uses
-    #               h_ref = clamp(tz+0.64,0.25,0.74) if tz<0 else 0.74
-    #               (Homie; not literally base+tz — e.g. tz=-0.2 → h_ref=0.44)
+    #               h_ref = clamp(base+tz+0.10,0.25,0.74) if tz<=0 else base
+    #               (10 cm above world target; e.g. tz=-0.2 → h_ref=0.64)
     self.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
     self.is_standing_env[env_ids] = ~is_vel
     self.vel_command_b[env_ids[~is_vel]] = 0.0
@@ -293,7 +293,7 @@ class TwistHeightCommand(UniformVelocityCommand):
         max=z_hi,
         step=0.01,
         initial_value=0.3,
-        hint="Homie target_position[:,2]. z<0 → squat h_ref=clamp(z+0.64).",
+        hint="target_z<=0 → h_ref=clamp(0.74+z+0.10) (10cm above target).",
       )
       h_ref_out = server.gui.add_number(
         "h_ref from target_z (m)",
@@ -330,8 +330,8 @@ class TwistHeightCommand(UniformVelocityCommand):
 
   def _play_h_ref(self, tz: float) -> float:
     base = float(self.cfg.base_height_target)
-    if tz < 0.0:
-      return float(max(0.25, min(0.74, tz + 0.64)))
+    if tz <= 0.0:
+      return float(max(0.25, min(0.74, base + tz + 0.10)))
     return base
 
   def compute(

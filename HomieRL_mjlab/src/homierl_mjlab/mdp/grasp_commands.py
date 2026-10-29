@@ -389,13 +389,13 @@ class GraspTargetCommand(CommandTerm):
     self._refresh_world_target(env_ids)
     self._update_extend_dist()
     self._apply_twist_override()
-    # Mirror Homie squat when target is low (h_ref from target_z).
-    if z < 0.0:
+    # Target-height squat: reward h_ref = base+z+0.10 via _command_height_target.
+    if z <= 0.0:
       try:
         twist = self._env.command_manager.get_term("twist")
-        h_ref = float(np.clip(z + 0.64, 0.25, 0.74))
-        twist.height_command[idx] = h_ref - float(self.cfg.base_height_target)
-        twist.is_height_env[idx] = True
+        # Height obs stays at base when ith; do not fold h_ref into height_cmd.
+        twist.height_command[idx] = 0.0
+        twist.is_height_env[idx] = False
         twist.is_standing_env[idx] = True
       except Exception:  # noqa: BLE001
         pass
