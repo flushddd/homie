@@ -584,6 +584,9 @@ def action_vanish(
   actions = env.action_manager.action
   term = env.action_manager.get_term("joint_pos")
   joint_ids = term.target_ids
+  n_joint = int(joint_ids.numel())
+  # Phase-3 appends EE residual after loco joints; vanish only covers joint_pos.
+  joint_actions = actions[:, :n_joint]
   scale = term.scale
   if not torch.is_tensor(scale):
     scale = torch.as_tensor(scale, device=env.device, dtype=actions.dtype)
@@ -591,8 +594,8 @@ def action_vanish(
   limits = asset.data.soft_joint_pos_limits[:, joint_ids]  # [N, J, 2]
   action_max = (limits[..., 1] - default) / scale
   action_min = (limits[..., 0] - default) / scale
-  upper = torch.clip(actions - action_max, min=0.0)
-  lower = torch.clip(action_min - actions, min=0.0)
+  upper = torch.clip(joint_actions - action_max, min=0.0)
+  lower = torch.clip(action_min - joint_actions, min=0.0)
   return torch.sum(upper + lower, dim=-1)
 
 

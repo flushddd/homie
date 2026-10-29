@@ -359,7 +359,22 @@ class HIMPPO:
     )
 
   # ---- symmetry helpers (Homie obs layout) ----
-  # one-step: [vx,vy,yaw, height, ang(3), grav(3), q(N), dq(N), a(12)]
+  # Phase-1: proprio68 | a12 | ith1 | tz1 | container10 (=92)
+  # Phase-2: proprio68 | a14 | grasp7 | container10 (=99); is_waist @ 83
+  # Phase-3: proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 (=229); is_waist @ 86
+  # Critic always appends lin_vel(3) as the trailing dims.
+  _GRASP = 7
+  _SDF = 128
+  _CLEAR = 6
+  _EE = 3
+  _CONTAINER = 10
+
+  @staticmethod
+  def _action_obs_slots(step_dim: int, num_actions: int, a0: int) -> int:
+    """Obs action width: 17 only when the phase-3 SDF trail is present."""
+    if step_dim >= a0 + 17 + 7 + 128:
+      return 17
+    return int(num_actions)
 
   def _flip_one_step(self, step: torch.Tensor, with_lin_vel: bool) -> torch.Tensor:
     out = step.clone()
@@ -383,14 +398,22 @@ class HIMPPO:
     # actions: 12 legs (+ optional waist / EE). Assume leg block [L6 | R6].
     a0 = 10 + 2 * n
     n_act = int(self.actor_critic.num_actions)
-    if step.shape[-1] >= a0 + n_act:
+    step_dim = int(step.shape[-1])
+    act_slots = self._action_obs_slots(step_dim, n_act, a0)
+    if step_dim >= a0 + n_act:
       out[..., a0 : a0 + n_act] = self.flip_actions(step[..., a0 : a0 + n_act])
-    # Phase-3 rich trail only: a17 | grasp7 | sdf128 | clearance6 | ee_err3.
-    # Phase-1/2 one-step dims stay below this threshold (no SDF).
-    rich_min = a0 + 17 + 7 + 128
-    if int(step.shape[-1]) >= rich_min:
-      g0 = a0 + 17
-      out[..., g0 : g0 + 7] = step[..., g0 : g0 + 7]
+
+    # Trail after action slots. Phase-1 ith/tz/container is NOT grasp.
+    g0 = a0 + act_slots
+    trail = step_dim - g0
+    # Phase-2: grasp7+container10(+lin_vel3). Phase-3: grasp7+sdf…(+lin_vel3).
+    has_grasp = trail >= self._GRASP + self._SDF or trail in (
+      self._GRASP + self._CONTAINER,
+      self._GRASP + self._CONTAINER + 3,
+    )
+    if has_grasp and step_dim >= g0 + self._GRASP:
+      # grasp: [is_target, is_waist, extend, tx, ty, tz, arm] — mirror ty, swap arm
+      out[..., g0 : g0 + self._GRASP] = step[..., g0 : g0 + self._GRASP]
       out[..., g0 + 4] = -step[..., g0 + 4]
       arm = step[..., g0 + 6]
       out[..., g0 + 6] = torch.where(
@@ -398,30 +421,33 @@ class HIMPPO:
         torch.ones_like(arm),
         torch.where(arm > 0.5, torch.full_like(arm, 2.0), arm),
       )
-      s0 = g0 + 7
-      k = 64  # HOMIE_SDF_DIM // 2
-      perm = self._sdf_y_flip_perm(k, step.device)
-      phi = step[..., s0 : s0 + k]
-      valid = step[..., s0 + k : s0 + 128]
-      out[..., s0 : s0 + k] = phi[..., perm]
-      out[..., s0 + k : s0 + 128] = valid[..., perm]
-      c0 = s0 + 128
-      if step.shape[-1] >= c0 + 6:
-        clr = step[..., c0 : c0 + 6]
-        out[..., c0 : c0 + 3] = clr[..., 3:6]
-        out[..., c0 + 3 : c0 + 6] = clr[..., 0:3]
-      e0 = c0 + 6
-      if step.shape[-1] >= e0 + 3:
-        out[..., e0 : e0 + 3] = step[..., e0 : e0 + 3]
-        out[..., e0 + 1] = -step[..., e0 + 1]
-      if with_lin_vel and step.shape[-1] >= 3:
-        lv = int(step.shape[-1]) - 3
-        out[..., lv] = step[..., lv]
-        out[..., lv + 1] = -step[..., lv + 1]
-        out[..., lv + 2] = step[..., lv + 2]
-    elif with_lin_vel and step.shape[-1] >= a0 + n_act + 3:
-      lv = a0 + n_act
+      s0 = g0 + self._GRASP
+      if step_dim >= s0 + self._SDF:
+        k = self._SDF // 2
+        perm = self._sdf_y_flip_perm(k, step.device)
+        phi = step[..., s0 : s0 + k]
+        valid = step[..., s0 + k : s0 + self._SDF]
+        out[..., s0 : s0 + k] = phi[..., perm]
+        out[..., s0 + k : s0 + self._SDF] = valid[..., perm]
+        c0 = s0 + self._SDF
+        if step_dim >= c0 + self._CLEAR:
+          clr = step[..., c0 : c0 + self._CLEAR]
+          out[..., c0 : c0 + 3] = clr[..., 3:6]
+          out[..., c0 + 3 : c0 + 6] = clr[..., 0:3]
+        e0 = c0 + self._CLEAR
+        if step_dim >= e0 + self._EE:
+          out[..., e0 : e0 + self._EE] = step[..., e0 : e0 + self._EE]
+          out[..., e0 + 1] = -step[..., e0 + 1]
+      elif step_dim >= s0 + self._CONTAINER:
+        # Phase-2 fixed container: flip y_c (index 1).
+        out[..., s0 + 1] = -step[..., s0 + 1]
+
+    # Critic lin_vel is always the trailing 3 dims (after grasp/SDF/container).
+    if with_lin_vel and step_dim >= 3:
+      lv = step_dim - 3
+      out[..., lv] = step[..., lv]
       out[..., lv + 1] = -step[..., lv + 1]
+      out[..., lv + 2] = step[..., lv + 2]
     return out
 
   _sdf_perm_cache: dict[tuple[int, str], torch.Tensor] = {}
