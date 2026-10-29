@@ -474,16 +474,16 @@ def deviation_waist_joint(
     * waist_mask.unsqueeze(-1)
     * (1.0 - reach_mask).unsqueeze(-1)
     * need_waist.unsqueeze(-1)
-    * 130.5
+    * 188
   )
   zero_loss = (
     torch.abs(joint_deviation - 0.5)
     * (1.0 - need_waist).unsqueeze(-1)
     * waist_mask.unsqueeze(-1)
-    * 0.59
+    * 1.5
   )
   dist_loss = (
-    loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * need_waist.unsqueeze(-1) * 2.2
+    loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * need_waist.unsqueeze(-1) * 5.0
   )
   first_step_loss = (
     torch.abs(joint_deviation - 0.5) * (1.0 - waist_mask).unsqueeze(-1) * 0.01
