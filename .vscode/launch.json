@@ -257,6 +257,90 @@
         "--checkpoint-file",
         "${input:homiePhase2Checkpoint}"
       ]
+    },
+    {
+      "name": "HomieRL mjlab: Train Phase3 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase3",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.resume",
+        "True",
+        "--agent.load-run",
+        "${input:homiePhase2RunForPhase3}",
+        "--agent.load-checkpoint",
+        "${input:homiePhase2CkptForPhase3}",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Resume Phase3 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.train",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase3",
+        "--env.scene.num-envs",
+        "4096",
+        "--agent.resume",
+        "True",
+        "--agent.load-run",
+        "${input:homieResumePhase3Run}",
+        "--agent.load-checkpoint",
+        "${input:homieResumePhase3Ckpt}",
+        "--agent.logger",
+        "tensorboard",
+        "--agent.upload-model",
+        "False"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Play Phase3 (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "module": "mjlab.scripts.play",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "Mjlab-Homie-Flat-Unitree-G1-Phase3",
+        "--num-envs",
+        "1",
+        "--viewer",
+        "viser",
+        "--checkpoint-file",
+        "${input:homiePhase3Checkpoint}"
+      ]
     }
   ],
   "compounds": [
@@ -272,6 +356,14 @@
       "name": "HomieRL mjlab: Resume Phase1 + TensorBoard",
       "configurations": [
         "HomieRL mjlab: Resume Phase1 (4096)",
+        "HomieRL mjlab: TensorBoard"
+      ],
+      "stopAll": true
+    },
+    {
+      "name": "HomieRL mjlab: Train Phase3 + TensorBoard",
+      "configurations": [
+        "HomieRL mjlab: Train Phase3 (4096)",
         "HomieRL mjlab: TensorBoard"
       ],
       "stopAll": true
@@ -324,6 +416,36 @@
       "id": "homiePhase2Checkpoint",
       "type": "promptString",
       "description": "Phase-2 checkpoint path (e.g. logs/rsl_rl/homie_g1/<run>_phase2/model_*.pt)",
+      "default": "logs/rsl_rl/homie_g1/phase2/model_17400.pt"
+    },
+    {
+      "id": "homiePhase2RunForPhase3",
+      "type": "promptString",
+      "description": "Phase-2 run folder to load as Phase-3 teacher (under logs/rsl_rl/homie_g1/)",
+      "default": "phase2"
+    },
+    {
+      "id": "homiePhase2CkptForPhase3",
+      "type": "promptString",
+      "description": "Phase-2 checkpoint filename for Phase-3 resume",
+      "default": "model_17400.pt"
+    },
+    {
+      "id": "homieResumePhase3Run",
+      "type": "promptString",
+      "description": "Phase-3 run folder to resume (under logs/rsl_rl/homie_g1/)",
+      "default": "phase3"
+    },
+    {
+      "id": "homieResumePhase3Ckpt",
+      "type": "promptString",
+      "description": "Phase-3 checkpoint filename",
+      "default": "model_0.pt"
+    },
+    {
+      "id": "homiePhase3Checkpoint",
+      "type": "promptString",
+      "description": "Phase-3 checkpoint path (e.g. logs/rsl_rl/homie_g1/<run>_phase3/model_*.pt)",
       "default": "logs/rsl_rl/homie_g1/"
     }
   ]
