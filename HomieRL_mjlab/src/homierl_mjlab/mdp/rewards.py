@@ -344,7 +344,8 @@ def deviation_waist_joint(
   """Homie ``_reward_deviation_waist_joint``.
 
   Prefer live grasp-target flags (``is_waist`` / ``need_waist`` / ``extend_dist``).
-  Falls back to height-only proxy when grasp command is absent (phase-1).
+  Phase-1 (no grasp): Homie ``is_waist=0`` → no waist bend/zero_loss (only tiny
+  first_step term). Do **not** proxy with ``is_height_env`` (that fights squat).
   """
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
@@ -355,10 +356,11 @@ def deviation_waist_joint(
     reach_mask = grasp.is_reachable.squeeze(-1)
     extend_dist = grasp.extend_dist.squeeze(-1)
   else:
-    waist_mask = _is_height_env(env, command_name)
+    waist_mask = torch.zeros(env.num_envs, device=env.device)
     need_waist = torch.zeros(env.num_envs, device=env.device)
     reach_mask = torch.zeros(env.num_envs, device=env.device)
     extend_dist = torch.zeros(env.num_envs, device=env.device)
+  del command_name  # phase-1 no longer uses height-env proxy
 
   q = asset.data.joint_pos[:, asset_cfg.joint_ids]
   limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
@@ -801,19 +803,21 @@ def stand_sway(
   waist_vel_weight: float = 1.0,
   waist_pos_weight: float = 0.25,
 ) -> torch.Tensor:
-  """Penalize base (+ optional waist-pitch) sway when velocity command is ~0.
+  """Penalize base (+ optional waist-pitch) sway when standing still.
 
-  Base: body-frame lin_vel_xy^2 + ang_vel_xy^2 (always; helps balance).
+  Base: body-frame lin_vel_xy^2 + ang_vel_xy^2.
   Waist pitch: only when **not** in grasp waist mode — otherwise this term
-  fights ``deviation_waist_joint`` (TB: stand_sway≈-0.8 vs waist≈-4e-4).
+  fights ``deviation_waist_joint``.
+
+  Gate: zero vel **and** near-standing ``h_target`` (Homie-style). Active while
+  squatting fought the squat descent (not in Homie 1jieduan).
   """
   asset: Entity = env.scene[asset_cfg.name]
   cmd = env.command_manager.get_command(command_name)
-  # Gate only on ~zero vel cmd (your change): also active while squatting.
-  # ``stand_height_threshold`` / ``base_height_target`` kept for cfg compat.
-  _ = (base_height_target, stand_height_threshold)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < cmd_threshold).float()
-  gate = zero_cmd
+  h_target = _command_height_target(env, command_name, base_height_target)
+  stand = (h_target >= stand_height_threshold).float()
+  gate = zero_cmd * stand
 
   lin_xy = torch.sum(torch.square(asset.data.root_link_lin_vel_b[:, :2]), dim=-1)
   ang_xy = torch.sum(torch.square(asset.data.root_link_ang_vel_b[:, :2]), dim=-1)

@@ -75,6 +75,9 @@ class TwistHeightCommand(UniformVelocityCommand):
     self._joystick_enabled: viser.GuiCheckboxHandle | None = None
     self._joystick_sliders: list[viser.GuiSliderHandle] = []
     self._height_abs_slider: viser.GuiSliderHandle | None = None
+    self._target_height_enabled: viser.GuiCheckboxHandle | None = None
+    self._target_z_slider: viser.GuiSliderHandle | None = None
+    self._h_ref_readout: Any | None = None
     self._joystick_get_env_idx: Callable[[], int] | None = None
 
   @property
@@ -153,9 +156,10 @@ class TwistHeightCommand(UniformVelocityCommand):
       return
 
     # Phase-1 (Homie ``legged_robot1jieduan``; is_target=is_waist=0):
-    #   height = U(height)*is_height*(1-is_target_height)  (+ base in obs)
-    #   target_z = U(pos_z)*is_height*is_target_height+0.3  (no is_waist)
-    # Obs exposes is_target_height + target_z; rewards use h_ref when ith.
+    #   no target:  height_cmd offset → abs obs/reward in ~[0.24, 0.74]
+    #   has target: height_cmd=0 → height obs stays 0.74; reward uses
+    #               h_ref = clamp(tz+0.64,0.25,0.74) if tz<0 else 0.74
+    #               (Homie; not literally base+tz — e.g. tz=-0.2 → h_ref=0.44)
     self.is_target_height[env_ids] = is_target_height.float().unsqueeze(-1)
     self.is_standing_env[env_ids] = ~is_vel
     self.vel_command_b[env_ids[~is_vel]] = 0.0
@@ -262,6 +266,7 @@ class TwistHeightCommand(UniformVelocityCommand):
         max=h_max,
         step=0.01,
         initial_value=h0,
+        hint="Height-cmd squat (Homie model_h). Disabled while target_height ON.",
       )
       hint = server.gui.add_number(
         "height_offset (= abs - 0.74)",
@@ -274,18 +279,60 @@ class TwistHeightCommand(UniformVelocityCommand):
       def _(_ev, _h=height_abs, _hint=hint, _base=h0) -> None:
         _hint.value = float(_h.value) - _base
 
+      # Homie 1jieduan target-height path (mutually exclusive with height-cmd).
+      z_lo = float(self.cfg.pos_z[0]) + 0.3
+      z_hi = float(self.cfg.pos_z[1]) + 0.3
+      target_height_on = server.gui.add_checkbox(
+        "Enable target_height squat",
+        initial_value=False,
+        hint="ON=is_target_height + target_z → h_ref. OFF=base_height_abs path.",
+      )
+      target_z = server.gui.add_slider(
+        "target_z (body, obs)",
+        min=z_lo,
+        max=z_hi,
+        step=0.01,
+        initial_value=0.3,
+        hint="Homie target_position[:,2]. z<0 → squat h_ref=clamp(z+0.64).",
+      )
+      h_ref_out = server.gui.add_number(
+        "h_ref from target_z (m)",
+        initial_value=h0,
+        step=0.01,
+        disabled=True,
+        hint="Reward height target when is_target_height.",
+      )
+
       zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
 
       @zero_btn.on_click
-      def _(_) -> None:
-        for s in sliders:
+      def _(
+        _,
+        _sliders=sliders,
+        _h=height_abs,
+        _h0=h0,
+        _ith=target_height_on,
+        _tz=target_z,
+      ) -> None:
+        for s in _sliders:
           s.value = 0.0
-        height_abs.value = h0
+        _h.value = _h0
+        _ith.value = False
+        _tz.value = 0.3
 
     self._joystick_enabled = enabled
     self._joystick_sliders = sliders
     self._height_abs_slider = height_abs
+    self._target_height_enabled = target_height_on
+    self._target_z_slider = target_z
+    self._h_ref_readout = h_ref_out
     self._joystick_get_env_idx = get_env_idx
+
+  def _play_h_ref(self, tz: float) -> float:
+    base = float(self.cfg.base_height_target)
+    if tz < 0.0:
+      return float(max(0.25, min(0.74, tz + 0.64)))
+    return base
 
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
@@ -294,19 +341,34 @@ class TwistHeightCommand(UniformVelocityCommand):
     if self._joystick_get_env_idx is None:
       return
     idx = self._joystick_get_env_idx()
-    # Height slider always wins when the GUI exists (no need to toggle Enable).
-    if self._height_abs_slider is not None:
+    base = float(self.cfg.base_height_target)
+    target_height_on = (
+      self._target_height_enabled is not None
+      and bool(self._target_height_enabled.value)
+    )
+    if target_height_on and self._target_z_slider is not None:
+      # Homie: height obs stays at base (0.74); reward tracks h_ref(tz).
+      tz = float(self._target_z_slider.value)
+      self.is_target_height[idx] = 1.0
+      self.target_z[idx] = tz
+      self.height_command[idx] = 0.0
+      self.is_height_env[idx] = False
+      self.is_standing_env[idx] = True
+      if self._h_ref_readout is not None:
+        self._h_ref_readout.value = self._play_h_ref(tz)
+    elif self._height_abs_slider is not None:
       abs_h = float(self._height_abs_slider.value)
-      h_off = abs_h - float(self.cfg.base_height_target)
+      h_off = abs_h - base
       self.height_command[idx] = h_off
-      # Keep idle-wipe / standing flags consistent with the slider.
-      # Play height slider = Homie height-cmd path (not target_z / h_ref).
+      # Height-cmd squat path (Homie model_h).
       squatting = abs(h_off) > 1e-3
       self.is_height_env[idx] = squatting
       self.is_target_height[idx] = 0.0
       self.target_z[idx] = 0.3
       if squatting:
         self.is_standing_env[idx] = True
+      if self._h_ref_readout is not None:
+        self._h_ref_readout.value = base
     # Velocity: Enable ON → follow sliders; Enable OFF → force zero (stand still).
     # Previously Enable OFF left random train velocities, so the robot kept walking.
     if self._joystick_active():
