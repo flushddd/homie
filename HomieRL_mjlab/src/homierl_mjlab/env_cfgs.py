@@ -141,16 +141,20 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
-    # Homie: error=(target-ee)+δ clipped ±0.1; blend joint targets (no hard yank).
+    # Same soft chase as play: smaller per-step Cartesian step + joint blend,
+    # nullspace holds default posture; ignore policy residual until loco+reach
+    # are stable (untrained δ only adds yank/jitter).
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
       ee_delta_scale=(0.03, 0.03, 0.05),
       ee_delta_clip=(0.04, 0.04, 0.06),
-      ee_error_clip=(0.10, 0.10, 0.10),
-      ik_damping=0.08,
-      max_joint_delta=0.08,
+      ee_error_clip=(0.06, 0.06, 0.06),
+      ik_damping=0.10,
+      max_joint_delta=0.06,
       ik_iterations=4,
-      joint_target_blend=0.35,
+      joint_target_blend=0.22,
+      nullspace_gain=0.15,
+      use_policy_delta=False,
     )
 
 
@@ -783,19 +787,7 @@ def homie_g1_flat_env_cfg(
       cont.thickness = (0.025, 0.025)
       cont.bottom_thickness = (0.016, 0.016)
       cont.target_offset_xy = (0.0, 0.0)
-    # Play phase-3: follow target, no untrained residual; nullspace holds
-    # default arm/wrist posture (redundant DOFs).
-    if int(phase) >= 3 and "ee_residual" in cfg.actions:
-      cfg.actions["ee_residual"] = replace(
-        cfg.actions["ee_residual"],
-        joint_target_blend=0.22,
-        ee_error_clip=(0.06, 0.06, 0.06),
-        max_joint_delta=0.06,
-        nullspace_gain=0.15,
-        ik_damping=0.10,
-        ik_iterations=4,
-        use_policy_delta=False,
-      )
+    # Play phase-3: EE IK already matches train soft-chase defaults above.
     # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
     cfg.events["log_waist_pitch"] = EventTermCfg(
       func=homie_mdp.log_waist_pitch,
