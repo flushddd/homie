@@ -7,9 +7,9 @@ task frame fixed at episode reset: origin = initial pelvis projection on ground,
 x forward, y left, z up.
 
 Phase-1/2 use a constant vector (no randomization) matching the design doc example.
-Phase-3 samples a square bin (4 walls + thin bottom) around the grasp target
-and syncs a mocap MuJoCo entity (``container_walls``) for collide + viz;
-analytic SDF uses the same params.
+Phase-3 samples a closed open-top crate (4 overlapping walls + floor) around
+the grasp target and syncs a mocap MuJoCo entity (``container_walls``) for
+collide + viz; analytic SDF uses the wall params.
 """
 
 from __future__ import annotations
@@ -62,6 +62,9 @@ class ContainerGeometryCommand(CommandTerm):
     self.metrics["container_rect"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["container_h"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["container_present"] = torch.zeros(self.num_envs, device=self.device)
+    # Expand per-world geom fields once so Viser rebuilds wall meshes when
+    # sync_walls_to_sim changes size/local pos (closed crate, not baked defaults).
+    self._geom_fields_ready = False
 
   @property
   def command(self) -> torch.Tensor:
@@ -124,7 +127,7 @@ class ContainerGeometryCommand(CommandTerm):
     self.sync_walls_to_sim(env_ids)
 
   def _resample_around_grasp(self, env_ids: torch.Tensor) -> None:
-    """Phase-3: optional open-bottom square walls around grasp target (world→task)."""
+    """Phase-3: closed open-top crate around grasp target (world→task)."""
     n = len(env_ids)
     device = self.device
     present = (torch.rand(n, device=device) < float(self.cfg.presence_prob)).float()
@@ -143,10 +146,17 @@ class ContainerGeometryCommand(CommandTerm):
     # Container center near target with small offset; keep target inside with margin.
     off_x = torch.empty(n, device=device).uniform_(*self.cfg.target_offset_xy)
     off_y = torch.empty(n, device=device).uniform_(*self.cfg.target_offset_xy)
+    # Size sampled inside configured ranges (inner cavity / wall / floor).
     inner_x = torch.empty(n, device=device).uniform_(*self.cfg.inner_size_xy)
     inner_y = torch.empty(n, device=device).uniform_(*self.cfg.inner_size_xy)
     h_c = torch.empty(n, device=device).uniform_(*self.cfg.height)
     t_wall = torch.empty(n, device=device).uniform_(*self.cfg.thickness)
+    t_bottom = torch.empty(n, device=device).uniform_(*self.cfg.bottom_thickness)
+    # Keep a usable cavity: wall/floor cannot eat the whole box.
+    min_inner = 2.0 * t_wall + 2.0 * float(self.cfg.target_margin) + 0.04
+    inner_x = torch.maximum(inner_x, min_inner)
+    inner_y = torch.maximum(inner_y, min_inner)
+    h_c = torch.maximum(h_c, t_bottom + 0.05)
     margin = float(self.cfg.target_margin)
     half_in_x = 0.5 * inner_x - margin
     half_in_y = 0.5 * inner_y - margin
@@ -169,7 +179,7 @@ class ContainerGeometryCommand(CommandTerm):
     self.container[env_ids, 6] = present  # b_rect
     self.container[env_ids, 7] = 0.0  # b_circle (ellipse later)
     self.container[env_ids, 8] = t_wall * present
-    self.container[env_ids, 9] = 0.01 * present  # thin bottom plate
+    self.container[env_ids, 9] = t_bottom * present
 
   def _follow_grasp_for_present(self) -> None:
     """Keep present containers centered on the current grasp (play slider / crawl)."""
@@ -200,8 +210,19 @@ class ContainerGeometryCommand(CommandTerm):
     z_w = self.container[env_ids, 2]
     return torch.stack((x_w, y_w, z_w), dim=-1)
 
+  def _ensure_geom_fields_expanded(self) -> None:
+    """Make geom_size/pos per-world so runtime crate layout shows in Viser."""
+    if self._geom_fields_ready:
+      return
+    sim = self._env.sim
+    need = ("geom_size", "geom_pos", "geom_rbound", "geom_aabb")
+    missing = tuple(f for f in need if f not in sim.expanded_fields)
+    if missing:
+      sim.expand_model_fields(missing)
+    self._geom_fields_ready = True
+
   def sync_walls_to_sim(self, env_ids: torch.Tensor | None = None) -> None:
-    """Push open-box params into the mocap ``container_walls`` entity (if present)."""
+    """Push closed-crate params into the mocap ``container_walls`` entity."""
     scene = self._env.scene
     if CONTAINER_ENTITY_NAME not in scene.entities:
       return
@@ -209,6 +230,7 @@ class ContainerGeometryCommand(CommandTerm):
       env_ids = torch.arange(self.num_envs, device=self.device)
     if len(env_ids) == 0:
       return
+    self._ensure_geom_fields_expanded()
 
     walls: Entity = scene[CONTAINER_ENTITY_NAME]
     n = len(env_ids)
@@ -275,13 +297,14 @@ class ContainerGeometryCommand(CommandTerm):
     )
     local_pos = torch.where(present.view(n, 1, 1), local_pos, torch.zeros_like(local_pos))
 
-    # Thin bottom plate (visual + foot contact); outer footprint = inner + 2*t_wall.
+    # Floor plate: outer footprint = inner + 2*t_wall (closed crate bottom).
+    t_bottom = torch.clamp(self.container[env_ids, 9], min=0.008)
     bottom_half = torch.zeros(n, 3, device=self.device)
     bottom_pos = torch.zeros(n, 3, device=self.device)
     bottom_half[:, 0] = 0.5 * inner_x + t_wall
     bottom_half[:, 1] = 0.5 * inner_y + t_wall
-    bottom_half[:, 2] = 0.005
-    bottom_pos[:, 2] = 0.005
+    bottom_half[:, 2] = 0.5 * t_bottom
+    bottom_pos[:, 2] = 0.5 * t_bottom
     bottom_half = torch.where(
       present.unsqueeze(-1), bottom_half, torch.full_like(bottom_half, _EPS_HALF)
     )
@@ -349,17 +372,19 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   # Phase-1/2 leave this False and keep ``fixed_values`` zeros.
   sample_around_grasp: bool = False
   presence_prob: float = 0.75
-  # Everyday shallow bin: ~30–40 cm cavity, ~12–20 cm wall height, ~2 cm walls.
+  # Closed open-top crate size ranges (meters). ``uniform_(lo, hi)`` per env.
+  # Desktop-bin scale like the cyan reference: ~30–42 cm cavity, ~16–24 cm tall.
   inner_size_xy: tuple[float, float] = (0.30, 0.42)
-  target_offset_xy: tuple[float, float] = (-0.06, 0.06)
-  target_margin: float = 0.06
-  # Used only if randomize=True
+  height: tuple[float, float] = (0.16, 0.24)
+  thickness: tuple[float, float] = (0.020, 0.030)
+  bottom_thickness: tuple[float, float] = (0.012, 0.020)
+  target_offset_xy: tuple[float, float] = (-0.04, 0.04)
+  target_margin: float = 0.05
+  # Used only if randomize=True (legacy free-place path).
   pos_x: tuple[float, float] = (0.40, 0.80)
   pos_y: tuple[float, float] = (-0.30, 0.30)
   z_b: tuple[float, float] = (0.70, 0.80)
   size_xy: tuple[float, float] = (0.20, 0.50)
-  height: tuple[float, float] = (0.12, 0.22)
-  thickness: tuple[float, float] = (0.015, 0.03)
   circle_prob: float = 0.4
 
   def build(self, env: ManagerBasedRlEnv) -> ContainerGeometryCommand:

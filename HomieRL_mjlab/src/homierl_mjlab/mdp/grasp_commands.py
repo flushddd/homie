@@ -6,8 +6,9 @@ random curriculum in ``env_cfgs`` events.
 Phase-3: ``enable_arm_reach`` + ternary mode mix
   ``(p_loco, p_waist_only, p_reach)`` → flags ``(0,0) / (1,0) / (1,1)``.
 
-Viser play: ``create_gui`` exposes target_x/y/z so you can drive waist mode
-manually (Enable ON → force ``is_waist`` + stand still on the viewed env).
+Viser play: ``create_gui`` exposes target_x/y/z sliders **and** a 3D XYZ
+transform gizmo (Enable ON → force ``is_waist`` + stand still; drag the
+gizmo or move sliders — they stay in sync).
 """
 
 from __future__ import annotations
@@ -21,9 +22,8 @@ import torch
 
 from mjlab.entity import Entity
 from mjlab.managers.command_manager import CommandTerm, CommandTermCfg
-from mjlab.utils.lab_api.math import quat_apply, yaw_quat
+from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, yaw_quat
 
-from homierl_mjlab.mdp.base_frame import base_to_world, world_to_base
 from homierl_mjlab.mdp.curriculum import CurriculumScheduler
 
 if TYPE_CHECKING:
@@ -122,9 +122,13 @@ class GraspTargetCommand(CommandTerm):
 
     self._left_shoulder_id: int | None = None
     self._right_shoulder_id: int | None = None
+    self._left_ee_id: int | None = None
+    self._right_ee_id: int | None = None
     for pattern, attr in (
       (".*left_shoulder_pitch_link", "_left_shoulder_id"),
       (".*right_shoulder_pitch_link", "_right_shoulder_id"),
+      (".*left_wrist_yaw_link", "_left_ee_id"),
+      (".*right_wrist_yaw_link", "_right_ee_id"),
     ):
       try:
         ids, _ = self.robot.find_bodies(pattern, preserve_order=True)
@@ -151,6 +155,12 @@ class GraspTargetCommand(CommandTerm):
     self._gui_need_waist: Any | None = None
     self._gui_waist_pitch_rad: Any | None = None
     self._gui_waist_pitch_deg: Any | None = None
+    self._gui_xform: Any | None = None
+    self._gui_xform_dragging: bool = False
+    self._gui_syncing_sliders: bool = False
+    # Play: ramp body-frame target toward slider/gizmo (avoid Enable snap).
+    self._gui_was_active: bool = False
+    self._gui_smooth_alpha: float = 0.15
     self._waist_pitch_joint_id: int | None = None
     try:
       ids, _ = self.robot.find_joints("waist_pitch_joint", preserve_order=True)
@@ -405,6 +415,7 @@ class GraspTargetCommand(CommandTerm):
     self._freeze_anchor_from_base(env_ids)
 
   def _refresh_world_target(self, env_ids: torch.Tensor | None = None) -> None:
+    """Homie: XY = pelvis + R_yaw(t_xy); Z = 0.74 + t_z (relative height)."""
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, device=self.device)
     if len(env_ids) == 0:
@@ -418,24 +429,27 @@ class GraspTargetCommand(CommandTerm):
     )
 
   def _freeze_anchor_from_base(self, env_ids: torch.Tensor | None = None) -> None:
-    """Phase-3 resample: set ``target_pos_w`` from the current base sample."""
+    """Phase-3: freeze world grasp. Z uses Homie ``0.74 + t_z``, not pelvis_z."""
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, device=self.device)
     if len(env_ids) == 0:
       return
-    self.target_pos_w[env_ids] = base_to_world(
-      self.robot, self.target_position[env_ids], env_ids
-    )
+    # Same placement as Homie / ``_refresh_world_target`` (Z ≠ pelvis + t_z).
+    self._refresh_world_target(env_ids)
 
   def _reproject_base_from_anchor(self, env_ids: torch.Tensor | None = None) -> None:
-    """Phase-3 step: refresh base-frame target from the frozen world anchor."""
+    """Phase-3 step: body XY from frozen world; body Z = world_z − 0.74."""
     if env_ids is None:
       env_ids = torch.arange(self.num_envs, device=self.device)
     if len(env_ids) == 0:
       return
-    self.target_position[env_ids] = world_to_base(
-      self.robot, self.target_pos_w[env_ids], env_ids
-    )
+    root = self.robot.data.root_link_pos_w[env_ids, :3]
+    heading = yaw_quat(self.robot.data.root_link_quat_w[env_ids])
+    delta = self.target_pos_w[env_ids] - root
+    # XY: yaw-only inverse (Homie body frame). Z: relative to standing base.
+    body = quat_apply_inverse(heading, delta)
+    body[:, 2] = self.target_pos_w[env_ids, 2] - float(self.cfg.base_height_target)
+    self.target_position[env_ids] = body
 
   def _update_extend_dist(self) -> None:
     active = (self.is_waist.squeeze(-1) > 0).nonzero(as_tuple=False).flatten()
@@ -533,6 +547,7 @@ class GraspTargetCommand(CommandTerm):
 
   def _release_gui_env(self) -> None:
     """Clear waist flags on the viewed env so Twist commands are not zeroed."""
+    self._gui_was_active = False
     if self._gui_get_env_idx is None:
       return
     idx = int(self._gui_get_env_idx())
@@ -583,14 +598,108 @@ class GraspTargetCommand(CommandTerm):
       except Exception:  # noqa: BLE001
         pass
 
+  def _body_xyz_from_world(self, idx: int, xw: float, yw: float, zw: float) -> tuple[float, float, float]:
+    """World → Homie body cmd: XY vs pelvis/yaw; Z = world_z − 0.74."""
+    ids = torch.tensor([idx], device=self.device, dtype=torch.long)
+    tw = torch.tensor([[xw, yw, zw]], device=self.device, dtype=torch.float32)
+    root = self.robot.data.root_link_pos_w[ids, :3]
+    heading = yaw_quat(self.robot.data.root_link_quat_w[ids])
+    delta = tw - root
+    body = quat_apply_inverse(heading, delta)[0]
+    z = zw - float(self.cfg.base_height_target)
+    return float(body[0].item()), float(body[1].item()), float(z)
+
+  def _seed_gui_target_from_ee(self, idx: int) -> None:
+    """On Enable edge: start target at current EE so approach is gradual."""
+    arm = float(self.target_arm[idx, 0].item())
+    ee_body = self._left_ee_id if arm < 1.5 else self._right_ee_id
+    if ee_body is None:
+      p = self.robot.data.root_link_pos_w[idx]
+    else:
+      p = self.robot.data.body_link_pos_w[idx, ee_body]
+    x, y, z = self._body_xyz_from_world(
+      idx, float(p[0].item()), float(p[1].item()), float(p[2].item())
+    )
+    if len(self._gui_sliders) >= 3:
+      sx, sy, sz = self._gui_sliders
+      x = float(np.clip(x, sx.min, sx.max))
+      y = float(np.clip(y, sy.min, sy.max))
+      z = float(np.clip(z, sz.min, sz.max))
+    self.target_position[idx, 0] = x
+    self.target_position[idx, 1] = y
+    self.target_position[idx, 2] = z
+
   def _apply_gui_target(self) -> None:
     if self._gui_get_env_idx is None or len(self._gui_sliders) < 3:
       return
+    # While dragging the 3D gizmo, world pose owns the target (still smoothed).
     idx = int(self._gui_get_env_idx())
-    x = float(self._gui_sliders[0].value)
-    y = float(self._gui_sliders[1].value)
-    z = float(self._gui_sliders[2].value)
+    just_on = not self._gui_was_active
+    self._gui_was_active = True
+    if just_on:
+      # Seed arm choice from slider before reading EE.
+      y_des0 = float(self._gui_sliders[1].value)
+      self.target_arm[idx] = 1.0 if y_des0 > 0.0 else 2.0
+      self._seed_gui_target_from_ee(idx)
+
+    if self._gui_xform_dragging:
+      # Gizmo already wrote desired via _apply_world_drag; still ease body cmd.
+      x_des = float(self._gui_sliders[0].value)
+      y_des = float(self._gui_sliders[1].value)
+      z_des = float(self._gui_sliders[2].value)
+    else:
+      x_des = float(self._gui_sliders[0].value)
+      y_des = float(self._gui_sliders[1].value)
+      z_des = float(self._gui_sliders[2].value)
+
+    a = float(self._gui_smooth_alpha)
+    x = (1.0 - a) * float(self.target_position[idx, 0].item()) + a * x_des
+    y = (1.0 - a) * float(self.target_position[idx, 1].item()) + a * y_des
+    z = (1.0 - a) * float(self.target_position[idx, 2].item()) + a * z_des
     self._apply_manual_target(idx, x, y, z)
+
+  def _set_sliders_from_body(self, x: float, y: float, z: float) -> None:
+    """Push body-frame xyz into sliders without re-entering drag handlers."""
+    if len(self._gui_sliders) < 3:
+      return
+    self._gui_syncing_sliders = True
+    try:
+      sx, sy, sz = self._gui_sliders
+      x = float(np.clip(x, sx.min, sx.max))
+      y = float(np.clip(y, sy.min, sy.max))
+      z = float(np.clip(z, sz.min, sz.max))
+      sx.value = x
+      sy.value = y
+      sz.value = z
+    finally:
+      self._gui_syncing_sliders = False
+
+  def _apply_world_drag(self, xw: float, yw: float, zw: float) -> None:
+    """Viser gizmo drag: write desired body xyz into sliders (smoothed in compute)."""
+    if self._gui_get_env_idx is None:
+      return
+    idx = int(self._gui_get_env_idx())
+    x, y, z = self._body_xyz_from_world(idx, xw, yw, zw)
+    self._set_sliders_from_body(x, y, z)
+
+  def _sync_gui_xform(self) -> None:
+    """Show/hide XYZ gizmo and keep it on the live world target."""
+    if self._gui_xform is None or self._gui_get_env_idx is None:
+      return
+    if not self._gui_active():
+      self._gui_xform.visible = False
+      self._gui_xform_dragging = False
+      return
+    self._gui_xform.visible = True
+    if self._gui_xform_dragging:
+      return
+    idx = int(self._gui_get_env_idx())
+    p = self.target_pos_w[idx]
+    self._gui_xform.position = (
+      float(p[0].item()),
+      float(p[1].item()),
+      float(p[2].item()),
+    )
 
   def _shoulder_target_dist(self, idx: int) -> float:
     """Live ‖shoulder_w − target_w‖ for the viewed env (Homie ``dist``)."""
@@ -640,7 +749,7 @@ class GraspTargetCommand(CommandTerm):
     on_change: Callable[[], None] | None = None,
     request_action: Callable[[str, Any], None] | None = None,
   ) -> None:
-    """Viser: Enable + body-frame target_x/y/z for waist play."""
+    """Viser: Enable + body-frame sliders + world-frame XYZ drag gizmo."""
     del on_change, request_action
     from viser import Icon
 
@@ -650,16 +759,16 @@ class GraspTargetCommand(CommandTerm):
     y_lo, y_hi = float(self.cfg.pos_y[0]), float(self.cfg.pos_y[1])
     z_lo = float(self.cfg.pos_z[0]) + 0.3  # e.g. -0.7
     z_hi = float(self.cfg.pos_z[1]) + 0.3  # e.g. 0.5
-    # Defaults ready for waist test; panel starts OFF so Twist loco/height works.
-    x0 = 0.45
-    y0 = 0.10
-    z0 = -0.20
+    # Mild defaults: avoid deep squat on Enable (z≪0.3 → sudden h_ref drop).
+    x0 = 0.40
+    y0 = 0.12
+    z0 = 0.10
 
     with server.gui.add_folder(name.capitalize()):
       enabled = server.gui.add_checkbox(
         "Enable waist target",
         initial_value=False,
-        hint="OFF=loco (Twist). ON=waist mode: zeros vel, drives body-frame target.",
+        hint="OFF=loco (Twist). ON=waist mode + XYZ gizmo: zeros vel, drag target in 3D.",
       )
       sx = server.gui.add_slider(
         "target_x (body)",
@@ -676,12 +785,12 @@ class GraspTargetCommand(CommandTerm):
         initial_value=y0,
       )
       sz = server.gui.add_slider(
-        "target_z (body, obs)",
+        "target_z (rel, +0.74→world)",
         min=z_lo,
         max=z_hi,
         step=0.01,
         initial_value=z0,
-        hint="z=0.3: height-cmd squat if Twist height. Else target-height path; low z → h_ref + 3D need_waist.",
+        hint="Homie relative height: world_z = 0.74 + z. z=0.3 → world 1.04; z=0 → world 0.74; low z → squat h_ref.",
       )
       shoulder_readout = server.gui.add_number(
         "shoulder→target (m)",
@@ -715,9 +824,33 @@ class GraspTargetCommand(CommandTerm):
 
       @reset_btn.on_click
       def _(_) -> None:
+        self._gui_xform_dragging = False
         sx.value = x0
         sy.value = y0
         sz.value = z0
+
+    # World-frame XYZ gizmo (translation only). Hidden until Enable ON.
+    xform = server.scene.add_transform_controls(
+      f"/homie/{name}/grasp_xyz",
+      scale=0.18,
+      line_width=2.0,
+      disable_rotations=True,
+      depth_test=False,
+      position=(0.45, 0.10, 0.54),
+      visible=False,
+    )
+
+    @xform.on_update
+    def _on_xform(event) -> None:
+      phase = getattr(event, "phase", "update")
+      if phase == "start":
+        self._gui_xform_dragging = True
+      elif phase == "end":
+        self._gui_xform_dragging = False
+      if not self._gui_active():
+        return
+      pos = event.target.position
+      self._apply_world_drag(float(pos[0]), float(pos[1]), float(pos[2]))
 
     self._gui_enabled = enabled
     self._gui_sliders = [sx, sy, sz]
@@ -726,6 +859,8 @@ class GraspTargetCommand(CommandTerm):
     self._gui_waist_pitch_rad = pitch_rad
     self._gui_waist_pitch_deg = pitch_deg
     self._gui_get_env_idx = get_env_idx
+    self._gui_xform = xform
+    self._gui_xform_dragging = False
 
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
@@ -739,6 +874,7 @@ class GraspTargetCommand(CommandTerm):
     else:
       self._release_gui_env()
     self._sync_gui_readouts()
+    self._sync_gui_xform()
 
   def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
     """Draw grasp target sphere (world) when waist is active."""

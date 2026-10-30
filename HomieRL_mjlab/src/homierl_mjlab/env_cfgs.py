@@ -141,14 +141,16 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
-    # Smaller residuals / joint steps so early IK does not yank COM over.
+    # Homie: error=(target-ee)+δ clipped ±0.1; blend joint targets (no hard yank).
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
       ee_delta_scale=(0.03, 0.03, 0.05),
       ee_delta_clip=(0.04, 0.04, 0.06),
+      ee_error_clip=(0.10, 0.10, 0.10),
       ik_damping=0.08,
       max_joint_delta=0.08,
       ik_iterations=4,
+      joint_target_blend=0.35,
     )
 
 
@@ -186,12 +188,19 @@ def _configure_phase_commands_and_obs(
       params={"command_name": "grasp"},
     )
     # Container params drive analytic SDF only — not a raw 10-D geom obs.
+    # Size randomized each resample inside the ranges below (reference bin scale).
     cfg.commands["container"] = homie_mdp.ContainerGeometryCommandCfg(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
       sample_around_grasp=True,
       # Fewer walls early so clearance does not fight balance before reach is on.
       presence_prob=0.40,
+      inner_size_xy=(0.30, 0.42),
+      height=(0.16, 0.24),
+      thickness=(0.020, 0.030),
+      bottom_thickness=(0.012, 0.020),
+      target_offset_xy=(-0.04, 0.04),
+      target_margin=0.05,
       debug_vis=False,
     )
     actor_terms.pop("container_geom", None)
@@ -661,10 +670,16 @@ def homie_g1_flat_env_cfg(
   }
 
   if int(phase) >= 3:
+    # Reach ↔ clearance are peers (same weight, both O(1) after normalize).
     cfg.rewards["reach_ee_position"] = RewardTermCfg(
       func=homie_mdp.reach_ee_position,
       weight=2.0,
       params={"grasp_command_name": "grasp", "sigma": 0.08},
+    )
+    cfg.rewards["clearance_penalty"] = RewardTermCfg(
+      func=homie_mdp.clearance_penalty,
+      weight=2.0,
+      params={"command_name": "container", "d_safe": 0.03, "d_max": 0.40},
     )
     cfg.rewards["reach_ee_progress"] = RewardTermCfg(
       func=homie_mdp.reach_ee_progress,
@@ -675,11 +690,6 @@ def homie_g1_flat_env_cfg(
       func=homie_mdp.reach_success,
       weight=0.5,
       params={"grasp_command_name": "grasp", "threshold": 0.03},
-    )
-    cfg.rewards["clearance_penalty"] = RewardTermCfg(
-      func=homie_mdp.clearance_penalty,
-      weight=2.0,
-      params={"command_name": "container", "d_safe": 0.03, "d_max": 0.40},
     )
     cfg.rewards["ee_residual_l2"] = RewardTermCfg(
       func=homie_mdp.ee_residual_l2,
@@ -758,14 +768,34 @@ def homie_g1_flat_env_cfg(
     twist = cfg.commands["twist"]
     twist.resampling_time_range = (1e9, 1e9)
     twist.rel_standing_envs = 0.0
-    # Phase-2: freeze grasp resample so Viser target_x/y/z owns the viewed env.
+    # Phase-2/3: freeze grasp resample so Viser target_x/y/z owns the viewed env.
     grasp = cfg.commands.get("grasp")
     if grasp is not None:
       grasp.resampling_time_range = (1e9, 1e9)
     cont = cfg.commands.get("container")
     if cont is not None and int(phase) >= 3:
-      cont.presence_prob = 1.0
+      # Play: hide crate for now — inspect grasp XYZ target only.
+      # When re-enabled, keep mid-range fixed size (train still uses ranges).
+      cont.presence_prob = 0.0
       cont.resampling_time_range = (1e9, 1e9)
+      cont.inner_size_xy = (0.36, 0.36)
+      cont.height = (0.20, 0.20)
+      cont.thickness = (0.025, 0.025)
+      cont.bottom_thickness = (0.016, 0.016)
+      cont.target_offset_xy = (0.0, 0.0)
+    # Play phase-3: follow target, no untrained residual; nullspace holds
+    # default arm/wrist posture (redundant DOFs).
+    if int(phase) >= 3 and "ee_residual" in cfg.actions:
+      cfg.actions["ee_residual"] = replace(
+        cfg.actions["ee_residual"],
+        joint_target_blend=0.22,
+        ee_error_clip=(0.06, 0.06, 0.06),
+        max_joint_delta=0.06,
+        nullspace_gain=0.15,
+        ik_damping=0.10,
+        ik_iterations=4,
+        use_policy_delta=False,
+      )
     # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
     cfg.events["log_waist_pitch"] = EventTermCfg(
       func=homie_mdp.log_waist_pitch,

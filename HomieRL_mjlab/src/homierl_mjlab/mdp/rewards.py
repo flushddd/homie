@@ -399,16 +399,22 @@ def clearance_penalty(
   d_safe: float = 0.03,
   d_max: float = 0.40,
 ) -> torch.Tensor:
-  """Penalty when arm proxy spheres violate safe distance to container walls."""
+  """Arm–wall clearance penalty, O(1) like ``reach_ee_position``.
+
+  Violation is normalized by ``d_safe`` so a full breach ≈ −1 before weight,
+  matching the scale of the reach exp reward (peer, not subordinate).
+  """
   from homierl_mjlab.mdp.sdf_observations import arm_clearance_field
 
   c = arm_clearance_field(env, command_name=command_name, d_max=d_max)
   c_m = c * float(d_max)
-  viol = torch.clamp(float(d_safe) - c_m, min=0.0)
+  d_s = max(float(d_safe), 1e-6)
+  # 0 = at/above safe margin; 1 = penetrating by ≥ d_safe.
+  viol_n = torch.clamp(d_s - c_m, min=0.0) / d_s
   cont = env.command_manager.get_term(command_name)
   present = cont.present
   active = _reach_active_mask(env)
-  return -torch.mean(viol * viol, dim=-1) * present * active
+  return -torch.mean(viol_n * viol_n, dim=-1) * present * active
 
 
 def ee_residual_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
