@@ -259,6 +259,29 @@ FEET_COLLISION = CollisionCfg(
   disable_other_geoms=True,
 )
 
+# Arm / hand collision meshes (named in ``_patch_inspire_spec``). Applied *after*
+# FEET_COLLISION so ``disable_other_geoms`` does not wipe them; keep
+# ``disable_other_geoms=False`` here.
+ARM_COLLISION = CollisionCfg(
+  geom_names_expr=(r"^(left|right)_(shoulder|elbow|wrist)_.*_collision\d*$",),
+  contype=1,
+  conaffinity=1,
+  condim=3,
+  priority=0,
+  friction=(0.6,),
+  disable_other_geoms=False,
+)
+
+_ARM_COLLISION_BODY_SUFFIXES = (
+  "shoulder_pitch_link",
+  "shoulder_roll_link",
+  "shoulder_yaw_link",
+  "elbow_link",
+  "wrist_roll_link",
+  "wrist_pitch_link",
+  "wrist_yaw_link",
+)
+
 
 def _ensure_named_sensor(
   spec: mujoco.MjSpec,
@@ -300,6 +323,15 @@ def _patch_inspire_spec(spec: mujoco.MjSpec) -> mujoco.MjSpec:
         rgba=[1.0, 0.0, 0.0, 1.0],
       )
 
+  # Name arm/hand collision geoms (XML leaves them anonymous; CollisionCfg
+  # needs names). Keep visual meshes (contype=0) untouched.
+  for side in ("left", "right"):
+    for suffix in _ARM_COLLISION_BODY_SUFFIXES:
+      body = spec.body(f"{side}_{suffix}")
+      coll_geoms = [g for g in body.geoms if int(g.contype) != 0]
+      for i, geom in enumerate(coll_geoms):
+        geom.name = f"{side}_{suffix}_collision{i}"
+
   _ensure_named_sensor(
     spec, "imu_ang_vel", mujoco.mjtSensor.mjSENS_GYRO, "imu_in_pelvis"
   )
@@ -320,7 +352,8 @@ def get_g1_robot_cfg() -> EntityCfg:
   """G1 inspire-waist: 29-DoF obs; PD on legs+waist+arms; policy = 12 legs."""
   return EntityCfg(
     init_state=HOMIE_INIT_STATE,
-    collisions=(FEET_COLLISION,),
+    # Feet first (disables others), then re-enable named arm/hand collisions.
+    collisions=(FEET_COLLISION, ARM_COLLISION),
     spec_fn=get_inspire_waist_spec,
     articulation=HOMIE_ARTICULATION,
   )
@@ -331,6 +364,7 @@ FOOT_COLLISION_GEOM_NAMES = tuple(
 )
 
 __all__ = [
+  "ARM_COLLISION",
   "ARM_JOINT_NAMES",
   "FEET_COLLISION",
   "FOOT_COLLISION_GEOM_NAMES",

@@ -778,9 +778,8 @@ def homie_g1_flat_env_cfg(
       grasp.resampling_time_range = (1e9, 1e9)
     cont = cfg.commands.get("container")
     if cont is not None and int(phase) >= 3:
-      # Play: hide crate for now — inspect grasp XYZ target only.
-      # When re-enabled, keep mid-range fixed size (train still uses ranges).
-      cont.presence_prob = 0.0
+      # Play: always show one mid-range closed crate around the grasp target.
+      cont.presence_prob = 1.0
       cont.resampling_time_range = (1e9, 1e9)
       cont.inner_size_xy = (0.36, 0.36)
       cont.height = (0.20, 0.20)
