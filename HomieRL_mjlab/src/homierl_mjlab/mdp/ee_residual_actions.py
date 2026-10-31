@@ -6,9 +6,9 @@ Homie ``legged_robot422`` path::
   pos_error = clip(pos_error, ±0.1)
   q_arm ← DLS IK on clipped error; clamp to joint limits
 
-Policy residual is still ``tanh * scale`` then clip. The important rate-limit
-is the **Cartesian error clip** — without it IK chases the full grasp target
-in one step and yanks the COM (unlike phase-1/2 smooth random-arm curriculum).
+Policy residual: ``tanh * scale`` then ``ee_delta_clip``. Rate-limits:
+Cartesian ``ee_error_clip``, per-iter ``max_joint_delta``, and total IK
+solution ``max_ik_solution_delta`` vs measured q.
 
 Inactive reach envs (``is_target=0``) hold arm joints at default.
 """
@@ -133,6 +133,7 @@ class EeResidualIkAction(ActionTerm):
     )
     self._damping = float(cfg.ik_damping)
     self._max_dq = float(cfg.max_joint_delta)
+    self._max_sol_dq = float(cfg.max_ik_solution_delta)
     self._ik_iters = int(cfg.ik_iterations)
     self._null_k = float(cfg.nullspace_gain)
     # Soft joint limits for post-IK clamp (J, 2).
@@ -262,7 +263,8 @@ class EeResidualIkAction(ActionTerm):
     # Always seed from measured q + measured J/ee (same pose). Seeding from
     # cmd_buf while J is at the real config makes the step inconsistent and
     # the arm can thrash.
-    q = self.robot.data.joint_pos[ids][:, joint_ids].clone()
+    q0 = self.robot.data.joint_pos[ids][:, joint_ids].clone()
+    q = q0.clone()
     q_pref = self.robot.data.default_joint_pos[ids][:, joint_ids]
     ee_w = self.robot.data.body_link_pos_w[ids, ee_body]
     ee_b = world_to_base(self.robot, ee_w, ids)
@@ -297,6 +299,9 @@ class EeResidualIkAction(ActionTerm):
       q = q + dq
       ee = ee + torch.bmm(J, dq.unsqueeze(-1)).squeeze(-1)
 
+    # Cap total IK solution vs measured q (multi-iter can still yank).
+    if self._max_sol_dq > 0.0:
+      q = q0 + torch.clamp(q - q0, -self._max_sol_dq, self._max_sol_dq)
     # Homie: clamp to dof limits after IK.
     q = torch.maximum(torch.minimum(q, limits[:, 1]), limits[:, 0])
 
@@ -341,7 +346,11 @@ class EeResidualIkActionCfg(ActionTermCfg):
   # Homie clips (target-ee+delta) to ±0.1 — this is the main yank prevention.
   ee_error_clip: tuple[float, float, float] = (0.10, 0.10, 0.10)
   ik_damping: float = 0.08
+  # Per-iteration joint step inside DLS.
   max_joint_delta: float = 0.08
+  # Total |q_ik - q_meas| after all IK iters (0 = disable). Caps yank from
+  # stacking ik_iterations * max_joint_delta.
+  max_ik_solution_delta: float = 0.10
   ik_iterations: int = 4
   # 1.0 = apply IK q immediately; lower = interpolate (play / soft start).
   joint_target_blend: float = 0.35

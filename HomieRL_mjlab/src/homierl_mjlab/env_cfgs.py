@@ -141,20 +141,19 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
-    # Same soft chase as play: smaller per-step Cartesian step + joint blend,
-    # nullspace holds default posture; ignore policy residual until loco+reach
-    # are stable (untrained δ only adds yank/jitter).
+    # Soft chase + small policy residual: clip δ and total IK Δq vs measured.
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
-      ee_delta_scale=(0.03, 0.03, 0.05),
-      ee_delta_clip=(0.04, 0.04, 0.06),
-      ee_error_clip=(0.06, 0.06, 0.06),
+      ee_delta_scale=(0.02, 0.02, 0.03),
+      ee_delta_clip=(0.02, 0.02, 0.03),
+      ee_error_clip=(0.05, 0.05, 0.05),
       ik_damping=0.10,
-      max_joint_delta=0.06,
+      max_joint_delta=0.04,
+      max_ik_solution_delta=0.08,
       ik_iterations=4,
       joint_target_blend=0.22,
       nullspace_gain=0.15,
-      use_policy_delta=False,
+      use_policy_delta=True,
     )
 
 
