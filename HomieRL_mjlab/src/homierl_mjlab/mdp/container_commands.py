@@ -7,9 +7,10 @@ task frame fixed at episode reset: origin = initial pelvis projection on ground,
 x forward, y left, z up.
 
 Phase-1/2 use a constant vector (no randomization) matching the design doc example.
-Phase-3 samples a closed open-top crate (4 overlapping walls + floor) around
-the grasp target and syncs a mocap MuJoCo entity (``container_walls``) for
-collide + viz; analytic SDF uses the wall params.
+Phase-3: grasp targets still sample the full curriculum range. A closed open-top
+crate is attached only on hard reaches (``need_waist`` and/or low squat ``body_z``),
+with ``presence_prob`` (train default 0.40). Optional play-only relocate can still
+move the grasp below/farther than the default hanging EE before placing the crate.
 """
 
 from __future__ import annotations
@@ -126,15 +127,80 @@ class ContainerGeometryCommand(CommandTerm):
     self.present[env_ids] = 1.0
     self.sync_walls_to_sim(env_ids)
 
-  def _resample_around_grasp(self, env_ids: torch.Tensor) -> None:
-    """Phase-3: closed open-top crate around grasp target (world→task)."""
+  def _relocate_grasp_below_default_ee(self, env_ids: torch.Tensor) -> None:
+    """Move grasp to a band below / farther than the default hanging EE.
+
+    Body-frame convention matches ``GraspTargetCommand``: ``z = U(pos_z) + 0.3``,
+    world ``Z = 0.74 + body_z``. Default zero-arm wrists sit roughly near
+    standing mid-torso; this band is lower and more forward so the open-top
+    crate rim is clearable from above.
+    """
+    if len(env_ids) == 0:
+      return
+    grasp = self._env.command_manager.get_term("grasp")
     n = len(env_ids)
     device = self.device
+    # Ensure reach mode so EE IK / clearance actually engage.
+    grasp.is_waist[env_ids] = 1.0
+    grasp.is_target[env_ids] = 1.0
+    rx = torch.empty(n, 1, device=device).uniform_(*self.cfg.grasp_pos_x)
+    ry = torch.empty(n, 1, device=device).uniform_(*self.cfg.grasp_pos_y)
+    rz = torch.empty(n, 1, device=device).uniform_(*self.cfg.grasp_pos_z)
+    # Keep existing arm side (y sign) when set; otherwise follow sampled y.
+    arm = grasp.target_arm[env_ids].squeeze(-1)
+    left = arm > 0.5
+    right = arm > 1.5
+    if bool(left.any()):
+      ry[left] = ry[left].abs()
+    if bool(right.any()):
+      ry[right] = -ry[right].abs()
+    gate = torch.ones(n, 1, device=device)
+    grasp.target_position[env_ids, 0:1] = rx * gate
+    grasp.target_position[env_ids, 1:2] = ry * gate
+    z = rz * gate + 0.3
+    grasp.target_position[env_ids, 2:3] = z
+    grasp.is_target_height[env_ids] = (torch.abs(z - 0.3) > 1e-3).float() * gate
+    grasp._finalize_waist_targets(env_ids, gate)
+    grasp.init_robot_poses[env_ids] = self.robot.data.root_link_pos_w[env_ids, :3]
+    grasp._freeze_anchor_from_base(env_ids)
+
+  def _hard_reach_mask(self, grasp, env_ids: torch.Tensor) -> torch.Tensor:
+    """True where the grasp needs bend/squat help (Homie hard reach)."""
+    need_waist = grasp.need_waist[env_ids].squeeze(-1) > 0.5
+    body_z = grasp.target_position[env_ids, 2]
+    low = body_z < float(self.cfg.low_body_z_max)
+    if bool(self.cfg.presence_requires_need_waist) and bool(
+      self.cfg.presence_also_on_low_z
+    ):
+      return need_waist | low
+    if bool(self.cfg.presence_requires_need_waist):
+      return need_waist
+    if bool(self.cfg.presence_also_on_low_z):
+      return low
+    return torch.ones(len(env_ids), device=self.device, dtype=torch.bool)
+
+  def _resample_around_grasp(self, env_ids: torch.Tensor) -> None:
+    """Phase-3: full-range grasp; crate on all hard-reach targets (optional relocate)."""
+    n = len(env_ids)
+    device = self.device
+    grasp = self._env.command_manager.get_term("grasp")
+    # Random gate first (play/train can set presence_prob=1 to always try).
     present = (torch.rand(n, device=device) < float(self.cfg.presence_prob)).float()
+    if bool(self.cfg.presence_requires_reach):
+      is_reach = grasp.is_target[env_ids].squeeze(-1) > 0.5
+      present = present * is_reach.float()
+    # Only 弯腰 / 下蹲够 targets are eligible; then presence_prob (e.g. 40%).
+    if bool(self.cfg.presence_requires_need_waist) or bool(
+      self.cfg.presence_also_on_low_z
+    ):
+      present = present * self._hard_reach_mask(grasp, env_ids).float()
     self.present[env_ids] = present
 
-    # Grasp target in world → task frame XY; z_b ≈ table under target.
-    grasp = self._env.command_manager.get_term("grasp")
+    present_ids = env_ids[present > 0.5]
+    if bool(self.cfg.relocate_grasp_when_present) and len(present_ids) > 0:
+      self._relocate_grasp_below_default_ee(present_ids)
+
+    # Grasp target in world → task frame XY; z_b ≈ floor under target.
     tw = grasp.target_pos_w[env_ids]
     yaw = self.ref_yaw[env_ids]
     c, s = torch.cos(yaw), torch.sin(yaw)
@@ -166,7 +232,8 @@ class ContainerGeometryCommand(CommandTerm):
     off_y = torch.clamp(off_y, -half_in_y, half_in_y)
     x_c = x_t - off_x
     y_c = y_t - off_y
-    z_b = tw[:, 2] - 0.02  # slightly below target (desktop support)
+    # Target near cavity floor; rim sits above so the arm approaches from above.
+    z_b = tw[:, 2] - 0.02
     self._grasp_offset_xy[env_ids, 0] = off_x
     self._grasp_offset_xy[env_ids, 1] = off_y
 
@@ -371,7 +438,21 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   # Phase-3: sample square bin around grasp (overrides randomize).
   # Phase-1/2 leave this False and keep ``fixed_values`` zeros.
   sample_around_grasp: bool = False
-  presence_prob: float = 0.75
+  # Among eligible hard-reach targets, this fraction get a bin (train: 0.40).
+  presence_prob: float = 0.40
+  # Train: only put crates on reach envs. Play can set False to always show one.
+  presence_requires_reach: bool = True
+  # Homie ``need_waist`` (beyond arm reach → bend) and/or low squat body_z.
+  presence_requires_need_waist: bool = True
+  presence_also_on_low_z: bool = True
+  # ``target_position[:,2]`` (already ``U(pos_z)+0.3``); world_z = 0.74 + body_z.
+  low_body_z_max: float = 0.15
+  # Play/debug only: move grasp below/farther than default hanging EE first.
+  # Train keeps full grasp curriculum — leave False.
+  relocate_grasp_when_present: bool = False
+  grasp_pos_x: tuple[float, float] = (0.38, 0.55)
+  grasp_pos_y: tuple[float, float] = (-0.22, 0.22)
+  grasp_pos_z: tuple[float, float] = (-0.55, -0.38)
   # Closed open-top crate size ranges (meters). ``uniform_(lo, hi)`` per env.
   # Desktop-bin scale: ~30–42 cm cavity, ~10–16 cm tall (clearable rim).
   inner_size_xy: tuple[float, float] = (0.30, 0.42)

@@ -197,10 +197,14 @@ def _configure_phase_commands_and_obs(
       entity_name="robot",
       resampling_time_range=(4.0, 4.0),
       sample_around_grasp=True,
-      # Fewer walls early so clearance does not fight balance before reach is on.
+      # Grasp stays full-range; among hard reaches, 40% get a crate.
       presence_prob=0.40,
+      presence_requires_reach=True,
+      presence_requires_need_waist=True,
+      presence_also_on_low_z=True,
+      low_body_z_max=0.15,
+      relocate_grasp_when_present=False,
       inner_size_xy=(0.30, 0.42),
-      # Lower walls so the arm can clear the rim (was 16–24 cm).
       height=(0.10, 0.16),
       thickness=(0.020, 0.030),
       bottom_thickness=(0.012, 0.020),
@@ -779,8 +783,15 @@ def homie_g1_flat_env_cfg(
       grasp.resampling_time_range = (1e9, 1e9)
     cont = cfg.commands.get("container")
     if cont is not None and int(phase) >= 3:
-      # Play: always show one mid-range closed crate around the grasp target.
+      # Play: always one crate on a fixed low+far grasp (force reach).
       cont.presence_prob = 1.0
+      cont.presence_requires_reach = False
+      cont.presence_requires_need_waist = False
+      cont.presence_also_on_low_z = False
+      cont.relocate_grasp_when_present = True
+      cont.grasp_pos_x = (0.45, 0.45)
+      cont.grasp_pos_y = (0.15, 0.15)
+      cont.grasp_pos_z = (-0.46, -0.46)
       cont.resampling_time_range = (1e9, 1e9)
       cont.inner_size_xy = (0.36, 0.36)
       cont.height = (0.13, 0.13)
