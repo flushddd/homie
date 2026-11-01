@@ -373,9 +373,9 @@ class ContainerGeometryCommandCfg(CommandTermCfg):
   sample_around_grasp: bool = False
   presence_prob: float = 0.75
   # Closed open-top crate size ranges (meters). ``uniform_(lo, hi)`` per env.
-  # Desktop-bin scale like the cyan reference: ~30–42 cm cavity, ~16–24 cm tall.
+  # Desktop-bin scale: ~30–42 cm cavity, ~10–16 cm tall (clearable rim).
   inner_size_xy: tuple[float, float] = (0.30, 0.42)
-  height: tuple[float, float] = (0.16, 0.24)
+  height: tuple[float, float] = (0.10, 0.16)
   thickness: tuple[float, float] = (0.020, 0.030)
   bottom_thickness: tuple[float, float] = (0.012, 0.020)
   target_offset_xy: tuple[float, float] = (-0.04, 0.04)

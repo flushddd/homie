@@ -141,17 +141,18 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
-    # Soft chase + small policy residual: clip δ and total IK Δq vs measured.
+    # Soft chase + small policy residual: tighter clips so the arm does not
+    # snap over the crate rim.
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
-      ee_delta_scale=(0.02, 0.02, 0.03),
-      ee_delta_clip=(0.02, 0.02, 0.03),
-      ee_error_clip=(0.05, 0.05, 0.05),
-      ik_damping=0.10,
-      max_joint_delta=0.04,
-      max_ik_solution_delta=0.08,
-      ik_iterations=4,
-      joint_target_blend=0.22,
+      ee_delta_scale=(0.015, 0.015, 0.02),
+      ee_delta_clip=(0.015, 0.015, 0.02),
+      ee_error_clip=(0.03, 0.03, 0.03),
+      ik_damping=0.12,
+      max_joint_delta=0.025,
+      max_ik_solution_delta=0.05,
+      ik_iterations=3,
+      joint_target_blend=0.12,
       nullspace_gain=0.15,
       use_policy_delta=True,
     )
@@ -199,7 +200,8 @@ def _configure_phase_commands_and_obs(
       # Fewer walls early so clearance does not fight balance before reach is on.
       presence_prob=0.40,
       inner_size_xy=(0.30, 0.42),
-      height=(0.16, 0.24),
+      # Lower walls so the arm can clear the rim (was 16–24 cm).
+      height=(0.10, 0.16),
       thickness=(0.020, 0.030),
       bottom_thickness=(0.012, 0.020),
       target_offset_xy=(-0.04, 0.04),
@@ -781,7 +783,7 @@ def homie_g1_flat_env_cfg(
       cont.presence_prob = 1.0
       cont.resampling_time_range = (1e9, 1e9)
       cont.inner_size_xy = (0.36, 0.36)
-      cont.height = (0.20, 0.20)
+      cont.height = (0.13, 0.13)
       cont.thickness = (0.025, 0.025)
       cont.bottom_thickness = (0.016, 0.016)
       cont.target_offset_xy = (0.0, 0.0)
