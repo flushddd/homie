@@ -33,7 +33,12 @@ from .observations import (
   twist_command_xy_yaw,
   zeros_vector,
 )
-from .sdf_observations import arm_clearance_field, ee_target_error, sdf_query_field
+from .sdf_observations import (
+  arm_clearance_field,
+  container_ik_avoidance_bias,
+  ee_target_error,
+  sdf_query_field,
+)
 from .rewards import (
   action_vanish,
   ang_vel_xy,
@@ -93,6 +98,7 @@ __all__ = [
   "bump_reach_mode_curriculum_from_tracking",
   "bump_upper_body_curriculum_from_tracking",
   "clearance_penalty",
+  "container_ik_avoidance_bias",
   "contact_momentum",
   "container_geometry_command",
   "deviation_ankle_joint",

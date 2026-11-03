@@ -141,19 +141,27 @@ def _configure_phase_actions(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     ),
   }
   if int(phase) >= 3:
-    # Soft chase + small policy residual: tighter clips so the arm does not
-    # snap over the crate rim.
+    # Reach-capable soft chase: Homie-scale Cartesian clip so the arm can
+    # fully extend; residual still small; nullspace is wrist-only in code.
     cfg.actions["ee_residual"] = homie_mdp.EeResidualIkActionCfg(
       entity_name="robot",
-      ee_delta_scale=(0.015, 0.015, 0.02),
-      ee_delta_clip=(0.015, 0.015, 0.02),
-      ee_error_clip=(0.03, 0.03, 0.03),
-      ik_damping=0.12,
-      max_joint_delta=0.025,
-      max_ik_solution_delta=0.05,
-      ik_iterations=3,
-      joint_target_blend=0.12,
-      nullspace_gain=0.15,
+      ee_delta_scale=(0.02, 0.02, 0.03),
+      ee_delta_clip=(0.02, 0.02, 0.03),
+      ee_error_clip=(0.08, 0.08, 0.08),
+      ik_damping=0.08,
+      max_joint_delta=0.05,
+      max_ik_solution_delta=0.12,
+      ik_iterations=4,
+      joint_target_blend=0.28,
+      nullspace_gain=0.12,
+      elbow_pref=0.8,
+      retract_nullspace_boost=2.5,
+      lock_wrist=True,
+      avoid_container=True,
+      avoid_d_safe=0.05,
+      avoid_lift_margin=0.05,
+      avoid_xy_slow=0.25,
+      avoid_repulsion_gain=1.0,
       use_policy_delta=True,
     )
 
@@ -678,6 +686,16 @@ def homie_g1_flat_env_cfg(
     ),
   }
 
+  # Phase-2+: squat h_ref is 5 cm above grasp target (phase-1 keeps 10 cm).
+  if int(phase) >= 2:
+    for _term in cfg.rewards.values():
+      params = getattr(_term, "params", None)
+      if isinstance(params, dict) and "base_height_target" in params:
+        params["href_above_target"] = 0.05
+    twist = cfg.commands.get("twist")
+    if twist is not None and hasattr(twist, "href_above_target"):
+      twist.href_above_target = 0.05
+
   if int(phase) >= 3:
     # Reach ↔ clearance are peers (same weight, both O(1) after normalize).
     cfg.rewards["reach_ee_position"] = RewardTermCfg(
@@ -687,8 +705,8 @@ def homie_g1_flat_env_cfg(
     )
     cfg.rewards["clearance_penalty"] = RewardTermCfg(
       func=homie_mdp.clearance_penalty,
-      weight=2.0,
-      params={"command_name": "container", "d_safe": 0.03, "d_max": 0.40},
+      weight=2.5,
+      params={"command_name": "container", "d_safe": 0.05, "d_max": 0.40},
     )
     cfg.rewards["reach_ee_progress"] = RewardTermCfg(
       func=homie_mdp.reach_ee_progress,
@@ -783,7 +801,7 @@ def homie_g1_flat_env_cfg(
       grasp.resampling_time_range = (1e9, 1e9)
     cont = cfg.commands.get("container")
     if cont is not None and int(phase) >= 3:
-      # Play: always one crate on a fixed low+far grasp (force reach).
+      # Play: default crate on (Viser "Show container" can toggle); low+far grasp.
       cont.presence_prob = 1.0
       cont.presence_requires_reach = False
       cont.presence_requires_need_waist = False
@@ -798,7 +816,16 @@ def homie_g1_flat_env_cfg(
       cont.thickness = (0.025, 0.025)
       cont.bottom_thickness = (0.016, 0.016)
       cont.target_offset_xy = (0.0, 0.0)
-    # Play phase-3: EE IK already matches train soft-chase defaults above.
+    # Play phase-3 demo: slower IK; Arm chase checkbox gates motion (set target first).
+    if int(phase) >= 3 and "ee_residual" in cfg.actions:
+      ee = cfg.actions["ee_residual"]
+      ee.require_play_arm_chase = True
+      ee.ee_error_clip = (0.025, 0.025, 0.025)
+      ee.max_joint_delta = 0.018
+      ee.max_ik_solution_delta = 0.035
+      ee.joint_target_blend = 0.06
+      ee.ik_iterations = 3
+      ee.avoid_xy_slow = 0.15
     # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
     cfg.events["log_waist_pitch"] = EventTermCfg(
       func=homie_mdp.log_waist_pitch,

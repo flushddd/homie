@@ -1,14 +1,17 @@
 """Phase-3 EE residual → arm joints via damped least-squares IK.
 
+Tracks the **palm TCP** (offset on ``wrist_yaw_link``), not the wrist origin.
+
 Homie ``legged_robot422`` path::
 
-  pos_error = (target - ee) + delta_e3[:3]
+  pos_error = (target - palm) + delta_e3[:3]
   pos_error = clip(pos_error, ±0.1)
   q_arm ← DLS IK on clipped error; clamp to joint limits
 
 Policy residual: ``tanh * scale`` then ``ee_delta_clip``. Rate-limits:
 Cartesian ``ee_error_clip``, per-iter ``max_joint_delta``, and total IK
-solution ``max_ik_solution_delta`` vs measured q.
+solution ``max_ik_solution_delta`` vs measured q. With ``lock_wrist``,
+wrist joints stay at default; IK runs on shoulder+elbow only.
 
 Inactive reach envs (``is_target=0``) hold arm joints at default.
 """
@@ -26,6 +29,7 @@ from homierl_mjlab.mdp.base_frame import (
   rotate_world_to_base,
   world_to_base,
 )
+from homierl_mjlab.mdp.palm import link_point_pos_w, palm_offset_tensor
 
 if TYPE_CHECKING:
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -126,8 +130,11 @@ class EeResidualIkAction(ActionTerm):
     self._right_ids = _jids(_RIGHT_ARM)
     self._left_bodies = _bids(_LEFT_ARM_BODIES)
     self._right_bodies = _bids(_RIGHT_ARM_BODIES)
+    # Track palm TCP (offset on wrist_yaw), not the wrist joint origin.
     self._left_ee = bnames.index("left_wrist_yaw_link")
     self._right_ee = bnames.index("right_wrist_yaw_link")
+    self._left_palm_off = palm_offset_tensor(self.device, torch.float32, left=True)
+    self._right_palm_off = palm_offset_tensor(self.device, torch.float32, left=False)
     self._axes_local = torch.tensor(
       _ARM_AXES_LOCAL, device=self.device, dtype=torch.float32
     )
@@ -136,6 +143,15 @@ class EeResidualIkAction(ActionTerm):
     self._max_sol_dq = float(cfg.max_ik_solution_delta)
     self._ik_iters = int(cfg.ik_iterations)
     self._null_k = float(cfg.nullspace_gain)
+    self._lock_wrist = bool(cfg.lock_wrist)
+    self._avoid_container = bool(cfg.avoid_container)
+    self._avoid_d_safe = float(cfg.avoid_d_safe)
+    self._avoid_lift_margin = float(cfg.avoid_lift_margin)
+    self._avoid_xy_slow = float(cfg.avoid_xy_slow)
+    self._avoid_repulsion = float(cfg.avoid_repulsion_gain)
+    self._elbow_pref = float(cfg.elbow_pref)
+    self._retract_boost = float(cfg.retract_nullspace_boost)
+    self._require_play_arm_chase = bool(cfg.require_play_arm_chase)
     # Soft joint limits for post-IK clamp (J, 2).
     limits = self.robot.data.soft_joint_pos_limits[0]
     self._left_lim = limits[self._left_ids].clone()
@@ -146,13 +162,18 @@ class EeResidualIkAction(ActionTerm):
     self._right_cmd = default[:, self._right_ids].clone()
     self._blend = float(cfg.joint_target_blend)
     self._use_policy_delta = bool(cfg.use_policy_delta)
-    # Prefer upright/default wrist (idx 4–6) so position-only IK does not leave
-    # the hand flopping; proximal joints get a lighter nullspace pull.
+    # Proximal nullspace: light shoulders, strong elbow → bent-arm preference so
+    # the arm retracts when the target moves closer/higher (avoids stuck stretch).
     n_arm = int(self._left_ids.numel())
-    null_w = torch.ones(n_arm, device=self.device, dtype=torch.float32)
-    if n_arm >= 7:
-      null_w[4:7] = 2.5
+    null_w = torch.zeros(n_arm, device=self.device, dtype=torch.float32)
+    null_w[0:3] = 0.2
+    if n_arm >= 4:
+      null_w[3] = 1.8  # elbow
+    if n_arm >= 7 and not self._lock_wrist:
+      null_w[4:7] = 2.0
     self._null_w = null_w
+    # Proximal DOFs for position IK when wrists are locked (shoulder×3 + elbow).
+    self._n_prox = 4 if (self._lock_wrist and n_arm >= 7) else n_arm
 
   @property
   def action_dim(self) -> int:
@@ -194,6 +215,11 @@ class EeResidualIkAction(ActionTerm):
     arm = grasp.target_arm.squeeze(-1)
     # Reach mode only (is_target=1). Waist-only / loco keep arms at default.
     is_reach = grasp.is_target.squeeze(-1) > 0.5
+    # Play demo: hold arms until Viser "Arm chase" is ON (set target first).
+    if self._require_play_arm_chase and not bool(
+      getattr(self._env, "_homie_play_arm_chase", False)
+    ):
+      is_reach = torch.zeros_like(is_reach)
     left_mask = is_reach & (arm > 0.5) & (arm < 1.5)
     right_mask = is_reach & (arm > 1.5)
 
@@ -210,6 +236,7 @@ class EeResidualIkAction(ActionTerm):
         joint_ids=self._left_ids,
         body_ids=self._left_bodies,
         ee_body=self._left_ee,
+        palm_offset=self._left_palm_off,
         target_base=tgt_b,
         limits=self._left_lim,
         cmd_buf=self._left_cmd,
@@ -221,6 +248,7 @@ class EeResidualIkAction(ActionTerm):
         joint_ids=self._right_ids,
         body_ids=self._right_bodies,
         ee_body=self._right_ee,
+        palm_offset=self._right_palm_off,
         target_base=tgt_b,
         limits=self._right_lim,
         cmd_buf=self._right_cmd,
@@ -251,6 +279,7 @@ class EeResidualIkAction(ActionTerm):
     joint_ids: torch.Tensor,
     body_ids: torch.Tensor,
     ee_body: int,
+    palm_offset: torch.Tensor,
     target_base: torch.Tensor,
     limits: torch.Tensor,
     cmd_buf: torch.Tensor,
@@ -265,20 +294,56 @@ class EeResidualIkAction(ActionTerm):
     # the arm can thrash.
     q0 = self.robot.data.joint_pos[ids][:, joint_ids].clone()
     q = q0.clone()
-    q_pref = self.robot.data.default_joint_pos[ids][:, joint_ids]
-    ee_w = self.robot.data.body_link_pos_w[ids, ee_body]
+    q_default = self.robot.data.default_joint_pos[ids][:, joint_ids]
+    # Nullspace preference: Homie-style bent elbow (not fully stretched).
+    q_pref = q_default.clone()
+    if int(joint_ids.numel()) >= 4 and abs(self._elbow_pref) > 1e-6:
+      q_pref[:, 3] = self._elbow_pref
+    # Hold wrists at default pose for the whole solve (orientation lock).
+    n_prox = int(self._n_prox)
+    if self._lock_wrist and n_prox < int(joint_ids.numel()):
+      q[:, n_prox:] = q_default[:, n_prox:]
+      q0[:, n_prox:] = q_default[:, n_prox:]
+      q_pref[:, n_prox:] = q_default[:, n_prox:]
+    # Palm TCP in world (hand center), not wrist_yaw origin.
+    ee_w = link_point_pos_w(self.robot, ee_body, palm_offset, ids)
     ee_b = world_to_base(self.robot, ee_w, ids)
     # Homie: pos_error = (target - ee) + delta_e3, then clip ±0.1.
     err = (target_base[ids] - ee_b) + self._delta[ids]
+    # Open-crate lift-over + SDF repulsion so IK does not plow through walls.
+    if self._avoid_container:
+      from homierl_mjlab.mdp.sdf_observations import container_ik_avoidance_bias
+
+      grasp = self._env.command_manager.get_term("grasp")
+      err = err + container_ik_avoidance_bias(
+        self._env,
+        ids,
+        ee_w,
+        grasp.target_pos_w[ids],
+        d_safe=self._avoid_d_safe,
+        lift_margin=self._avoid_lift_margin,
+        xy_slow=self._avoid_xy_slow,
+        repulsion_gain=self._avoid_repulsion,
+      )
     err = torch.maximum(torch.minimum(err, self._err_clip), -self._err_clip)
 
     m = int(ids.numel())
     n_arm = int(joint_ids.numel())
     eye3 = torch.eye(3, device=self.device, dtype=q.dtype).expand(m, 3, 3)
-    eye_n = torch.eye(n_arm, device=self.device, dtype=q.dtype).expand(m, n_arm, n_arm)
-    J = self._geometric_jacobian_base(ids, body_ids, ee_body)
+    eye_n = torch.eye(n_prox, device=self.device, dtype=q.dtype).expand(m, n_prox, n_prox)
+    J_full = self._geometric_jacobian_base(ids, body_ids, ee_w)
+    J = J_full[:, :, :n_prox]
     ee = ee_b
-    null_w = self._null_w.to(dtype=q.dtype)
+    null_w = self._null_w[:n_prox].to(dtype=q.dtype)
+    # Retract boost when EE is farther from shoulder than the target (over-reach).
+    sh_w = self.robot.data.body_link_pos_w[ids, int(body_ids[0].item())]
+    grasp = self._env.command_manager.get_term("grasp")
+    tgt_w = grasp.target_pos_w[ids]
+    d_ee = torch.linalg.norm(ee_w - sh_w, dim=-1)
+    d_tgt = torch.linalg.norm(tgt_w - sh_w, dim=-1)
+    over = torch.clamp(d_ee - d_tgt, min=0.0)
+    null_scale = 1.0 + self._retract_boost * (over / 0.20).clamp(max=2.0)
+    null_k = self._null_k * null_scale  # (M,)
     for _ in range(self._ik_iters):
       Jt = J.transpose(1, 2)
       JJt = torch.bmm(J, Jt)
@@ -287,27 +352,37 @@ class EeResidualIkAction(ActionTerm):
       step_goal = ee_b + err
       delta_x = torch.linalg.solve(A, (step_goal - ee).unsqueeze(-1)).squeeze(-1)
       dq = torch.bmm(Jt, delta_x.unsqueeze(-1)).squeeze(-1)
-      # Nullspace → default pose (heavier on wrists) so the hand does not droop.
+      # Proximal nullspace (bent-elbow preference); wrists stay hard-locked.
       if self._null_k > 0.0:
-        # J# ≈ J^T (JJ^T + λ²I)^{-1}; N = I - J# J.
         A_inv_J = torch.linalg.solve(A, J)
         Jpinv = torch.bmm(Jt, A_inv_J)
         N = eye_n - Jpinv
-        dq_null = self._null_k * null_w * (q_pref - q)
+        dq_null = null_w * (q_pref[:, :n_prox] - q[:, :n_prox])
+        dq_null = null_k.unsqueeze(-1) * dq_null
         dq = dq + torch.bmm(N, dq_null.unsqueeze(-1)).squeeze(-1)
       dq = torch.clamp(dq, -self._max_dq, self._max_dq)
-      q = q + dq
+      q[:, :n_prox] = q[:, :n_prox] + dq
       ee = ee + torch.bmm(J, dq.unsqueeze(-1)).squeeze(-1)
 
-    # Cap total IK solution vs measured q (multi-iter can still yank).
+    # Cap total IK solution vs measured q (proximal only).
     if self._max_sol_dq > 0.0:
-      q = q0 + torch.clamp(q - q0, -self._max_sol_dq, self._max_sol_dq)
+      dq_tot = torch.clamp(q[:, :n_prox] - q0[:, :n_prox], -self._max_sol_dq, self._max_sol_dq)
+      q[:, :n_prox] = q0[:, :n_prox] + dq_tot
+    # Hard lock wrists to default after IK.
+    if self._lock_wrist and n_prox < n_arm:
+      q[:, n_prox:] = q_default[:, n_prox:]
     # Homie: clamp to dof limits after IK.
     q = torch.maximum(torch.minimum(q, limits[:, 1]), limits[:, 0])
+    if self._lock_wrist and n_prox < n_arm:
+      q[:, n_prox:] = q_default[:, n_prox:]
 
-    # Blend toward IK solution (smooth vs hard snap).
+    # Blend proximal toward IK; keep wrists locked at default (no lag).
     a = self._blend
-    cmd_buf[ids] = (1.0 - a) * cmd_buf[ids] + a * q
+    cmd_buf[ids, :n_prox] = (1.0 - a) * cmd_buf[ids, :n_prox] + a * q[:, :n_prox]
+    if self._lock_wrist and n_prox < n_arm:
+      cmd_buf[ids, n_prox:] = q_default[:, n_prox:]
+    else:
+      cmd_buf[ids, n_prox:] = (1.0 - a) * cmd_buf[ids, n_prox:] + a * q[:, n_prox:]
     out_targets = out_targets.clone()
     out_targets[ids] = cmd_buf[ids]
     return out_targets
@@ -316,10 +391,9 @@ class EeResidualIkAction(ActionTerm):
     self,
     ids: torch.Tensor,
     body_ids: torch.Tensor,
-    ee_body: int,
+    ee_w: torch.Tensor,
   ) -> torch.Tensor:
-    """Positional Jacobian in Homie base frame ``(M, 3, n_arm)``."""
-    ee_w = self.robot.data.body_link_pos_w[ids, ee_body]
+    """Positional Jacobian of point ``ee_w`` in Homie base frame ``(M, 3, n_arm)``."""
     n_arm = int(body_ids.numel())
     J_w = torch.zeros(ids.numel(), 3, n_arm, device=self.device, dtype=ee_w.dtype)
     for i in range(n_arm):
@@ -354,11 +428,25 @@ class EeResidualIkActionCfg(ActionTermCfg):
   ik_iterations: int = 4
   # 1.0 = apply IK q immediately; lower = interpolate (play / soft start).
   joint_target_blend: float = 0.35
-  # Light pull on redundant DOFs (esp. wrists). Keep small — damped J# makes
-  # N imperfect, and a large gain fights the position task (arm looks stuck).
-  nullspace_gain: float = 0.1
+  # Proximal nullspace toward bent-elbow preference (works with lock_wrist).
+  nullspace_gain: float = 0.12
+  # Homie reach elbow rest (~0.8 rad). Pulls arm out of full extension.
+  elbow_pref: float = 0.8
+  # Extra nullspace when ||EE-shoulder|| > ||target-shoulder|| (over-reach).
+  retract_nullspace_boost: float = 2.5
+  # Hard-hold wrist_roll/pitch/yaw at default; IK only on shoulder+elbow.
+  lock_wrist: bool = True
+  # IK-layer open-crate avoidance (lift-over + SDF repulsion). Reward still
+  # learns residual clearance; this stops the chase from ignoring walls.
+  avoid_container: bool = True
+  avoid_d_safe: float = 0.05
+  avoid_lift_margin: float = 0.05
+  avoid_xy_slow: float = 0.25
+  avoid_repulsion_gain: float = 1.0
   # If False, ignore policy EE residual (recommended for play on phase-2 ckpt).
   use_policy_delta: bool = True
+  # Play demo: IK only runs when env._homie_play_arm_chase is True.
+  require_play_arm_chase: bool = False
   fd_eps: float = 1e-3
 
   def build(self, env: ManagerBasedRlEnv) -> EeResidualIkAction:

@@ -293,7 +293,7 @@ class TwistHeightCommand(UniformVelocityCommand):
         max=z_hi,
         step=0.01,
         initial_value=0.3,
-        hint="target_z<=0 → h_ref=clamp(0.74+z+0.10) (10cm above target).",
+        hint="target_z<=0 → h_ref=clamp(0.74+z+href_above) (phase1 10cm / phase2+ 5cm).",
       )
       h_ref_out = server.gui.add_number(
         "h_ref from target_z (m)",
@@ -330,8 +330,9 @@ class TwistHeightCommand(UniformVelocityCommand):
 
   def _play_h_ref(self, tz: float) -> float:
     base = float(self.cfg.base_height_target)
+    above = float(getattr(self.cfg, "href_above_target", 0.10))
     if tz <= 0.0:
-      return float(max(0.25, min(0.74, base + tz + 0.10)))
+      return float(max(0.25, min(0.74, base + tz + above)))
     return base
 
   def compute(
@@ -388,6 +389,8 @@ class TwistHeightCommandCfg(UniformVelocityCommandCfg):
 
   ranges: Ranges  # type: ignore[assignment]
   base_height_target: float = 0.74
+  # Meters above world target when is_target_height and tz<=0 (phase-1: 0.10).
+  href_above_target: float = 0.10
   # Homie ``target_command_ranges.target_pos_z`` (1jieduan / config1).
   pos_z: tuple[float, float] = (-1.0, 0.2)
 

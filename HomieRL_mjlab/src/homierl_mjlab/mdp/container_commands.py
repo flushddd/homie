@@ -15,8 +15,9 @@ move the grasp below/farther than the default hanging EE before placing the crat
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -30,6 +31,8 @@ from homierl_mjlab.robot.container_spec import (
 )
 
 if TYPE_CHECKING:
+  import viser
+
   from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 
 # Phase-1/2: placeholder zeros (no container signal yet).
@@ -66,6 +69,9 @@ class ContainerGeometryCommand(CommandTerm):
     # Expand per-world geom fields once so Viser rebuilds wall meshes when
     # sync_walls_to_sim changes size/local pos (closed crate, not baked defaults).
     self._geom_fields_ready = False
+    # Viser play: optional Show-container checkbox.
+    self._gui_show: Any | None = None
+    self._gui_get_env_idx: Callable[[], int] | None = None
 
   @property
   def command(self) -> torch.Tensor:
@@ -414,12 +420,94 @@ class ContainerGeometryCommand(CommandTerm):
     self.metrics["container_h"][:] = self.container[:, 5]
     self.metrics["container_present"][:] = self.present
 
+  def _gui_wants_container(self) -> bool | None:
+    """None = no GUI; else checkbox value."""
+    if self._gui_show is None:
+      return None
+    return bool(self._gui_show.value)
+
+  def _apply_gui_presence(self) -> None:
+    """Play: force viewed-env present from the Show-container checkbox."""
+    want = self._gui_wants_container()
+    if want is None or self._gui_get_env_idx is None:
+      return
+    idx = int(self._gui_get_env_idx())
+    ids = torch.tensor([idx], device=self.device, dtype=torch.long)
+    if want:
+      self.present[idx] = 1.0
+      # First enable / empty geom: place a mid-range crate at the grasp.
+      if float(self.container[idx, 5].item()) < 1e-4:
+        self._place_fixed_crate_at_grasp(ids)
+    else:
+      self.present[idx] = 0.0
+
+  def _place_fixed_crate_at_grasp(self, env_ids: torch.Tensor) -> None:
+    """Fill play crate geometry around current grasp (no relocate)."""
+    if len(env_ids) == 0:
+      return
+    grasp = self._env.command_manager.get_term("grasp")
+    tw = grasp.target_pos_w[env_ids]
+    yaw = self.ref_yaw[env_ids]
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    dx = tw[:, 0] - self.ref_origin_xy[env_ids, 0]
+    dy = tw[:, 1] - self.ref_origin_xy[env_ids, 1]
+    x_t = c * dx + s * dy
+    y_t = -s * dx + c * dy
+    inner_x = 0.5 * (
+      float(self.cfg.inner_size_xy[0]) + float(self.cfg.inner_size_xy[1])
+    )
+    inner_y = inner_x
+    h_c = 0.5 * (float(self.cfg.height[0]) + float(self.cfg.height[1]))
+    t_wall = 0.5 * (float(self.cfg.thickness[0]) + float(self.cfg.thickness[1]))
+    t_bottom = 0.5 * (
+      float(self.cfg.bottom_thickness[0]) + float(self.cfg.bottom_thickness[1])
+    )
+    self._grasp_offset_xy[env_ids] = 0.0
+    self.container[env_ids, 0] = x_t
+    self.container[env_ids, 1] = y_t
+    self.container[env_ids, 2] = tw[:, 2] - 0.02
+    self.container[env_ids, 3] = inner_x
+    self.container[env_ids, 4] = inner_y
+    self.container[env_ids, 5] = h_c
+    self.container[env_ids, 6] = 1.0
+    self.container[env_ids, 7] = 0.0
+    self.container[env_ids, 8] = t_wall
+    self.container[env_ids, 9] = t_bottom
+    self.present[env_ids] = 1.0
+
+  def create_gui(
+    self,
+    name: str,
+    server: viser.ViserServer,
+    get_env_idx: Callable[[], int],
+    on_change: Callable[[], None] | None = None,
+    request_action: Callable[[str, Any], None] | None = None,
+  ) -> None:
+    """Viser play: toggle whether the closed crate is present on the viewed env."""
+    del on_change, request_action
+    if not bool(self.cfg.sample_around_grasp):
+      return
+    if CONTAINER_ENTITY_NAME not in self._env.scene.entities:
+      return
+    with server.gui.add_folder(name.capitalize()):
+      show = server.gui.add_checkbox(
+        "Show container",
+        initial_value=True,
+        hint="ON=closed crate around grasp target. OFF=hide crate (no SDF walls).",
+      )
+    self._gui_show = show
+    self._gui_get_env_idx = get_env_idx
+
   def _update_command(self, env_ids: torch.Tensor | None) -> None:
     # Re-sync every step: reset_scene_to_default re-buries mocap walls on reset.
     # Also re-center on grasp so play Viser / arm crawl keep a closed bin.
     del env_ids
+    self._apply_gui_presence()
     if self.cfg.sample_around_grasp and bool(self.present.any()):
       self._follow_grasp_for_present()
+      self.sync_walls_to_sim()
+    elif self._gui_show is not None:
+      # Checkbox may have just turned OFF — bury walls for the viewed env.
       self.sync_walls_to_sim()
     elif bool(self.present.any()):
       self.sync_walls_to_sim()

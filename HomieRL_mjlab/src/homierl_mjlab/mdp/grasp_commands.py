@@ -160,7 +160,9 @@ class GraspTargetCommand(CommandTerm):
     self._gui_syncing_sliders: bool = False
     # Play: ramp body-frame target toward slider/gizmo (avoid Enable snap).
     self._gui_was_active: bool = False
-    self._gui_smooth_alpha: float = 0.15
+    # Lower = slower target easing (better for demo recording).
+    self._gui_smooth_alpha: float = 0.06
+    self._gui_arm_chase: Any | None = None
     self._waist_pitch_joint_id: int | None = None
     try:
       ids, _ = self.robot.find_joints("waist_pitch_joint", preserve_order=True)
@@ -587,7 +589,7 @@ class GraspTargetCommand(CommandTerm):
       self._refresh_world_target(env_ids)
     self._update_extend_dist()
     self._apply_twist_override()
-    # Target-height squat: reward h_ref = base+z+0.10 via _command_height_target.
+    # Target-height squat: reward h_ref = base+z+href_above via _command_height_target.
     if z <= 0.0:
       try:
         twist = self._env.command_manager.get_term("twist")
@@ -610,13 +612,19 @@ class GraspTargetCommand(CommandTerm):
     return float(body[0].item()), float(body[1].item()), float(z)
 
   def _seed_gui_target_from_ee(self, idx: int) -> None:
-    """On Enable edge: start target at current EE so approach is gradual."""
+    """On Enable edge: start target at current palm so approach is gradual."""
+    from homierl_mjlab.mdp.palm import link_point_pos_w, palm_offset_tensor
+
     arm = float(self.target_arm[idx, 0].item())
     ee_body = self._left_ee_id if arm < 1.5 else self._right_ee_id
     if ee_body is None:
       p = self.robot.data.root_link_pos_w[idx]
     else:
-      p = self.robot.data.body_link_pos_w[idx, ee_body]
+      off = palm_offset_tensor(
+        self.device, torch.float32, left=(arm < 1.5)
+      )
+      ids = torch.tensor([idx], device=self.device, dtype=torch.long)
+      p = link_point_pos_w(self.robot, ee_body, off, ids)[0]
     x, y, z = self._body_xyz_from_world(
       idx, float(p[0].item()), float(p[1].item()), float(p[2].item())
     )
@@ -768,8 +776,20 @@ class GraspTargetCommand(CommandTerm):
       enabled = server.gui.add_checkbox(
         "Enable waist target",
         initial_value=False,
-        hint="OFF=loco (Twist). ON=waist mode + XYZ gizmo: zeros vel, drag target in 3D.",
+        hint="OFF=loco (Twist). ON=waist/reach mode + XYZ gizmo. Set target first, then Arm chase.",
       )
+      arm_chase = server.gui.add_checkbox(
+        "Arm chase (slow)",
+        initial_value=False,
+        hint="OFF=hold arms (pose target freely). ON=slow IK toward target — for demo recording.",
+      )
+      self._env._homie_play_arm_chase = False
+
+      @arm_chase.on_update
+      def _(_ev, _ac=arm_chase, _env=self._env) -> None:
+        _env._homie_play_arm_chase = bool(_ac.value)
+
+      self._gui_arm_chase = arm_chase
       sx = server.gui.add_slider(
         "target_x (body)",
         min=x_lo,

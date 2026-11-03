@@ -26,10 +26,11 @@ _QUERY_CACHE: dict[tuple[str, int], torch.Tensor] = {}
 _ARM_SPHERES = (
   ("left_shoulder_pitch_link", (0.0, 0.05, 0.0), 0.06),
   ("left_elbow_link", (0.0, 0.0, 0.0), 0.055),
-  ("left_wrist_yaw_link", (0.0, 0.0, 0.0), 0.05),
+  # Palm TCP (Inspire palm sensor offset on wrist_yaw), not wrist origin.
+  ("left_wrist_yaw_link", (0.1611, -0.012296, 0.00036819), 0.05),
   ("right_shoulder_pitch_link", (0.0, -0.05, 0.0), 0.06),
   ("right_elbow_link", (0.0, 0.0, 0.0), 0.055),
-  ("right_wrist_yaw_link", (0.0, 0.0, 0.0), 0.05),
+  ("right_wrist_yaw_link", (0.1611, 0.012296, 0.00036819), 0.05),
 )
 
 
@@ -128,6 +129,8 @@ def arm_clearance_field(
   robot = env.scene["robot"]
   cont = env.command_manager.get_term(command_name)
   bnames = list(robot.body_names)
+  from mjlab.utils.lab_api.math import quat_apply
+
   centers = []
   radii = []
   for link, offset, radius in _ARM_SPHERES:
@@ -135,8 +138,9 @@ def arm_clearance_field(
       continue
     bi = bnames.index(link)
     pos = robot.data.body_link_pos_w[:, bi]
+    quat = robot.data.body_link_quat_w[:, bi]
     off = torch.tensor(offset, device=env.device, dtype=pos.dtype)
-    centers.append(pos + off.unsqueeze(0))
+    centers.append(pos + quat_apply(quat, off.expand(pos.shape[0], 3)))
     radii.append(radius)
   if not centers:
     return torch.zeros(env.num_envs, 1, device=env.device)
@@ -163,7 +167,9 @@ def ee_target_error(
   env: ManagerBasedRlEnv,
   grasp_command_name: str = "grasp",
 ) -> torch.Tensor:
-  """Base-frame EE→anchor error for active arm (3-D), zeros if no arm."""
+  """Base-frame palm→anchor error for active arm (3-D), zeros if no arm."""
+  from homierl_mjlab.mdp.palm import link_point_pos_w, palm_offset_tensor
+
   robot = env.scene["robot"]
   grasp = env.command_manager.get_term(grasp_command_name)
   bnames = list(robot.body_names)
@@ -178,13 +184,130 @@ def ee_target_error(
     else bnames.index("right_elbow_link")
   )
   arm = grasp.target_arm.squeeze(-1)
-  ee_w = torch.where(
-    (arm < 1.5).unsqueeze(-1),
-    robot.data.body_link_pos_w[:, left_i],
-    robot.data.body_link_pos_w[:, right_i],
-  )
+  left_off = palm_offset_tensor(env.device, torch.float32, left=True)
+  right_off = palm_offset_tensor(env.device, torch.float32, left=False)
+  left_w = link_point_pos_w(robot, left_i, left_off)
+  right_w = link_point_pos_w(robot, right_i, right_off)
+  ee_w = torch.where((arm < 1.5).unsqueeze(-1), left_w, right_w)
   ee_b = world_to_base(robot, ee_w)
   tgt_b = world_to_base(robot, grasp.target_pos_w)
   err = tgt_b - ee_b
   active = (arm > 0.5).float().unsqueeze(-1)
   return err * active
+
+
+def container_ik_avoidance_bias(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  ee_w: torch.Tensor,
+  target_w: torch.Tensor,
+  *,
+  command_name: str = "container",
+  d_safe: float = 0.05,
+  lift_margin: float = 0.05,
+  xy_slow: float = 0.25,
+  repulsion_gain: float = 1.0,
+  d_max: float = 0.40,
+  fd_eps: float = 0.01,
+) -> torch.Tensor:
+  """Base-frame bias added to IK Cartesian error for open-top crate avoidance.
+
+  1. **Lift-over**: while EE is below the rim, chase a waypoint above the rim
+     and slow XY motion so the arm does not plow through the wall.
+  2. **SDF repulsion**: finite-difference grad of wall distance at the EE;
+     push out when ``phi < d_safe``.
+  """
+  from homierl_mjlab.mdp.base_frame import rotate_world_to_base
+
+  m = int(env_ids.numel())
+  device = ee_w.device
+  dtype = ee_w.dtype
+  zero = torch.zeros(m, 3, device=device, dtype=dtype)
+  if m == 0:
+    return zero
+
+  cont = env.command_manager.get_term(command_name)
+  present = cont.present[env_ids] > 0.5
+  if not bool(present.any()):
+    return zero
+
+  robot = env.scene["robot"]
+  cx, cy, z_b, inner_x, inner_y, h_c, t_wall = _container_world_params(cont)
+  cx_i = cx[env_ids]
+  cy_i = cy[env_ids]
+  z_b_i = z_b[env_ids]
+  inner_x_i = inner_x[env_ids]
+  inner_y_i = inner_y[env_ids]
+  h_c_i = h_c[env_ids]
+  t_wall_i = t_wall[env_ids]
+  rim_z = z_b_i + h_c_i
+  half_in_x = 0.5 * inner_x_i
+  half_in_y = 0.5 * inner_y_i
+
+  # --- Lift-over waypoint (world) ---
+  wp = target_w.clone()
+  below = ee_w[:, 2] < (rim_z + float(lift_margin))
+  # Outside inner cavity in XY (still approaching / skirting walls).
+  outside = (torch.abs(ee_w[:, 0] - cx_i) > half_in_x) | (
+    torch.abs(ee_w[:, 1] - cy_i) > half_in_y
+  )
+  lift = present & below
+  skirt = lift & outside
+  # Raise waypoint above rim until EE clears.
+  wp[:, 2] = torch.where(
+    lift, torch.maximum(wp[:, 2], rim_z + float(lift_margin)), wp[:, 2]
+  )
+  # While skirting below the rim, only creep in XY toward the target.
+  creep = float(xy_slow)
+  wp_xy = ee_w[:, :2] + creep * (target_w[:, :2] - ee_w[:, :2])
+  wp[:, 0] = torch.where(skirt, wp_xy[:, 0], wp[:, 0])
+  wp[:, 1] = torch.where(skirt, wp_xy[:, 1], wp[:, 1])
+
+  wp_b = world_to_base(robot, wp, env_ids)
+  ee_b = world_to_base(robot, ee_w, env_ids)
+  tgt_b = world_to_base(robot, target_w, env_ids)
+  # Bias = (waypoint - ee) - (target - ee) = waypoint - target in base.
+  lift_bias = (wp_b - tgt_b) * present.unsqueeze(-1).to(dtype=dtype)
+
+  # --- SDF repulsion at EE ---
+  pts = ee_w.unsqueeze(1)  # (M,1,3)
+  phi, _ = query_open_box_distance(
+    pts,
+    present=cont.present[env_ids],
+    cx=cx_i,
+    cy=cy_i,
+    z_b=z_b_i,
+    inner_x=inner_x_i,
+    inner_y=inner_y_i,
+    h_c=h_c_i,
+    t_wall=t_wall_i,
+    d_max=d_max,
+  )
+  phi0 = phi[:, 0]
+  eps = float(fd_eps)
+  eye = torch.eye(3, device=device, dtype=dtype)
+  grads = []
+  for ax in range(3):
+    pts_d = pts + eps * eye[ax].view(1, 1, 3)
+    phi_d, _ = query_open_box_distance(
+      pts_d,
+      present=cont.present[env_ids],
+      cx=cx_i,
+      cy=cy_i,
+      z_b=z_b_i,
+      inner_x=inner_x_i,
+      inner_y=inner_y_i,
+      h_c=h_c_i,
+      t_wall=t_wall_i,
+      d_max=d_max,
+    )
+    grads.append((phi_d[:, 0] - phi0) / eps)
+  grad_w = torch.stack(grads, dim=-1)
+  grad_n = torch.linalg.norm(grad_w, dim=-1, keepdim=True).clamp(min=1e-6)
+  grad_hat_w = grad_w / grad_n
+  viol = torch.clamp(float(d_safe) - phi0, min=0.0)
+  rep_w = (float(repulsion_gain) * viol).unsqueeze(-1) * grad_hat_w
+  rep_b = rotate_world_to_base(robot, rep_w, env_ids)
+  rep_b = rep_b * present.unsqueeze(-1).to(dtype=dtype)
+
+  return lift_bias + rep_b

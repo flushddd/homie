@@ -105,14 +105,16 @@ def _command_height_target(
   env: ManagerBasedRlEnv,
   command_name: str,
   base_height_target: float,
+  href_above_target: float = 0.10,
 ) -> torch.Tensor:
   """Absolute base-height target (``tracking_base_height`` / ``lin_vel_z``).
 
   Default: ``base + twist_height_offset``.
-  When ``is_target_height`` and body-frame ``target_z <= 0``: track **10 cm
-  above** the target (world target ≈ ``base + tz``)::
+  When ``is_target_height`` and body-frame ``target_z <= 0``: track
+  ``href_above_target`` meters **above** the world target
+  (``base + tz``), e.g. phase-1 0.10 / phase-2+ 0.05::
 
-      h_ref = clamp(base + tz + 0.10, 0.25, 0.74)
+      h_ref = clamp(base + tz + href_above_target, 0.25, 0.74)
 
   If ``target_z > 0``: keep standing ``base`` (0.74).
   Height obs stays at base when ith (Homie); only the reward target changes.
@@ -134,9 +136,10 @@ def _command_height_target(
   if not torch.any(mask):
     return h
   base = float(base_height_target)
+  above = float(href_above_target)
   h_ref = torch.where(
     tz <= 0.0,
-    torch.clamp(tz + base + 0.10, min=0.25, max=0.74),
+    torch.clamp(tz + base + above, min=0.25, max=0.74),
     torch.full_like(tz, base),
   )
   return torch.where(mask, h_ref, h)
@@ -202,12 +205,13 @@ def lin_vel_z(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
   """Penalize vertical base velocity only near standing height (Homie gate)."""
   asset: Entity = env.scene[asset_cfg.name]
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
   return torch.square(asset.data.root_link_lin_vel_b[:, 2]) * gate
 
@@ -233,13 +237,14 @@ def tracking_base_height(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   ankle_sole_distance: float = 0.02,
   height_error_scale: float = 4.0,
   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
   """Homie ``r_height``: ``exp(-|h - h*| * 4)``."""
   asset: Entity = env.scene[asset_cfg.name]
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   try:
     base_height = _base_height_from_feet(asset, ankle_sole_distance)
   except Exception:
@@ -257,6 +262,7 @@ def deviation_hip_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot",
@@ -265,7 +271,7 @@ def deviation_hip_joint(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
   err = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[
     :, asset_cfg.joint_ids
@@ -277,6 +283,7 @@ def deviation_ankle_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot", joint_names=(".*_ankle_roll_joint",)
@@ -284,7 +291,7 @@ def deviation_ankle_joint(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
   err = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[
     :, asset_cfg.joint_ids
@@ -296,6 +303,7 @@ def deviation_knee_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot", joint_names=(".*_knee_joint",)
   ),
@@ -303,7 +311,7 @@ def deviation_knee_joint(
   """Homie ``r_knee``: |(q_norm - 0.5) * height_error| summed over knees."""
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   # Homie: height_error = root_states[:,2] - h_target
   height_error = asset.data.root_link_pos_w[:, 2] - h_target
 
@@ -396,13 +404,13 @@ def reach_success(
 def clearance_penalty(
   env: ManagerBasedRlEnv,
   command_name: str = "container",
-  d_safe: float = 0.03,
+  d_safe: float = 0.05,
   d_max: float = 0.40,
 ) -> torch.Tensor:
   """Arm–wall clearance penalty, O(1) like ``reach_ee_position``.
 
-  Violation is normalized by ``d_safe`` so a full breach ≈ −1 before weight,
-  matching the scale of the reach exp reward (peer, not subordinate).
+  Uses the **worst** arm sphere (not the mean) so one link clipping the rim
+  is not washed out by free spheres. Violation / ``d_safe`` → full breach ≈ −1.
   """
   from homierl_mjlab.mdp.sdf_observations import arm_clearance_field
 
@@ -411,10 +419,11 @@ def clearance_penalty(
   d_s = max(float(d_safe), 1e-6)
   # 0 = at/above safe margin; 1 = penetrating by ≥ d_safe.
   viol_n = torch.clamp(d_s - c_m, min=0.0) / d_s
+  worst = torch.amax(viol_n * viol_n, dim=-1)
   cont = env.command_manager.get_term(command_name)
   present = cont.present
   active = _reach_active_mask(env)
-  return -torch.mean(viol_n * viol_n, dim=-1) * present * active
+  return -worst * present * active
 
 
 def ee_residual_l2(env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -665,6 +674,7 @@ def feet_clearance(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   clearance_height_target: float = 0.14,
   stand_gate: float = 0.71,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
@@ -674,7 +684,7 @@ def feet_clearance(
   """Penalize foot height error while swinging (Homie feet_clearance)."""
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_gate).float()
 
   foot_z = asset.data.site_pos_w[:, asset_cfg.site_ids, 2]
@@ -694,6 +704,7 @@ def feet_distance_lateral(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   least: float = 0.2,
   most: float = 0.35,
   stand_height_threshold: float = 0.735,
@@ -703,7 +714,7 @@ def feet_distance_lateral(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
 
   root_pos = asset.data.root_link_pos_w[:, 0:3]
@@ -726,6 +737,7 @@ def knee_distance_lateral(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   least: float = 0.2,
   most: float = 0.35,
   stand_height_threshold: float = 0.735,
@@ -741,7 +753,7 @@ def knee_distance_lateral(
 ) -> torch.Tensor:
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
 
   root_pos = asset.data.root_link_pos_w[:, 0:3]
@@ -769,6 +781,7 @@ def feet_parallel(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot", site_names=("left_foot", "right_foot")
@@ -777,7 +790,7 @@ def feet_parallel(
   """Variance of multi-point foot distances — approx with site pair variance proxy."""
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
   feet = asset.data.site_pos_w[:, asset_cfg.site_ids, :]
   # Single pair: use squared height difference as parallel proxy.
@@ -873,12 +886,13 @@ def stand_still(
   sensor_name: str = "feet_ground_contact",
   command_name: str = "twist",
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
 ) -> torch.Tensor:
   # Homie: count feet with low upward GRF as "not firmly planted".
   fz = _foot_grf_z(env, sensor_name)
   light = (fz < 0.1).float().sum(dim=-1)
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   gate = (h_target >= stand_height_threshold).float()
   cmd = env.command_manager.get_command(command_name)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < 0.1).float()
@@ -896,6 +910,7 @@ def stand_sway(
   ),
   cmd_threshold: float = 0.1,
   base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
   stand_height_threshold: float = 0.735,
   waist_vel_weight: float = 1.0,
   waist_pos_weight: float = 0.25,
@@ -912,7 +927,7 @@ def stand_sway(
   asset: Entity = env.scene[asset_cfg.name]
   cmd = env.command_manager.get_command(command_name)
   zero_cmd = (torch.norm(cmd[:, :3], dim=-1) < cmd_threshold).float()
-  h_target = _command_height_target(env, command_name, base_height_target)
+  h_target = _command_height_target(env, command_name, base_height_target, href_above_target)
   stand = (h_target >= stand_height_threshold).float()
   gate = zero_cmd * stand
 
