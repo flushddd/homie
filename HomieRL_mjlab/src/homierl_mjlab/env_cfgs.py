@@ -115,6 +115,16 @@ def _configure_phase_events(cfg: ManagerBasedRlEnvCfg, phase: int) -> None:
     return
 
   # Phase-2: yaw held; roll/pitch from policy. Arms use curriculum above.
+  # Bend reward scale ramps only after height tracking is solid.
+  cfg.events["bump_bend_curriculum"] = EventTermCfg(
+    func=homie_mdp.bump_bend_curriculum_from_tracking,
+    mode="reset",
+    params={
+      "reward_name": "tracking_base_height",
+      "threshold_frac": 0.8,
+      "ratio_step": 0.05,
+    },
+  )
   cfg.events["hold_waist_yaw_default"] = EventTermCfg(
     func=homie_mdp.hold_joints_at_default,
     mode="step",
@@ -190,6 +200,8 @@ def _configure_phase_commands_and_obs(
       reach_reward_name="tracking_x_vel",
       reach_threshold_frac=0.8,
       reach_ratio_step=0.05,
+      # Height-then-bend already learned in phase-2; keep bend fully on.
+      init_bend_ratio=1.0,
     )
     actor_terms["actions"] = ObservationTermCfg(
       func=homie_mdp.padded_last_action,
@@ -258,6 +270,8 @@ def _configure_phase_commands_and_obs(
       resampling_time_range=(4.0, 4.0),
       debug_vis=True,
       base_height_target=0.74,
+      # Start with bend reward off; ramp via tracking_base_height.
+      init_bend_ratio=0.0,
     )
     actor_terms["grasp_target"] = ObservationTermCfg(
       func=homie_mdp.grasp_target_command,
@@ -526,7 +540,13 @@ def homie_g1_flat_env_cfg(
     "deviation_waist_joint": RewardTermCfg(
       func=homie_mdp.deviation_waist_joint,
       weight=-4e-3,
-      params={"command_name": "twist"},
+      params={
+        "command_name": "twist",
+        "base_height_target": 0.74,
+        "height_eps": 0.05,
+        "stop_speed": 0.02,
+        "ankle_sole_distance": 0.02,
+      },
     ),
     "dof_acc": RewardTermCfg(func=homie_mdp.dof_acc_l2, weight=-2.5e-7),
     "dof_pos_limits": RewardTermCfg(func=vel_mdp.joint_pos_limits, weight=-2.0),
@@ -686,7 +706,8 @@ def homie_g1_flat_env_cfg(
     ),
   }
 
-  # Phase-2+: squat h_ref is 5 cm above grasp target (phase-1 keeps 10 cm).
+  # Phase-2+: squat h_ref is 5 cm above grasp target (phase-1 keeps 10 cm);
+  # strengthen height tracking so bend curriculum can gate on it.
   if int(phase) >= 2:
     for _term in cfg.rewards.values():
       params = getattr(_term, "params", None)
@@ -695,6 +716,8 @@ def homie_g1_flat_env_cfg(
     twist = cfg.commands.get("twist")
     if twist is not None and hasattr(twist, "href_above_target"):
       twist.href_above_target = 0.05
+    if "tracking_base_height" in cfg.rewards:
+      cfg.rewards["tracking_base_height"].weight = 3.0
 
   if int(phase) >= 3:
     # Reach ↔ clearance are peers (same weight, both O(1) after normalize).
@@ -799,6 +822,11 @@ def homie_g1_flat_env_cfg(
     grasp = cfg.commands.get("grasp")
     if grasp is not None:
       grasp.resampling_time_range = (1e9, 1e9)
+      # Play: full bend scale so height-gate alone controls bend (no curriculum wait).
+      grasp.init_bend_ratio = 1.0
+    # Don't ramp bend_ratio during play resets.
+    if "bump_bend_curriculum" in cfg.events:
+      cfg.events["bump_bend_curriculum"].params["ratio_step"] = 0.0
     cont = cfg.commands.get("container")
     if cont is not None and int(phase) >= 3:
       # Play: default crate on (Viser "Show container" can toggle); low+far grasp.

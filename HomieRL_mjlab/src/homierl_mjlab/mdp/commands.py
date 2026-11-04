@@ -78,6 +78,7 @@ class TwistHeightCommand(UniformVelocityCommand):
     self._target_height_enabled: viser.GuiCheckboxHandle | None = None
     self._target_z_slider: viser.GuiSliderHandle | None = None
     self._h_ref_readout: Any | None = None
+    self._base_z_readout: Any | None = None
     self._joystick_get_env_idx: Callable[[], int] | None = None
 
   @property
@@ -302,6 +303,13 @@ class TwistHeightCommand(UniformVelocityCommand):
         disabled=True,
         hint="Reward height target when is_target_height.",
       )
+      base_z_out = server.gui.add_number(
+        "base_link height (m)",
+        initial_value=h0,
+        step=0.001,
+        disabled=True,
+        hint="Live root_link_pos_w.z of the selected env.",
+      )
 
       zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
 
@@ -326,6 +334,7 @@ class TwistHeightCommand(UniformVelocityCommand):
     self._target_height_enabled = target_height_on
     self._target_z_slider = target_z
     self._h_ref_readout = h_ref_out
+    self._base_z_readout = base_z_out
     self._joystick_get_env_idx = get_env_idx
 
   def _play_h_ref(self, tz: float) -> float:
@@ -370,6 +379,9 @@ class TwistHeightCommand(UniformVelocityCommand):
         self.is_standing_env[idx] = True
       if self._h_ref_readout is not None:
         self._h_ref_readout.value = base
+    if self._base_z_readout is not None:
+      robot = self._env.scene["robot"]
+      self._base_z_readout.value = float(robot.data.root_link_pos_w[idx, 2].item())
     # Velocity: Enable ON → follow sliders; Enable OFF → force zero (stand still).
     # Previously Enable OFF left random train velocities, so the robot kept walking.
     if self._joystick_active():

@@ -164,6 +164,38 @@ def bump_reach_mode_curriculum_from_tracking(
     )
 
 
+def bump_bend_curriculum_from_tracking(
+  env: ManagerBasedRlEnv,
+  env_ids: torch.Tensor,
+  reward_name: str = "tracking_base_height",
+  threshold_frac: float = 0.8,
+  ratio_step: float = 0.05,
+) -> None:
+  """Phase-2+: ramp waist-bend scale after height tracking is solid.
+
+  Raises ``grasp.bend_ratio`` 0→1 when mean episode ``tracking_base_height``
+  clears ``threshold_frac * weight``. Bend reward terms multiply by this
+  ratio (see ``deviation_waist_joint``); until then waist stays upright via
+  ``zero_loss``.
+  """
+  try:
+    grasp = env.command_manager.get_term("grasp")
+  except Exception:  # noqa: BLE001
+    return
+  if grasp is None or not hasattr(grasp, "bend_ratio"):
+    return
+  got = _episode_mean_reward(env, env_ids, reward_name)
+  if got is None:
+    return
+  mean_ep, weight = got
+  if mean_ep > threshold_frac * weight:
+    grasp.bend_ratio = min(1.0, float(grasp.bend_ratio) + float(ratio_step))
+    log = env.extras.setdefault("log", {})
+    log["Curriculum/bend_ratio"] = torch.tensor(grasp.bend_ratio, device=env.device)
+    if hasattr(grasp, "metrics") and "bend_curriculum" in grasp.metrics:
+      grasp.metrics["bend_curriculum"][:] = grasp.bend_ratio
+
+
 def update_upper_body_pose_curriculum(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor | None,

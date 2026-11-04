@@ -117,6 +117,9 @@ class GraspTargetCommand(CommandTerm):
     # Ratio is bumped from tracking_x_vel (same gate as loco arm curriculum),
     # not wall-clock — see ``bump_reach_mode_curriculum_from_tracking``.
     self.reach_ratio = float(cfg.init_reach_ratio)
+    # Phase-2+: waist-bend reward scale 0→1 after height tracking is solid
+    # (``bump_bend_curriculum_from_tracking`` / ``deviation_waist_joint``).
+    self.bend_ratio = float(cfg.init_bend_ratio)
     self.arm_on = False
     self.waist_on = False
 
@@ -141,6 +144,8 @@ class GraspTargetCommand(CommandTerm):
     self.metrics["extend_dist"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["need_waist"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["waist_curriculum"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["bend_curriculum"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["bend_curriculum"][:] = self.bend_ratio
     if bool(cfg.enable_arm_reach):
       self.metrics["reach_mode_alpha"] = torch.zeros(self.num_envs, device=self.device)
       self.metrics["target_range_alpha"] = torch.zeros(self.num_envs, device=self.device)
@@ -506,6 +511,7 @@ class GraspTargetCommand(CommandTerm):
     self.metrics["grasp_active"][:] = self.is_waist.squeeze(-1)
     self.metrics["extend_dist"][:] = self.extend_dist.squeeze(-1)
     self.metrics["need_waist"][:] = self.need_waist.squeeze(-1)
+    self.metrics["bend_curriculum"][:] = self.bend_ratio
 
   def _update_command(self, env_ids: torch.Tensor | None) -> None:
     del env_ids
@@ -949,6 +955,11 @@ class GraspTargetCommandCfg(CommandTermCfg):
   reach_reward_name: str = "tracking_x_vel"
   reach_threshold_frac: float = 0.8
   reach_ratio_step: float = 0.05
+  # Phase-2+: bend reward scale; bumped from ``tracking_base_height``.
+  init_bend_ratio: float = 0.0
+  bend_reward_name: str = "tracking_base_height"
+  bend_threshold_frac: float = 0.8
+  bend_ratio_step: float = 0.05
 
   def build(self, env: ManagerBasedRlEnv) -> GraspTargetCommand:
     return GraspTargetCommand(self, env)

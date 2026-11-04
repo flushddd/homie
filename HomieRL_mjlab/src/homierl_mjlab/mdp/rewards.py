@@ -440,15 +440,25 @@ def deviation_waist_joint(
   env: ManagerBasedRlEnv,
   command_name: str = "twist",
   grasp_command_name: str = "grasp",
+  base_height_target: float = 0.74,
+  href_above_target: float = 0.10,
+  ankle_sole_distance: float = 0.02,
+  height_eps: float = 0.05,
+  stop_speed: float = 0.02,
   asset_cfg: SceneEntityCfg = SceneEntityCfg(
     "robot", joint_names=("waist_pitch_joint",)
   ),
 ) -> torch.Tensor:
-  """Homie ``_reward_deviation_waist_joint``.
+  """Homie ``_reward_deviation_waist_joint`` with height-then-bend gating.
 
   Prefer live grasp-target flags (``is_waist`` / ``need_waist`` / ``extend_dist``).
   Phase-1 (no grasp): Homie ``is_waist=0`` → no waist bend/zero_loss (only tiny
   first_step term). Do **not** proxy with ``is_height_env`` (that fights squat).
+
+  Bend terms (``waist_loss`` / ``dist_loss``) only when:
+    ``need_waist`` and ``|h - h_ref| < height_eps`` and base XY speed is low,
+  then scaled by grasp ``bend_ratio`` curriculum (0→1). Otherwise waist envs
+  get ``zero_loss`` so the trunk stays upright while height is still tracking.
   """
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
@@ -458,12 +468,13 @@ def deviation_waist_joint(
     need_waist = grasp.need_waist.squeeze(-1)
     reach_mask = grasp.is_reachable.squeeze(-1)
     extend_dist = grasp.extend_dist.squeeze(-1)
+    bend_scale = float(getattr(grasp, "bend_ratio", 1.0))
   else:
     waist_mask = torch.zeros(env.num_envs, device=env.device)
     need_waist = torch.zeros(env.num_envs, device=env.device)
     reach_mask = torch.zeros(env.num_envs, device=env.device)
     extend_dist = torch.zeros(env.num_envs, device=env.device)
-  del command_name  # phase-1 no longer uses height-env proxy
+    bend_scale = 1.0
 
   q = asset.data.joint_pos[:, asset_cfg.joint_ids]
   limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
@@ -471,13 +482,27 @@ def deviation_waist_joint(
   q_max = limits[..., 1]
   joint_deviation = (q - q_min) / (q_max - q_min + 1e-6)
 
+  h_ref = _command_height_target(
+    env, command_name, base_height_target, href_above_target
+  )
+  try:
+    h = _base_height_from_feet(asset, ankle_sole_distance)
+  except Exception:  # noqa: BLE001
+    h = asset.data.root_link_pos_w[:, 2]
+  speed_xy = torch.linalg.norm(asset.data.root_link_lin_vel_b[:, :2], dim=-1)
+  height_ready = (
+    (torch.abs(h - h_ref) < float(height_eps))
+    & (speed_xy < float(stop_speed))
+  ).float()
+  # Soft curriculum: allow bend only after height is on target, then ramp weight.
+  bend_gate = need_waist * height_ready * float(bend_scale)
+
   l = 0.2
   x = torch.clamp(
     extend_dist / l,
     0.0,
     torch.sin(torch.tensor(0.52, device=env.device)),
   )
-  speed_xy = torch.linalg.norm(asset.data.root_link_lin_vel_b[:, :2], dim=-1)
   gate_stop = torch.exp(-(speed_xy / 0.02).pow(2))
   target_waist = torch.clamp(torch.asin(x) / 0.52, 0.0, 1.0) * 0.5 + 0.5
   waist_vel = asset.data.joint_vel[:, asset_cfg.joint_ids].squeeze(-1).abs()
@@ -488,17 +513,17 @@ def deviation_waist_joint(
     torch.relu(target_waist.unsqueeze(-1) - joint_deviation)
     * waist_mask.unsqueeze(-1)
     * (1.0 - reach_mask).unsqueeze(-1)
-    * need_waist.unsqueeze(-1)
+    * bend_gate.unsqueeze(-1)
     * 188
   )
   zero_loss = (
     torch.abs(joint_deviation - 0.5)
-    * (1.0 - need_waist).unsqueeze(-1)
+    * (1.0 - bend_gate).unsqueeze(-1)
     * waist_mask.unsqueeze(-1)
     * 1.5
   )
   dist_loss = (
-    loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * need_waist.unsqueeze(-1) * 5.0
+    loss_dist.unsqueeze(-1) * waist_mask.unsqueeze(-1) * bend_gate.unsqueeze(-1) * 5.0
   )
   first_step_loss = (
     torch.abs(joint_deviation - 0.5) * (1.0 - waist_mask).unsqueeze(-1) * 0.01
