@@ -706,18 +706,24 @@ def homie_g1_flat_env_cfg(
     ),
   }
 
-  # Phase-2+: squat h_ref is 5 cm above grasp target (phase-1 keeps 10 cm);
-  # strengthen height tracking so bend curriculum can gate on it.
+  # Phase-2+: squat h_ref tracks world target (base+tz), no +5cm bias —
+  # so tz≈-0.1 already asks ~10cm squat (was +5cm → only ~5cm, late response).
+  # Phase-1 keeps href_above=0.10. Sharper height tracking for shallow tz.
   if int(phase) >= 2:
     for _term in cfg.rewards.values():
       params = getattr(_term, "params", None)
       if isinstance(params, dict) and "base_height_target" in params:
-        params["href_above_target"] = 0.05
+        params["href_above_target"] = 0.0
     twist = cfg.commands.get("twist")
     if twist is not None and hasattr(twist, "href_above_target"):
-      twist.href_above_target = 0.05
+      twist.href_above_target = 0.0
     if "tracking_base_height" in cfg.rewards:
-      cfg.rewards["tracking_base_height"].weight = 3.0
+      # Sharper shallow-squat tracking: scale 4→6, weight 3→4 so |Δh|~0.1
+      # (tz≈-0.1 with href=0) is not under-penalized vs standing.
+      cfg.rewards["tracking_base_height"].weight = 4.0
+      params = cfg.rewards["tracking_base_height"].params
+      if isinstance(params, dict):
+        params["height_error_scale"] = 6.0
 
   if int(phase) >= 3:
     # Reach ↔ clearance are peers (same weight, both O(1) after normalize).

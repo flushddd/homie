@@ -294,7 +294,7 @@ class TwistHeightCommand(UniformVelocityCommand):
         max=z_hi,
         step=0.01,
         initial_value=0.3,
-        hint="target_z<=0 → h_ref=clamp(0.74+z+href_above) (phase1 10cm / phase2+ 5cm).",
+        hint="target_z<=0 → h_ref=clamp(0.74+z+href_above) (phase1 10cm / phase2+ 0cm).",
       )
       h_ref_out = server.gui.add_number(
         "h_ref from target_z (m)",

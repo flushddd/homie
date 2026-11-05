@@ -112,7 +112,7 @@ def _command_height_target(
   Default: ``base + twist_height_offset``.
   When ``is_target_height`` and body-frame ``target_z <= 0``: track
   ``href_above_target`` meters **above** the world target
-  (``base + tz``), e.g. phase-1 0.10 / phase-2+ 0.05::
+  (``base + tz``), e.g. phase-1 0.10 / phase-2+ 0.0::
 
       h_ref = clamp(base + tz + href_above_target, 0.25, 0.74)
 
