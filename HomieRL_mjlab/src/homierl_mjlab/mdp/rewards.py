@@ -455,11 +455,11 @@ def deviation_waist_joint(
   ``is_waist=0`` → only tiny first_step term.
 
   Sequence (phase-2 intent):
-    1. Track ``h_ref`` with waist held at Homie mid ``joint_deviation=0.5``.
-    2. Only after ``|h-h_ref|<eps`` and base stopped: if **live**
-       shoulder→target still beyond arm reach (``extend_dist>0``), apply bend
-       terms, scaled by ``bend_ratio``. If already reachable after the squat,
-       keep mid — do **not** bend just because resample ``need_waist`` was 1.
+    1. Prefer upright (Homie mid ``joint_deviation=0.5``) when not bending.
+    2. Bend when **live** shoulder→target is beyond arm reach (``extend_dist>0``),
+       scaled by ``bend_ratio``. Soft height weight down-weights bend while far
+       from ``h_ref`` (squat-first), but does **not** hard-block on a tiny
+       speed threshold — that previously left far reaches with only zero_loss.
   """
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
@@ -469,11 +469,13 @@ def deviation_waist_joint(
     reach_mask = grasp.is_reachable.squeeze(-1)
     extend_dist = grasp.extend_dist.squeeze(-1)
     bend_scale = float(getattr(grasp, "bend_ratio", 1.0))
+    need_waist = grasp.need_waist.squeeze(-1)
   else:
     waist_mask = torch.zeros(env.num_envs, device=env.device)
     reach_mask = torch.zeros(env.num_envs, device=env.device)
     extend_dist = torch.zeros(env.num_envs, device=env.device)
     bend_scale = 1.0
+    need_waist = torch.zeros(env.num_envs, device=env.device)
 
   q = asset.data.joint_pos[:, asset_cfg.joint_ids]
   limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
@@ -489,14 +491,17 @@ def deviation_waist_joint(
     h = _base_height_from_feet(asset, ankle_sole_distance)
   except Exception:  # noqa: BLE001
     h = asset.data.root_link_pos_w[:, 2]
+  # Soft height gate (not hard AND with stop_speed): squat-first without
+  # permanently disabling bend on far standing reaches.
+  height_err = torch.abs(h - h_ref)
+  height_w = torch.exp(-((height_err / max(float(height_eps), 1e-3)) ** 2))
+  # Beyond-reach signal: live extend, or resampled need_waist (far XY/3D).
+  live_need = torch.maximum(
+    (extend_dist > 1e-4).float(), need_waist.float()
+  )
+  bend_gate = live_need * height_w * float(bend_scale)
   speed_xy = torch.linalg.norm(asset.data.root_link_lin_vel_b[:, :2], dim=-1)
-  height_ready = (
-    (torch.abs(h - h_ref) < float(height_eps))
-    & (speed_xy < float(stop_speed))
-  ).float()
-  # After height is acquired, bend only if still beyond live arm reach.
-  live_need = (extend_dist > 1e-4).float()
-  bend_gate = height_ready * live_need * float(bend_scale)
+  del stop_speed  # kept in signature for cfg compat; stop used via gate_stop below
 
   l = 0.2
   x = torch.clamp(
