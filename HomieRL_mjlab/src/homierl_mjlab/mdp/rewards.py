@@ -449,29 +449,28 @@ def deviation_waist_joint(
     "robot", joint_names=("waist_pitch_joint",)
   ),
 ) -> torch.Tensor:
-  """Homie ``_reward_deviation_waist_joint`` with height-then-bend gating.
+  """Homie ``_reward_deviation_waist_joint`` with height-then-live-reach gating.
 
-  Prefer live grasp-target flags (``is_waist`` / ``need_waist`` / ``extend_dist``).
-  Phase-1 (no grasp): Homie ``is_waist=0`` → no waist bend/zero_loss (only tiny
-  first_step term). Do **not** proxy with ``is_height_env`` (that fights squat).
+  Prefer live grasp flags (``is_waist`` / ``extend_dist``). Phase-1 (no grasp):
+  ``is_waist=0`` → only tiny first_step term.
 
-  Bend terms (``waist_loss`` / ``dist_loss``) only when:
-    ``need_waist`` and ``|h - h_ref| < height_eps`` and base XY speed is low,
-  then scaled by grasp ``bend_ratio`` curriculum (0→1). Otherwise waist envs
-  get ``zero_loss`` so the trunk stays upright while height is still tracking.
+  Sequence (phase-2 intent):
+    1. Track ``h_ref`` with waist held at Homie mid ``joint_deviation=0.5``.
+    2. Only after ``|h-h_ref|<eps`` and base stopped: if **live**
+       shoulder→target still beyond arm reach (``extend_dist>0``), apply bend
+       terms, scaled by ``bend_ratio``. If already reachable after the squat,
+       keep mid — do **not** bend just because resample ``need_waist`` was 1.
   """
   asset: Entity = env.scene[asset_cfg.name]
   asset_cfg.resolve(env.scene)
   grasp = _grasp_term(env, grasp_command_name)
   if grasp is not None:
     waist_mask = grasp.is_waist.squeeze(-1)
-    need_waist = grasp.need_waist.squeeze(-1)
     reach_mask = grasp.is_reachable.squeeze(-1)
     extend_dist = grasp.extend_dist.squeeze(-1)
     bend_scale = float(getattr(grasp, "bend_ratio", 1.0))
   else:
     waist_mask = torch.zeros(env.num_envs, device=env.device)
-    need_waist = torch.zeros(env.num_envs, device=env.device)
     reach_mask = torch.zeros(env.num_envs, device=env.device)
     extend_dist = torch.zeros(env.num_envs, device=env.device)
     bend_scale = 1.0
@@ -480,6 +479,7 @@ def deviation_waist_joint(
   limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
   q_min = limits[..., 0]
   q_max = limits[..., 1]
+  # Homie: normalize into [0,1]; upright / zero action ↔ mid 0.5.
   joint_deviation = (q - q_min) / (q_max - q_min + 1e-6)
 
   h_ref = _command_height_target(
@@ -494,8 +494,9 @@ def deviation_waist_joint(
     (torch.abs(h - h_ref) < float(height_eps))
     & (speed_xy < float(stop_speed))
   ).float()
-  # Soft curriculum: allow bend only after height is on target, then ramp weight.
-  bend_gate = need_waist * height_ready * float(bend_scale)
+  # After height is acquired, bend only if still beyond live arm reach.
+  live_need = (extend_dist > 1e-4).float()
+  bend_gate = height_ready * live_need * float(bend_scale)
 
   l = 0.2
   x = torch.clamp(
@@ -516,6 +517,7 @@ def deviation_waist_joint(
     * bend_gate.unsqueeze(-1)
     * 188
   )
+  # Homie zero_loss: hold mid (0.5) when not bending.
   zero_loss = (
     torch.abs(joint_deviation - 0.5)
     * (1.0 - bend_gate).unsqueeze(-1)
