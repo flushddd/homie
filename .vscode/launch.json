@@ -341,6 +341,94 @@
         "--checkpoint-file",
         "${input:homiePhase3Checkpoint}"
       ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Checks",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--check"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Smoke (1 env)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "1",
+        "--device",
+        "cuda:0",
+        "--warmup-collect",
+        "20",
+        "--collect-per-iter",
+        "10",
+        "--iters",
+        "2",
+        "--save-every",
+        "1",
+        "--ee-mode",
+        "attractor",
+        "--log-dir",
+        "logs/stage3_bptt_smoke"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train (16)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "16",
+        "--device",
+        "cuda:0",
+        "--warmup-collect",
+        "200",
+        "--collect-per-iter",
+        "50",
+        "--iters",
+        "100",
+        "--save-every",
+        "10",
+        "--ee-mode",
+        "attractor",
+        "--log-dir",
+        "logs/stage3_bptt"
+      ]
     }
   ],
   "compounds": [
@@ -364,6 +452,14 @@
       "name": "HomieRL mjlab: Train Phase3 + TensorBoard",
       "configurations": [
         "HomieRL mjlab: Train Phase3 (4096)",
+        "HomieRL mjlab: TensorBoard"
+      ],
+      "stopAll": true
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train + TensorBoard",
+      "configurations": [
+        "HomieRL mjlab: Stage3 BPTT Train (16)",
         "HomieRL mjlab: TensorBoard"
       ],
       "stopAll": true
@@ -447,6 +543,12 @@
       "type": "promptString",
       "description": "Phase-3 checkpoint path (e.g. logs/rsl_rl/homie_g1/<run>_phase3/model_*.pt)",
       "default": "logs/rsl_rl/homie_g1/"
+    },
+    {
+      "id": "homieStage2CkptForBptt",
+      "type": "promptString",
+      "description": "Frozen phase-2 checkpoint for Stage3 BPTT (full path under HomieRL_mjlab/)",
+      "default": "logs/rsl_rl/homie_g1/phase2/model_15400(2).pt"
     }
   ]
 }
