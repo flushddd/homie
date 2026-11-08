@@ -22,7 +22,11 @@ class TransitionBatch:
 
 
 class EpisodeReplay:
-  """Fixed-capacity circular buffer; window samples stay within one episode."""
+  """Fixed-capacity circular buffer; window samples stay within one episode.
+
+  Collector writes all ``N`` envs each step as one block. Capacity **must** be a
+  multiple of ``N`` so wrap never splits a step (otherwise env stride breaks).
+  """
 
   def __init__(
     self,
@@ -32,22 +36,30 @@ class EpisodeReplay:
     goal_dim: int,
     geom_dim: int,
     device: torch.device,
+    *,
+    num_envs: int = 1,
   ):
-    self.capacity = int(capacity)
+    self.num_envs = max(1, int(num_envs))
+    # Keep stride layout valid across wrap.
+    cap = max(int(capacity), self.num_envs * 16)
+    if cap % self.num_envs != 0:
+      cap = (cap // self.num_envs + 1) * self.num_envs
+    self.capacity = cap
     self.device = device
     self.ptr = 0
     self.size = 0
-    z = lambda d: torch.zeros(capacity, d, device=device)
+    self._steps_written = 0
+    z = lambda d: torch.zeros(cap, d, device=device)
     self.state = z(state_dim)
     self.control = z(control_dim)
     self.next_state = z(state_dim)
-    self.reward = torch.zeros(capacity, device=device)
-    self.terminated = torch.zeros(capacity, device=device)
-    self.truncated = torch.zeros(capacity, device=device)
+    self.reward = torch.zeros(cap, device=device)
+    self.terminated = torch.zeros(cap, device=device)
+    self.truncated = torch.zeros(cap, device=device)
     self.goal = z(goal_dim)
     self.geom = z(geom_dim)
-    self.episode_id = torch.zeros(capacity, device=device, dtype=torch.long)
-    self.env_id = torch.zeros(capacity, device=device, dtype=torch.long)
+    self.episode_id = torch.zeros(cap, device=device, dtype=torch.long)
+    self.env_id = torch.zeros(cap, device=device, dtype=torch.long)
     self._ep_counter = 0
 
   def add_batch(
@@ -66,7 +78,14 @@ class EpisodeReplay:
     new_episode: torch.Tensor | None = None,
   ) -> None:
     del new_episode  # kept for API; prefer explicit episode_id
-    n = state.shape[0]
+    n = int(state.shape[0])
+    if n != self.num_envs:
+      raise ValueError(
+        f"add_batch n={n} != replay.num_envs={self.num_envs}; "
+        "keep num_envs fixed for stride window sampling"
+      )
+    if self.ptr % self.num_envs != 0:
+      raise RuntimeError("replay ptr desynced from env block stride")
     idx = torch.arange(n, device=self.device)
     slots = (self.ptr + idx) % self.capacity
     self.state[slots] = state
@@ -86,6 +105,7 @@ class EpisodeReplay:
       self.episode_id[slots] = env_id.long() * 1_000_000_000 + episode_id.long()
     self.ptr = int((self.ptr + n) % self.capacity)
     self.size = min(self.capacity, self.size + n)
+    self._steps_written += 1
 
   def sample_transitions(self, batch: int) -> TransitionBatch:
     assert self.size > 0
@@ -103,43 +123,53 @@ class EpisodeReplay:
       env_id=self.env_id[idx],
     )
 
+  def _num_complete_steps(self) -> int:
+    return int(self.size // self.num_envs)
+
+  def _chrono_index(self, step: torch.Tensor, env_i: int) -> torch.Tensor:
+    """Map chronological step (0=oldest kept) + env → absolute slot.
+
+    When not full, data starts at 0. When full, oldest step starts at ``ptr``.
+    """
+    n = self.num_envs
+    if self.size < self.capacity:
+      return step * n + env_i
+    # Full circular: chronological step 0 begins at ptr.
+    return (self.ptr + step * n + env_i) % self.capacity
+
   def sample_contiguous_windows(
     self, batch: int, horizon: int, num_envs_hint: int | None = None
   ) -> tuple[torch.Tensor, ...]:
-    """Return ``states (B,H+1,S), controls (B,H,U), ...`` from same env episode.
-
-    Collector writes all envs each step as a contiguous block of size ``N``.
-    Temporal neighbors for one env are therefore ``i, i+N, i+2N, ...``.
-    """
+    """Return ``states (B,H+1,S), controls (B,H,U), ...`` from same env episode."""
     h = int(horizon)
-    assert self.size > h + 1
-    # Infer N from unique env ids in the filled region when possible.
-    filled = min(self.size, self.capacity)
-    if num_envs_hint is not None:
-      n_envs = int(num_envs_hint)
-    else:
-      n_envs = int(self.env_id[:filled].max().item()) + 1
-      n_envs = max(1, n_envs)
+    n_envs = int(num_envs_hint) if num_envs_hint is not None else self.num_envs
+    if n_envs != self.num_envs:
+      # Hint mismatch (e.g. stale arg): trust the buffer stride.
+      n_envs = self.num_envs
+    n_steps = self._num_complete_steps()
+    if n_steps <= h + 1:
+      raise RuntimeError(
+        "Replay too short for contiguous windows "
+        f"(steps={n_steps}, need>{h + 1}, size={self.size}, "
+        f"n_envs={n_envs}, capacity={self.capacity}). "
+        "Increase --warmup-collect / replay_capacity, or lower --num-envs."
+      )
+
     states, controls, rewards, terms, goals, geoms = [], [], [], [], [], []
     tries = 0
-    max_block = filled // n_envs
-    while len(states) < batch and tries < batch * 80:
+    max_start = n_steps - h  # exclusive end for start step
+    while len(states) < batch and tries < batch * 100:
       tries += 1
-      if max_block <= h + 1:
-        break
       env_i = int(torch.randint(0, n_envs, (1,)).item())
-      t0 = int(torch.randint(0, max_block - h, (1,)).item())
-      idx = env_i + (torch.arange(h + 1, device=self.device) + t0) * n_envs
-      if int(idx[-1].item()) >= filled:
-        continue
-      # Avoid circular wrap corruption.
-      if int(idx[-1].item()) >= self.capacity:
-        continue
+      t0 = int(torch.randint(0, max_start, (1,)).item())
+      steps = torch.arange(h + 1, device=self.device) + t0
+      idx = self._chrono_index(steps, env_i)
       ep = self.episode_id[idx]
       if not bool((ep == ep[0]).all()):
         continue
       if not bool((self.env_id[idx] == env_i).all()):
         continue
+      # No terminal inside the open prefix (keep last step free for bootstrap).
       if h > 1 and bool(self.terminated[idx[:-2]].any()):
         continue
       states.append(self.state[idx])
@@ -151,7 +181,8 @@ class EpisodeReplay:
     if not states:
       raise RuntimeError(
         "Failed to sample contiguous replay windows "
-        f"(size={self.size}, n_envs={n_envs}, h={h})"
+        f"(size={self.size}, steps={n_steps}, n_envs={n_envs}, h={h}, "
+        f"capacity={self.capacity}). Episodes may be shorter than h+1."
       )
     return (
       torch.stack(states, 0),

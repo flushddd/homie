@@ -38,6 +38,7 @@ class Stage3BpttTrainer:
     obs_fn: Callable[..., torch.Tensor],
     feat_fn: Callable[..., torch.Tensor],
     geom_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    num_envs: int = 1,
   ):
     self.cfg = cfg
     self.device = torch.device(cfg.device)
@@ -45,6 +46,7 @@ class Stage3BpttTrainer:
     self.obs_fn = obs_fn
     self.feat_fn = feat_fn
     self.geom_fn = geom_fn
+    self.num_envs_hint = int(num_envs)
 
     self.actor = Stage3Actor(obs_dim, cfg.actor_hidden, cfg.action_scale_m).to(self.device)
     self.critic = Stage3Critic(feat_dim, cfg.critic_hidden).to(self.device)
@@ -65,6 +67,7 @@ class Stage3BpttTrainer:
       goal_dim,
       geom_dim,
       self.device,
+      num_envs=self.num_envs_hint,
     )
     self.last_action = torch.zeros(1, 3, device=self.device)
     self.iter = 0

@@ -144,22 +144,38 @@ def run_real(args: argparse.Namespace) -> int:
     cur = "B"
   print(f"[stage3_bptt] curriculum={cur} (A=no crate, B=crate+SDF clearance)")
 
+  n_envs = int(args.num_envs)
+  # SuperMimic: replay = num_envs × 1000 steps/env (not a fixed 200k total).
+  # Also keep capacity a multiple of N so circular wrap never splits a step.
+  steps_per_env = max(1000, int(args.warmup_collect) + 64)
+  need_cap = n_envs * steps_per_env
+  if n_envs >= 512:
+    print(
+      f"[warn] num_envs={n_envs} → replay ~{need_cap} transitions "
+      f"(SuperMimic-style {steps_per_env} steps/env); needs substantial VRAM."
+    )
+
   cfg = Stage3BpttCfg(
     device=args.device,
     stage2_checkpoint=args.stage2_checkpoint,
     log_dir=args.log_dir,
     curriculum=cur,
     collect_steps_per_iter=args.collect_per_iter,
+    replay_capacity=max(200_000, need_cap),
   )
   log_dir = Path(args.log_dir)
   log_dir.mkdir(parents=True, exist_ok=True)
+  print(
+    f"[stage3_bptt] num_envs={n_envs} replay_capacity={cfg.replay_capacity} "
+    f"(~{cfg.replay_capacity // n_envs} steps/env)"
+  )
 
   actor = None
   # obs_dim set after collector builds (depends on sdf_query_count)
   collector = Stage3SimCollector(
     cfg,
     stage2_checkpoint=args.stage2_checkpoint,
-    num_envs=args.num_envs,
+    num_envs=n_envs,
     ee_mode=args.ee_mode if args.ee_mode == "attractor" else "attractor",
     actor=None,
   )
@@ -183,11 +199,11 @@ def run_real(args: argparse.Namespace) -> int:
     obs_fn=obs_fn,
     feat_fn=feat_fn,
     geom_fn=geom_fn,
+    num_envs=int(collector.env.num_envs),
   )
   # Share the same actor weights the collector uses when ee_mode=actor.
   trainer.actor = actor
   trainer.opt_actor = torch.optim.Adam(trainer.actor.parameters(), lr=cfg.actor_lr)
-  trainer.num_envs_hint = args.num_envs
 
   print(f"[info] warmup collect {args.warmup_collect} steps …")
   logs = collector.collect(trainer.replay, args.warmup_collect)
@@ -205,7 +221,7 @@ def run_real(args: argparse.Namespace) -> int:
       torch.save(payload, ckpt)
       print(f"[info] saved {ckpt}")
 
-  print("[ok] real train loop finished (curriculum A)")
+  print(f"[ok] real train loop finished (curriculum {cur})")
   return 0
 
 
