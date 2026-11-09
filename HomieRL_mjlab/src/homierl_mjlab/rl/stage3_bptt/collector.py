@@ -88,6 +88,26 @@ def meters_to_ee_raw(
   return 0.5 * torch.log((1.0 + x) / (1.0 - x))
 
 
+def _scalarize_log_val(v) -> float:
+  if isinstance(v, torch.Tensor):
+    return float(v.detach().float().mean().cpu())
+  return float(v)
+
+
+def _aggregate_ep_logs(ep_logs: list[dict]) -> dict[str, float]:
+  """Mean per-term PPO episode rewards (monitor only; not used for BPTT)."""
+  if not ep_logs:
+    return {}
+  keys = {k for ep in ep_logs for k in ep}
+  out: dict[str, float] = {}
+  for key in sorted(keys):
+    vals = [_scalarize_log_val(ep[key]) for ep in ep_logs if key in ep]
+    if vals:
+      # Keep Homie/mjlab key shape; prefix so JSON is easy to filter.
+      out[f"ppo/{key}"] = sum(vals) / len(vals)
+  return out
+
+
 class Stage3SimCollector:
   """Phase-3 env + frozen phase-2 HIM loco + EE attractor/actor."""
 
@@ -249,6 +269,9 @@ class Stage3SimCollector:
     coll_env_sum = 0.0
     present_sum = 0.0
     rew_sum = 0.0
+    ppo_step_rew_sum = 0.0
+    # PPO episode-term logs (extras["log"] on reset) — monitor loco health only.
+    ep_logs: list[dict] = []
     for step_i in range(int(num_steps)):
       state = pack_robot_state(self.env, arm_left=self.arm_left)
       goal, geom = goal_geom_from_env(self.env)
@@ -262,7 +285,7 @@ class Stage3SimCollector:
       elif act.shape[-1] == 14:
         act = torch.cat((act, ee_raw), dim=-1)
 
-      obs_td, _rew, dones, extras = self.vec.step(act)
+      obs_td, ppo_rew, dones, extras = self.vec.step(act)
       self._force_reach_flags()
       control = self._applied_joint_targets()
       next_state = pack_robot_state(self.env, arm_left=self.arm_left)
@@ -297,6 +320,11 @@ class Stage3SimCollector:
       if isinstance(extras, dict) and "time_outs" in extras:
         truncated = extras["time_outs"].float()
       terminated = (dones_f - truncated).clamp(min=0.0)
+      # Monitor-only: mjlab emits Episode_Reward/* in extras["log"] on episode end.
+      if isinstance(extras, dict):
+        log = extras.get("log") or extras.get("episode")
+        if log:
+          ep_logs.append(log)
       env_ids = torch.arange(n, device=self.device)
       replay.add_batch(
         state=state,
@@ -318,18 +346,23 @@ class Stage3SimCollector:
         if hasattr(self.policy, "reset"):
           self.policy.reset()
       rew_sum += float(r.mean().item())
+      ppo_step_rew_sum += float(ppo_rew.mean().item())
       # Env-mean penetration of the *active* arm (not "any of 4096 envs").
       hit = (clr.min(dim=-1).values < 0.0) & (present > 0.5)
       coll_env_sum += float(hit.float().mean().item())
       present_sum += float((present > 0.5).float().mean().item())
 
-    return {
+    out = {
       "collect_steps": float(num_steps),
       "collect_rew_mean": rew_sum / max(num_steps, 1),
+      "ppo_step_rew_mean": ppo_step_rew_sum / max(num_steps, 1),
       "collect_neg_clearance_frac": coll_env_sum / max(num_steps, 1),
       "collect_present_frac": present_sum / max(num_steps, 1),
       "replay_size": float(replay.size),
+      "ppo_ep_log_count": float(len(ep_logs)),
     }
+    out.update(_aggregate_ep_logs(ep_logs))
+    return out
 
   def make_fns(self):
     """Callables for Stage3BpttTrainer imagination (v1 open-loop loco)."""

@@ -45,8 +45,70 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--warmup-collect", type=int, default=100)
   p.add_argument("--collect-per-iter", type=int, default=50)
   p.add_argument("--ee-mode", type=str, default="attractor", choices=("attractor", "actor"))
-  p.add_argument("--save-every", type=int, default=10)
+  p.add_argument("--save-every", type=int, default=200)
   return p.parse_args()
+
+
+def _print_iter_log(
+  *,
+  it: int,
+  tot_iter: int,
+  collect_s: float,
+  update_s: float,
+  iter_s: float,
+  env_steps: float,
+  tot_timesteps: int,
+  tot_time: float,
+  logs: dict[str, float],
+  width: int = 80,
+  pad: int = 35,
+) -> None:
+  """Homie/rsl_rl-style console block (phase-3 PPO terms under Mean episode …)."""
+  title = f" \033[1m Stage3 BPTT iteration {it}/{tot_iter - 1} \033[0m "
+  fps = env_steps / max(iter_s, 1e-6)
+  done = it + 1
+  remaining = max(tot_iter - done, 0)
+  eta = tot_time / max(done, 1) * remaining
+  lines = [
+    "#" * width,
+    title.center(width, " "),
+    "",
+    (
+      f"{'Computation:':>{pad}} {fps:.0f} steps/s "
+      f"(collection: {collect_s:.3f}s, learning {update_s:.3f}s)"
+    ),
+  ]
+  core = [
+    ("collect_rew_mean", "Stage3 reward"),
+    ("ppo_step_rew_mean", "PPO step reward"),
+    ("collect_neg_clearance_frac", "Neg clearance frac"),
+    ("collect_present_frac", "Present frac"),
+    ("replay_size", "Replay size"),
+    ("ppo_ep_log_count", "PPO ep log count"),
+    ("wm_loss", "World-model loss"),
+    ("critic_loss", "Critic loss"),
+    ("actor_loss", "Actor loss"),
+    ("actor_grad_norm", "Actor grad norm"),
+    ("J_mean", "Imagination J mean"),
+  ]
+  for key, label in core:
+    if key in logs:
+      lines.append(f"{f'{label}:':>{pad}} {float(logs[key]):.4f}")
+  # PPO Episode_Reward/* (and other extras) collected for monitoring.
+  for key in sorted(k for k in logs if k.startswith("ppo/") and k != "ppo_ep_log_count"):
+    ep_key = key[len("ppo/") :]
+    lines.append(f"{f'Mean episode {ep_key}:':>{pad}} {float(logs[key]):.4f}")
+  lines.extend(
+    [
+      "-" * width,
+      f"{'Total timesteps:':>{pad}} {tot_timesteps}",
+      f"{'Iteration time:':>{pad}} {iter_s:.2f}s",
+      f"{'Total time:':>{pad}} {tot_time:.2f}s",
+      f"{'ETA:':>{pad}} {eta:.1f}s",
+      "",
+    ]
+  )
+  print("\n".join(lines))
 
 
 def run_checks() -> int:
@@ -213,7 +275,22 @@ def run_real(args: argparse.Namespace) -> int:
   print(json.dumps({**logs, "wall_s": warm_s}, indent=2))
   print(f"[info] warmup wall {warm_s:.1f}s")
 
-  for it in range(int(args.iters)):
+  def _save_ckpt(tag: int) -> Path:
+    ckpt = log_dir / f"stage3_bptt_{tag}.pt"
+    payload = trainer.state_dict()
+    payload["stage2_checkpoint"] = args.stage2_checkpoint
+    torch.save(payload, ckpt)
+    print(f"[info] saved {ckpt}")
+    return ckpt
+
+  # Warmup snapshot (iter 0), then every --save-every (launch: 200).
+  _save_ckpt(0)
+
+  tot_timesteps = int(args.warmup_collect) * n_envs
+  tot_time = warm_s
+  tot_iter = int(args.iters)
+  save_every = max(1, int(args.save_every))
+  for it in range(tot_iter):
     t_iter = time.perf_counter()
     t_c = time.perf_counter()
     clogs = collector.collect(trainer.replay, cfg.collect_steps_per_iter)
@@ -224,24 +301,27 @@ def run_real(args: argparse.Namespace) -> int:
     iter_s = time.perf_counter() - t_iter
     n_env = int(collector.env.num_envs)
     env_steps = float(cfg.collect_steps_per_iter * n_env)
-    merged = {
-      **clogs,
-      **tlogs,
-      "wall_s": iter_s,
-      "collect_s": collect_s,
-      "update_s": update_s,
-      "env_steps": env_steps,
-      "env_steps_per_s": env_steps / max(iter_s, 1e-6),
-    }
-    print(f"[iter {it}] " + json.dumps(merged))
-    if (it + 1) % max(1, args.save_every) == 0:
-      ckpt = log_dir / f"stage3_bptt_{it+1}.pt"
-      payload = trainer.state_dict()
-      payload["stage2_checkpoint"] = args.stage2_checkpoint
-      torch.save(payload, ckpt)
-      print(f"[info] saved {ckpt}")
+    tot_timesteps += int(env_steps)
+    tot_time += iter_s
+    merged = {**clogs, **tlogs}
+    _print_iter_log(
+      it=it,
+      tot_iter=tot_iter,
+      collect_s=collect_s,
+      update_s=update_s,
+      iter_s=iter_s,
+      env_steps=env_steps,
+      tot_timesteps=tot_timesteps,
+      tot_time=tot_time,
+      logs=merged,
+    )
+    if (it + 1) % save_every == 0:
+      _save_ckpt(it + 1)
 
-  print(f"[ok] real train loop finished (curriculum {cur})")
+  if tot_iter % save_every != 0:
+    _save_ckpt(tot_iter)
+
+  print(f"[ok] real train loop finished (curriculum {cur}) log_dir={log_dir}")
   return 0
 
 
