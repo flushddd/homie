@@ -25,8 +25,8 @@ class Stage3BpttCfg:
 
   # --- rewards ---
   w_target: float = 1.0
-  # Safe ≥ target so rim collisions are not ignored for reach progress.
-  w_safe: float = 2.5
+  # Safe ≥ target, but not so large that constant penetration kills all gradients.
+  w_safe: float = 1.5
   w_smooth: float = 0.05
   w_stability: float = 0.0
 
@@ -62,6 +62,12 @@ class Stage3BpttCfg:
   log_dir: str = "logs/stage3_bptt"
   # A=no container (reach only); B=crate present for SDF / clearance BPTT.
   curriculum: str = "B"
-  curriculum_b_presence_prob: float = 0.70
+  # Start milder than 0.7 so replay mixes free reaches with crates.
+  curriculum_b_presence_prob: float = 0.35
+  # Place grasp under open-top so lift-over is feasible (Homie crate curriculum).
+  relocate_grasp_when_present: bool = True
+  avoid_lift_margin: float = 0.12
+  avoid_repulsion_gain: float = 3.0
+  avoid_xy_slow: float = 0.10
 
   extra: dict = field(default_factory=dict)

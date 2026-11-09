@@ -41,7 +41,7 @@ def _configure_grasp_reach(env_cfg) -> None:
 
 
 def _configure_curriculum(env_cfg, cfg: Stage3BpttCfg) -> None:
-  """A: no crate. B: crates on so collect/BPTT see SDF + clearance."""
+  """A: no crate. B: milder crate mix + lift-over IK so data is not all collisions."""
   _configure_grasp_reach(env_cfg)
   cont = env_cfg.commands.get("container")
   if cont is None:
@@ -51,11 +51,12 @@ def _configure_curriculum(env_cfg, cfg: Stage3BpttCfg) -> None:
     cont.presence_prob = 0.0
     cont.debug_vis = False
     return
-  # Curriculum B (default): high crate rate on hard reaches; keep IK avoid on.
+  # Curriculum B: fewer crates + relocate grasp under rim for clearable approaches.
   cont.presence_prob = float(cfg.curriculum_b_presence_prob)
   cont.presence_requires_reach = True
   cont.presence_requires_need_waist = True
   cont.presence_also_on_low_z = True
+  cont.relocate_grasp_when_present = bool(cfg.relocate_grasp_when_present)
   cont.debug_vis = False
   # Stronger IK-layer lift/repulsion while collecting under crates.
   actions = getattr(env_cfg, "actions", None)
@@ -64,11 +65,18 @@ def _configure_curriculum(env_cfg, cfg: Stage3BpttCfg) -> None:
     if hasattr(ee, "avoid_d_safe"):
       ee.avoid_d_safe = float(cfg.d_safe)
     if hasattr(ee, "avoid_lift_margin"):
-      ee.avoid_lift_margin = max(0.08, float(cfg.d_safe))
+      ee.avoid_lift_margin = float(cfg.avoid_lift_margin)
     if hasattr(ee, "avoid_repulsion_gain"):
-      ee.avoid_repulsion_gain = 2.0
+      ee.avoid_repulsion_gain = float(cfg.avoid_repulsion_gain)
     if hasattr(ee, "avoid_xy_slow"):
-      ee.avoid_xy_slow = 0.15
+      ee.avoid_xy_slow = float(cfg.avoid_xy_slow)
+
+
+def _active_arm_clearance(
+  clr6: torch.Tensor, *, arm_left: bool
+) -> torch.Tensor:
+  """Keep the 3 spheres for the controlled arm (L:0:3, R:3:6)."""
+  return clr6[:, :3] if arm_left else clr6[:, 3:6]
 
 
 def meters_to_ee_raw(
@@ -210,9 +218,9 @@ class Stage3SimCollector:
           ee_w,
           grasp.target_pos_w,
           d_safe=self.cfg.d_safe,
-          lift_margin=max(0.08, self.cfg.d_safe),
-          xy_slow=0.15,
-          repulsion_gain=2.0,
+          lift_margin=float(self.cfg.avoid_lift_margin),
+          xy_slow=float(self.cfg.avoid_xy_slow),
+          repulsion_gain=float(self.cfg.avoid_repulsion_gain),
           d_max=self.cfg.d_max,
         )
         delta = delta + bias
@@ -238,7 +246,8 @@ class Stage3SimCollector:
     self._force_reach_flags()
     obs_td = self.vec.get_observations()
     n = self.env.num_envs
-    coll_pen = 0.0
+    coll_env_sum = 0.0
+    present_sum = 0.0
     rew_sum = 0.0
     for step_i in range(int(num_steps)):
       state = pack_robot_state(self.env, arm_left=self.arm_left)
@@ -260,9 +269,15 @@ class Stage3SimCollector:
 
       palm = palm_pos_base(self.env, arm_left=self.arm_left)
       try:
-        clr = arm_clearance_field(self.env, d_max=self.cfg.d_max)
+        clr6 = arm_clearance_field(self.env, d_max=self.cfg.d_max)
       except Exception:  # noqa: BLE001
-        clr = torch.ones(n, 6, device=self.device) * self.cfg.d_max
+        clr6 = torch.ones(n, 6, device=self.device) * self.cfg.d_max
+      # Only the controlled arm — idle-side spheres must not dominate safe loss.
+      clr = _active_arm_clearance(clr6, arm_left=self.arm_left)
+      try:
+        present = self.env.command_manager.get_term("container").present
+      except Exception:  # noqa: BLE001
+        present = torch.zeros(n, device=self.device)
       r = stage3_reward(
         palm_pos=palm,
         goal_pos=goal,
@@ -275,6 +290,7 @@ class Stage3SimCollector:
         w_target=self.cfg.w_target,
         w_safe=self.cfg.w_safe,
         w_smooth=self.cfg.w_smooth,
+        present=present,
       )
       dones_f = dones.float()
       truncated = torch.zeros_like(dones_f)
@@ -302,13 +318,16 @@ class Stage3SimCollector:
         if hasattr(self.policy, "reset"):
           self.policy.reset()
       rew_sum += float(r.mean().item())
-      if bool((clr.min(dim=-1).values < 0).any()):
-        coll_pen += 1.0
+      # Env-mean penetration of the *active* arm (not "any of 4096 envs").
+      hit = (clr.min(dim=-1).values < 0.0) & (present > 0.5)
+      coll_env_sum += float(hit.float().mean().item())
+      present_sum += float((present > 0.5).float().mean().item())
 
     return {
       "collect_steps": float(num_steps),
       "collect_rew_mean": rew_sum / max(num_steps, 1),
-      "collect_neg_clearance_frac": coll_pen / max(num_steps, 1),
+      "collect_neg_clearance_frac": coll_env_sum / max(num_steps, 1),
+      "collect_present_frac": present_sum / max(num_steps, 1),
       "replay_size": float(replay.size),
     }
 

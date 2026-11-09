@@ -381,6 +381,8 @@
         "1",
         "--device",
         "cuda:0",
+        "--curriculum",
+        "B",
         "--warmup-collect",
         "20",
         "--collect-per-iter",
@@ -416,18 +418,57 @@
         "16",
         "--device",
         "cuda:0",
+        "--curriculum",
+        "B",
         "--warmup-collect",
-        "200",
+        "1000",
         "--collect-per-iter",
-        "50",
+        "200",
         "--iters",
-        "100",
+        "10000",
         "--save-every",
-        "10",
+        "500",
         "--ee-mode",
         "attractor",
         "--log-dir",
         "logs/stage3_bptt"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "4096",
+        "--device",
+        "cuda:0",
+        "--curriculum",
+        "B",
+        "--warmup-collect",
+        "1000",
+        "--collect-per-iter",
+        "200",
+        "--iters",
+        "10000",
+        "--save-every",
+        "500",
+        "--ee-mode",
+        "attractor",
+        "--log-dir",
+        "logs/stage3_bptt_4096"
       ]
     }
   ],
@@ -460,6 +501,14 @@
       "name": "HomieRL mjlab: Stage3 BPTT Train + TensorBoard",
       "configurations": [
         "HomieRL mjlab: Stage3 BPTT Train (16)",
+        "HomieRL mjlab: TensorBoard"
+      ],
+      "stopAll": true
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train 4096 + TensorBoard",
+      "configurations": [
+        "HomieRL mjlab: Stage3 BPTT Train (4096)",
         "HomieRL mjlab: TensorBoard"
       ],
       "stopAll": true
@@ -548,7 +597,7 @@
       "id": "homieStage2CkptForBptt",
       "type": "promptString",
       "description": "Frozen phase-2 checkpoint for Stage3 BPTT (full path under HomieRL_mjlab/)",
-      "default": "logs/rsl_rl/homie_g1/phase2/model_15400(2).pt"
+      "default": "logs/rsl_rl/homie_g1/phase2/model_18600.pt"
     }
   ]
 }

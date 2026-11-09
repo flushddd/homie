@@ -45,10 +45,14 @@ def stage3_reward(
   w_smooth: float = 0.05,
   w_stability: float = 0.0,
   stability: torch.Tensor | None = None,
+  present: torch.Tensor | None = None,
 ) -> torch.Tensor:
+  safe = safe_reward(clearance, d_safe, d_max=d_max)
+  if present is not None:
+    safe = safe * present.reshape(safe.shape[0]).float()
   r = (
     float(w_target) * target_reward(palm_pos, goal_pos, sigma_p)
-    + float(w_safe) * safe_reward(clearance, d_safe, d_max=d_max)
+    + float(w_safe) * safe
     + float(w_smooth) * smooth_reward(action, last_action)
   )
   if stability is not None and float(w_stability) != 0.0:
