@@ -59,7 +59,7 @@ class Stage3BpttCfg:
 
   # paths (fill at launch)
   stage2_checkpoint: str = ""
-  log_dir: str = "logs/rsl_rl/homie_g1"
+  log_dir: str = "logs/stage3_bptt"
   # A=no container (reach only); B=crate present for SDF / clearance BPTT.
   curriculum: str = "B"
   # Start milder than 0.7 so replay mixes free reaches with crates.

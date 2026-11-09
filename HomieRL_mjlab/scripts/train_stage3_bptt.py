@@ -18,7 +18,6 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -35,19 +34,7 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--stage2-checkpoint", type=str, default="")
   p.add_argument("--num-envs", type=int, default=16)
   p.add_argument("--device", type=str, default="cuda:0")
-  # Same layout as mjlab/rsl_rl: <log-dir>/<YYYY-mm-dd_HH-MM-SS>_<run-name>/
-  p.add_argument(
-    "--log-dir",
-    type=str,
-    default="logs/rsl_rl/homie_g1",
-    help="Experiment root (mjlab-style); run folder is stamped under this.",
-  )
-  p.add_argument(
-    "--run-name",
-    type=str,
-    default="stage3_bptt",
-    help="Suffix for the dated run folder (like agent.run_name).",
-  )
+  p.add_argument("--log-dir", type=str, default="logs/stage3_bptt")
   p.add_argument(
     "--curriculum",
     type=str,
@@ -60,84 +47,6 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--ee-mode", type=str, default="attractor", choices=("attractor", "actor"))
   p.add_argument("--save-every", type=int, default=10)
   return p.parse_args()
-
-
-def _print_iter_log(
-  *,
-  it: int,
-  tot_iter: int,
-  collect_s: float,
-  update_s: float,
-  iter_s: float,
-  env_steps: float,
-  tot_timesteps: int,
-  tot_time: float,
-  logs: dict[str, float],
-  width: int = 80,
-  pad: int = 35,
-) -> None:
-  """Homie/rsl_rl-style console block (not one-line JSON)."""
-  title = f" \033[1m Stage3 BPTT iteration {it}/{tot_iter - 1} \033[0m "
-  fps = env_steps / max(iter_s, 1e-6)
-  done = it + 1
-  remaining = max(tot_iter - done, 0)
-  eta = tot_time / max(done, 1) * remaining
-  lines = [
-    "#" * width,
-    title.center(width, " "),
-    "",
-    (
-      f"{'Computation:':>{pad}} {fps:.0f} steps/s "
-      f"(collection: {collect_s:.3f}s, learning {update_s:.3f}s)"
-    ),
-  ]
-  pretty = [
-    ("collect_rew_mean", "Collect reward"),
-    ("collect_neg_clearance_frac", "Neg clearance frac"),
-    ("collect_present_frac", "Present frac"),
-    ("replay_size", "Replay size"),
-    ("wm_loss", "World-model loss"),
-    ("critic_loss", "Critic loss"),
-    ("actor_loss", "Actor loss"),
-    ("actor_grad_norm", "Actor grad norm"),
-    ("J_mean", "Imagination J mean"),
-  ]
-  for key, label in pretty:
-    if key in logs:
-      lines.append(f"{f'{label}:':>{pad}} {float(logs[key]):.4f}")
-  lines.extend(
-    [
-      "-" * width,
-      f"{'Total timesteps:':>{pad}} {tot_timesteps}",
-      f"{'Iteration time:':>{pad}} {iter_s:.2f}s",
-      f"{'Total time:':>{pad}} {tot_time:.2f}s",
-      f"{'ETA:':>{pad}} {eta:.1f}s",
-      "",
-    ]
-  )
-  print("\n".join(lines))
-
-
-def _tb_write(writer, logs: dict[str, float], it: int, collect_s: float, update_s: float, fps: float) -> None:
-  if writer is None:
-    return
-  writer.add_scalar("Perf/total_fps", fps, it)
-  writer.add_scalar("Perf/collection_time", collect_s, it)
-  writer.add_scalar("Perf/learning_time", update_s, it)
-  key_map = {
-    "collect_rew_mean": "Train/mean_reward",
-    "collect_neg_clearance_frac": "Train/neg_clearance_frac",
-    "collect_present_frac": "Train/present_frac",
-    "replay_size": "Train/replay_size",
-    "wm_loss": "Loss/world_model",
-    "critic_loss": "Loss/critic",
-    "actor_loss": "Loss/actor",
-    "actor_grad_norm": "Loss/actor_grad_norm",
-    "J_mean": "Train/imagination_J",
-  }
-  for src, dst in key_map.items():
-    if src in logs:
-      writer.add_scalar(dst, float(logs[src]), it)
 
 
 def run_checks() -> int:
@@ -247,34 +156,20 @@ def run_real(args: argparse.Namespace) -> int:
       f"(SuperMimic-style {steps_per_env} steps/env); needs substantial VRAM."
     )
 
-  # mjlab/rsl_rl layout: logs/rsl_rl/homie_g1/<stamp>_<run_name>/
-  stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-  run_name = (args.run_name or "stage3_bptt").strip() or "stage3_bptt"
-  log_dir = Path(args.log_dir) / f"{stamp}_{run_name}"
-  log_dir.mkdir(parents=True, exist_ok=True)
-
   cfg = Stage3BpttCfg(
     device=args.device,
     stage2_checkpoint=args.stage2_checkpoint,
-    log_dir=str(log_dir),
+    log_dir=args.log_dir,
     curriculum=cur,
     collect_steps_per_iter=args.collect_per_iter,
     replay_capacity=max(200_000, need_cap),
   )
+  log_dir = Path(args.log_dir)
+  log_dir.mkdir(parents=True, exist_ok=True)
   print(
     f"[stage3_bptt] num_envs={n_envs} replay_capacity={cfg.replay_capacity} "
     f"(~{cfg.replay_capacity // n_envs} steps/env)"
   )
-  print(f"[INFO] Logging experiment in directory: {log_dir}")
-
-  def _save_ckpt(tag: int | str) -> Path:
-    ckpt = log_dir / f"model_{tag}.pt"
-    payload = trainer.state_dict()
-    payload["stage2_checkpoint"] = args.stage2_checkpoint
-    payload["log_dir"] = str(log_dir)
-    torch.save(payload, ckpt)
-    print(f"[info] saved {ckpt}")
-    return ckpt
 
   actor = None
   # obs_dim set after collector builds (depends on sdf_query_count)
@@ -311,27 +206,14 @@ def run_real(args: argparse.Namespace) -> int:
   trainer.actor = actor
   trainer.opt_actor = torch.optim.Adam(trainer.actor.parameters(), lr=cfg.actor_lr)
 
-  try:
-    from torch.utils.tensorboard import SummaryWriter
-
-    writer = SummaryWriter(log_dir=str(log_dir), flush_secs=10)
-  except Exception as e:
-    print(f"[warn] TensorBoard disabled: {e}")
-    writer = None
-
   print(f"[info] warmup collect {args.warmup_collect} steps …")
   t0 = time.perf_counter()
   logs = collector.collect(trainer.replay, args.warmup_collect)
   warm_s = time.perf_counter() - t0
   print(json.dumps({**logs, "wall_s": warm_s}, indent=2))
   print(f"[info] warmup wall {warm_s:.1f}s")
-  # Initial weights after warmup (iter 0), before any BPTT update.
-  _save_ckpt(0)
 
-  tot_timesteps = int(args.warmup_collect) * n_envs
-  tot_time = warm_s
-  tot_iter = int(args.iters)
-  for it in range(tot_iter):
+  for it in range(int(args.iters)):
     t_iter = time.perf_counter()
     t_c = time.perf_counter()
     clogs = collector.collect(trainer.replay, cfg.collect_steps_per_iter)
@@ -342,40 +224,24 @@ def run_real(args: argparse.Namespace) -> int:
     iter_s = time.perf_counter() - t_iter
     n_env = int(collector.env.num_envs)
     env_steps = float(cfg.collect_steps_per_iter * n_env)
-    tot_timesteps += int(env_steps)
-    tot_time += iter_s
-    merged = {**clogs, **tlogs}
-    _tb_write(
-      writer,
-      merged,
-      it,
-      collect_s=collect_s,
-      update_s=update_s,
-      fps=env_steps / max(iter_s, 1e-6),
-    )
-    _print_iter_log(
-      it=it,
-      tot_iter=tot_iter,
-      collect_s=collect_s,
-      update_s=update_s,
-      iter_s=iter_s,
-      env_steps=env_steps,
-      tot_timesteps=tot_timesteps,
-      tot_time=tot_time,
-      logs=merged,
-    )
+    merged = {
+      **clogs,
+      **tlogs,
+      "wall_s": iter_s,
+      "collect_s": collect_s,
+      "update_s": update_s,
+      "env_steps": env_steps,
+      "env_steps_per_s": env_steps / max(iter_s, 1e-6),
+    }
+    print(f"[iter {it}] " + json.dumps(merged))
     if (it + 1) % max(1, args.save_every) == 0:
-      _save_ckpt(it + 1)
+      ckpt = log_dir / f"stage3_bptt_{it+1}.pt"
+      payload = trainer.state_dict()
+      payload["stage2_checkpoint"] = args.stage2_checkpoint
+      torch.save(payload, ckpt)
+      print(f"[info] saved {ckpt}")
 
-  # Always keep a final snapshot even if iters % save_every != 0.
-  final_tag = tot_iter
-  if final_tag % max(1, args.save_every) != 0:
-    _save_ckpt(final_tag)
-
-  if writer is not None:
-    writer.flush()
-    writer.close()
-  print(f"[ok] real train loop finished (curriculum {cur}) log_dir={log_dir}")
+  print(f"[ok] real train loop finished (curriculum {cur})")
   return 0
 
 
