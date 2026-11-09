@@ -394,7 +394,9 @@
         "--ee-mode",
         "attractor",
         "--log-dir",
-        "logs/stage3_bptt_smoke"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt_smoke"
       ]
     },
     {
@@ -431,7 +433,9 @@
         "--ee-mode",
         "attractor",
         "--log-dir",
-        "logs/stage3_bptt"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
       ]
     },
     {
@@ -460,15 +464,17 @@
         "--warmup-collect",
         "1000",
         "--collect-per-iter",
-        "200",
+        "32",
         "--iters",
         "10000",
         "--save-every",
-        "500",
+        "200",
         "--ee-mode",
         "attractor",
         "--log-dir",
-        "logs/stage3_bptt_4096"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
       ]
     }
   ],
