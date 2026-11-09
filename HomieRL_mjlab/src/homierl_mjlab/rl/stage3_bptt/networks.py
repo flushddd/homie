@@ -19,9 +19,10 @@ def _mlp(in_dim: int, hidden: Sequence[int], out_dim: int) -> nn.Sequential:
 
 
 class Stage3Actor(nn.Module):
-  """Deterministic 3-D EE position increment in base frame.
+  """Deterministic 3-D action (meters), ``tanh``-scaled.
 
-  Output is ``tanh``-bounded then scaled by ``action_scale_m`` (meters).
+  - ``ee_residual`` mode: Δp in base from current palm.
+  - ``hierarchical_subgoal`` mode: world-frame offset from episode ``p_ee0``.
   Do not apply an extra tanh outside.
   """
 

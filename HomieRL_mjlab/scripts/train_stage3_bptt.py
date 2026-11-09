@@ -45,6 +45,14 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--warmup-collect", type=int, default=100)
   p.add_argument("--collect-per-iter", type=int, default=50)
   p.add_argument("--ee-mode", type=str, default="attractor", choices=("attractor", "actor"))
+  p.add_argument(
+    "--control-mode",
+    type=str,
+    default="hierarchical_subgoal",
+    choices=("hierarchical_subgoal", "ee_residual"),
+    help="hierarchical_subgoal: actor sets grasp subgoal for frozen loco+IK; "
+    "ee_residual: legacy Δp on EE IK.",
+  )
   p.add_argument("--save-every", type=int, default=200)
   return p.parse_args()
 
@@ -225,12 +233,13 @@ def run_real(args: argparse.Namespace) -> int:
     curriculum=cur,
     collect_steps_per_iter=args.collect_per_iter,
     replay_capacity=max(200_000, need_cap),
+    control_mode=str(args.control_mode),
   )
   log_dir = Path(args.log_dir)
   log_dir.mkdir(parents=True, exist_ok=True)
   print(
     f"[stage3_bptt] num_envs={n_envs} replay_capacity={cfg.replay_capacity} "
-    f"(~{cfg.replay_capacity // n_envs} steps/env)"
+    f"(~{cfg.replay_capacity // n_envs} steps/env) control_mode={cfg.control_mode}"
   )
 
   actor = None
@@ -243,7 +252,7 @@ def run_real(args: argparse.Namespace) -> int:
     actor=None,
   )
   actor = Stage3Actor(
-    collector.obs_dim, cfg.actor_hidden, cfg.action_scale_m
+    collector.obs_dim, cfg.actor_hidden, collector.actor_action_scale
   ).to(collector.device)
   if args.ee_mode == "actor":
     collector.ee_mode = "actor"

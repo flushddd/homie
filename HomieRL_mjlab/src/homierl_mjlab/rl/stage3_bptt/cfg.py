@@ -8,8 +8,16 @@ from dataclasses import dataclass, field
 @dataclass
 class Stage3BpttCfg:
   # --- control ---
+  # ee_residual: actor Δp added on EE IK (legacy Stage-3).
+  # hierarchical_subgoal: actor offset from episode EE anchor → grasp target;
+  #   frozen phase-2 loco + EE IK chase that short-horizon target (套娃).
+  control_mode: str = "hierarchical_subgoal"
   arm_side: str = "right"  # "left" | "right"
-  action_scale_m: float = 0.02  # max |Δp| per policy step (m)
+  action_scale_m: float = 0.02  # legacy residual |Δp| per step (m)
+  # Hierarchical: max |offset| from p_ee0 in world meters (must cover goal−ee0).
+  subgoal_offset_scale_m: float = 0.55
+  # Hierarchical: max |p_sub| change per policy step (m).
+  subgoal_rate_limit_m: float = 0.04
   policy_dt: float = 0.02
   dls_damping: float = 0.08
   max_joint_delta: float = 0.05

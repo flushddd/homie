@@ -467,6 +467,8 @@
         "200",
         "--ee-mode",
         "attractor",
+        "--control-mode",
+        "hierarchical_subgoal",
         "--log-dir",
         "logs/stage3_bptt_4096"
       ]

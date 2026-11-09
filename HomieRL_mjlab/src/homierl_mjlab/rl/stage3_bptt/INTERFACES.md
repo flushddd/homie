@@ -22,8 +22,10 @@ Phase-3 PPO packs `a17 | grasp7 | sdf | clearance | ee_err` → 229-D one-step.
 
 | Field | Dim | Unit / frame | Notes |
 |-------|-----|--------------|-------|
-| `delta_p` action | 3 | meters, **base** frame | `p_cmd = p_palm + scale * tanh(raw)` |
-| Stage3 obs (v1) | configurable | base | joint arm, palm err, SDF queries, clearance, last Δp |
+| `control_mode` | — | cfg | `hierarchical_subgoal` (default) or `ee_residual` |
+| hierarchical action | 3 | meters, **world** offset from episode `p_ee0` | `p_sub = rate_limit(p_ee0 + a)`; injected into **grasp** (loco+IK); EE residual = 0 |
+| legacy `delta_p` | 3 | meters, **base** | `p_cmd = p_palm + scale * tanh(raw)` on EE IK only |
+| Stage3 obs (hierarchical) | `15+K+6` | base | palm, true goal, goal−ee0, palm−ee0, last offset, SDF, clearance |
 | Applied control logged | full joint position targets | rad | same PD interface as sim |
 | Arm DoF | 7 per arm (`shoulder×3, elbow, wrist×3`) | | v1: single arm (configurable left/right); wrists often soft-locked |
 

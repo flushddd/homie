@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from homierl_mjlab.mdp.sdf_observations import arm_clearance_field, sdf_query_field
 from homierl_mjlab.rl.him_runner import HomieOnPolicyRunner
 from homierl_mjlab.rl.stage3_bptt.cfg import Stage3BpttCfg
+from homierl_mjlab.mdp.base_frame import world_to_base
 from homierl_mjlab.rl.stage3_bptt.env_bridge import (
   attractor_delta,
   goal_geom_from_env,
@@ -24,6 +25,13 @@ from homierl_mjlab.rl.stage3_bptt.env_bridge import (
 from homierl_mjlab.rl.stage3_bptt.geom_clearance import (
   palm_probe_clearance,
   sdf_query_from_geom,
+)
+from homierl_mjlab.rl.stage3_bptt.hierarchical import (
+  HierarchicalSubgoalState,
+  attractor_offset_w,
+  build_hierarchical_obs,
+  hierarchical_obs_dim,
+  inject_subgoal_into_grasp,
 )
 from homierl_mjlab.rl.stage3_bptt.networks import Stage3Actor
 from homierl_mjlab.rl.stage3_bptt.replay import EpisodeReplay
@@ -164,14 +172,24 @@ class Stage3SimCollector:
     self.control_dim = self.n_joints
     self.goal_dim = 3
     self.geom_dim = 10
-    self.obs_dim = 3 + 3 + 3 + cfg.sdf_query_count + 6  # palm, goal, last_a, sdf_phi, clearance
-    # If include_valid doubles sdf — we use phi only for actor obs v1.
+    self.control_mode = str(getattr(cfg, "control_mode", "hierarchical_subgoal"))
+    self.hierarchical = self.control_mode == "hierarchical_subgoal"
+    if self.hierarchical:
+      self.obs_dim = hierarchical_obs_dim(cfg.sdf_query_count)
+      self.actor_action_scale = float(cfg.subgoal_offset_scale_m)
+    else:
+      # Legacy: palm, goal, last_a, sdf_phi, clearance
+      self.obs_dim = 3 + 3 + 3 + cfg.sdf_query_count + 6
+      self.actor_action_scale = float(cfg.action_scale_m)
     self.feat_dim = self.state_dim + self.goal_dim + self.geom_dim
 
     self.last_a = torch.zeros(self.env.num_envs, 3, device=self.device)
     self._env_ep_id = torch.zeros(
       self.env.num_envs, device=self.device, dtype=torch.long
     )
+    self.hier = HierarchicalSubgoalState(self.env.num_envs, self.device)
+    # Snapshot anchors after first reset.
+    self.hier.ensure_all(self.env, arm_left=self.arm_left)
 
   def _force_reach_flags(self) -> None:
     grasp = self.env.command_manager.get_term("grasp")
@@ -179,9 +197,7 @@ class Stage3SimCollector:
     grasp.is_waist[:] = 1.0
     grasp.waist_on = True
 
-  def _build_actor_obs(self) -> torch.Tensor:
-    palm = palm_pos_base(self.env, arm_left=self.arm_left)
-    goal, _ = goal_geom_from_env(self.env)
+  def _sdf_clr(self) -> tuple[torch.Tensor, torch.Tensor]:
     try:
       sdf = sdf_query_field(
         self.env,
@@ -197,22 +213,43 @@ class Stage3SimCollector:
       clr = arm_clearance_field(self.env, d_max=self.cfg.d_max)
     except Exception:  # noqa: BLE001
       clr = torch.ones(self.env.num_envs, 6, device=self.device) * self.cfg.d_max
+    return sdf, clr
+
+  def _build_actor_obs(self) -> torch.Tensor:
+    sdf, clr = self._sdf_clr()
+    if self.hierarchical:
+      return build_hierarchical_obs(
+        self.env,
+        self.hier,
+        arm_left=self.arm_left,
+        sdf=sdf,
+        clearance=clr,
+      )
+    palm = palm_pos_base(self.env, arm_left=self.arm_left)
+    goal, _ = goal_geom_from_env(self.env)
     return torch.cat((palm, goal, self.last_a, sdf, clr), dim=-1)
 
-  def _ee_delta_m(self) -> torch.Tensor:
+  def _high_level_action(self) -> torch.Tensor:
+    """Actor / attractor output in the active control_mode units."""
     if self.ee_mode == "actor" and self.actor is not None:
       obs = self._build_actor_obs()
       with torch.no_grad():
-        delta = self.actor(obs)
-    else:
-      delta = attractor_delta(
+        return self.actor(obs)
+    if self.hierarchical:
+      return attractor_offset_w(
         self.env,
+        self.hier,
         arm_left=self.arm_left,
-        scale=min(self.cfg.action_scale_m, 0.015),
-        clip=self.cfg.action_scale_m,
+        scale_m=min(self.cfg.subgoal_offset_scale_m, 0.25),
+        clip_m=self.cfg.subgoal_offset_scale_m,
       )
-    # Curriculum B: attractor/actor residual also gets IK crate bias so
-    # collection does not plow through walls before the actor learns.
+    delta = attractor_delta(
+      self.env,
+      arm_left=self.arm_left,
+      scale=min(self.cfg.action_scale_m, 0.015),
+      clip=self.cfg.action_scale_m,
+    )
+    # Legacy residual: optional IK crate bias on top of Δp.
     if str(self.cfg.curriculum).upper() != "A":
       try:
         from homierl_mjlab.mdp.palm import (
@@ -248,6 +285,13 @@ class Stage3SimCollector:
         pass
     return delta
 
+  def _true_goal_base(self) -> torch.Tensor:
+    if self.hierarchical:
+      env_ids = torch.arange(self.env.num_envs, device=self.device)
+      return world_to_base(self.env.scene["robot"], self.hier.p_goal_w, env_ids)
+    goal, _ = goal_geom_from_env(self.env)
+    return goal
+
   def _applied_joint_targets(self) -> torch.Tensor:
     """Full PD position command vector (n_joints), matching sim apply."""
     robot = self.env.scene["robot"]
@@ -264,6 +308,7 @@ class Stage3SimCollector:
 
   def collect(self, replay: EpisodeReplay, num_steps: int) -> dict[str, float]:
     self._force_reach_flags()
+    self.hier.ensure_all(self.env, arm_left=self.arm_left)
     obs_td = self.vec.get_observations()
     n = self.env.num_envs
     coll_env_sum = 0.0
@@ -274,11 +319,27 @@ class Stage3SimCollector:
     ep_logs: list[dict] = []
     for step_i in range(int(num_steps)):
       state = pack_robot_state(self.env, arm_left=self.arm_left)
-      goal, geom = goal_geom_from_env(self.env)
+      _, geom = goal_geom_from_env(self.env)
+      goal = self._true_goal_base()
+
+      # High-level action → either residual Δp or hierarchical subgoal.
+      high_a = self._high_level_action()
+      if self.hierarchical:
+        p_sub = self.hier.apply_offset(
+          high_a,
+          scale_m=self.cfg.subgoal_offset_scale_m,
+          rate_m=self.cfg.subgoal_rate_limit_m,
+        )
+        inject_subgoal_into_grasp(self.env, p_sub)
+        # Refresh loco obs so grasp command / waist gates see p_sub.
+        obs_td = self.vec.get_observations()
+        ee_delta = torch.zeros(n, 3, device=self.device)
+      else:
+        ee_delta = high_a
+
       with torch.inference_mode():
         full_a = self.policy(obs_td)
-      delta_m = self._ee_delta_m()
-      ee_raw = meters_to_ee_raw(delta_m, self.ee_scale)
+      ee_raw = meters_to_ee_raw(ee_delta, self.ee_scale)
       act = full_a.clone()
       if act.shape[-1] >= 17:
         act[:, 14:17] = ee_raw
@@ -305,7 +366,7 @@ class Stage3SimCollector:
         palm_pos=palm,
         goal_pos=goal,
         clearance=clr,
-        action=delta_m,
+        action=high_a,
         last_action=self.last_a,
         sigma_p=self.cfg.sigma_p,
         d_safe=self.cfg.d_safe,
@@ -338,11 +399,13 @@ class Stage3SimCollector:
         env_id=env_ids,
         episode_id=self._env_ep_id,
       )
-      self.last_a = delta_m.detach()
+      self.last_a = high_a.detach()
       done_mask = dones.bool()
       if bool(done_mask.any()):
+        done_ids = done_mask.nonzero(as_tuple=False).flatten()
         self._env_ep_id[done_mask] += 1
         self.last_a[done_mask] = 0.0
+        self.hier.reset_envs(self.env, done_ids, arm_left=self.arm_left)
         if hasattr(self.policy, "reset"):
           self.policy.reset()
       rew_sum += float(r.mean().item())
@@ -360,6 +423,7 @@ class Stage3SimCollector:
       "collect_present_frac": present_sum / max(num_steps, 1),
       "replay_size": float(replay.size),
       "ppo_ep_log_count": float(len(ep_logs)),
+      "control_mode_hierarchical": 1.0 if self.hierarchical else 0.0,
     }
     out.update(_aggregate_ep_logs(ep_logs))
     return out
@@ -396,6 +460,7 @@ class Stage3SimCollector:
 
     d_max = float(self.cfg.d_max)
     sdf_k = int(self.cfg.sdf_query_count)
+    hierarchical = self.hierarchical
 
     def obs_fn(state, goal, geom, last_a):
       palm = state[..., -3:]
@@ -414,6 +479,12 @@ class Stage3SimCollector:
       else:
         sdf = torch.zeros(state.shape[0], sdf_k, device=state.device)
         clr = torch.ones(state.shape[0], 6, device=state.device) * d_max
+      if hierarchical:
+        # Match build_hierarchical_obs: palm, goal, goal−ee0≈goal, palm−ee0≈palm,
+        # last_a, sdf, clr (imagination lacks live ee0; approximate).
+        return torch.cat(
+          (palm, goal[..., :3], goal[..., :3], palm, last_a, sdf, clr), dim=-1
+        )
       return torch.cat((palm, goal[..., :3], last_a, sdf, clr), dim=-1)
 
     def feat_fn(state, goal, geom):
