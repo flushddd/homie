@@ -6,7 +6,7 @@ Examples::
   .venv/bin/python scripts/train_stage3_bptt.py --check
   .venv/bin/python scripts/train_stage3_bptt.py --synthetic-smoke
 
-  # Real sim loop (curriculum A, attractor EE, frozen phase-2 loco)
+  # Real sim loop (curriculum B, actor EE, frozen phase-2 loco)
   .venv/bin/python scripts/train_stage3_bptt.py \\
     --stage2-checkpoint logs/rsl_rl/homie_g1/phase2/model_15400\\(2\\).pt \\
     --num-envs 16 --device cuda:0 --iters 100 --warmup-collect 200
@@ -56,7 +56,13 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--iters", type=int, default=50)
   p.add_argument("--warmup-collect", type=int, default=100)
   p.add_argument("--collect-per-iter", type=int, default=50)
-  p.add_argument("--ee-mode", type=str, default="attractor", choices=("attractor", "actor"))
+  p.add_argument(
+    "--ee-mode",
+    type=str,
+    default="actor",
+    choices=("attractor", "actor"),
+    help="actor: collect with BPTT policy; attractor: heuristic data only",
+  )
   p.add_argument(
     "--control-mode",
     type=str,
@@ -259,23 +265,27 @@ def run_real(args: argparse.Namespace) -> int:
   )
   print(f"[INFO] Logging experiment in directory: {log_dir}")
 
-  actor = None
   # obs_dim set after collector builds (depends on sdf_query_count)
   collector = Stage3SimCollector(
     cfg,
     stage2_checkpoint=args.stage2_checkpoint,
     num_envs=n_envs,
-    ee_mode=args.ee_mode if args.ee_mode == "attractor" else "attractor",
+    ee_mode=str(args.ee_mode),
     actor=None,
   )
   actor = Stage3Actor(
     collector.obs_dim, cfg.actor_hidden, collector.actor_action_scale
   ).to(collector.device)
-  if args.ee_mode == "actor":
-    collector.ee_mode = "actor"
-    collector.actor = actor
+  # Near-zero actions at start → hierarchical p_sub stays near p_ee0 (stable).
+  nn_linear = actor.net[-1]
+  if hasattr(nn_linear, "weight"):
+    torch.nn.init.zeros_(nn_linear.weight)
+    torch.nn.init.zeros_(nn_linear.bias)
+  collector.actor = actor
+  collector.ee_mode = str(args.ee_mode)
+  print(f"[stage3_bptt] ee_mode={collector.ee_mode}")
 
-  control_fn, obs_fn, feat_fn, geom_fn = collector.make_fns()
+  control_fn, obs_fn, feat_fn, geom_fn, palm_step_fn = collector.make_fns()
   trainer = Stage3BpttTrainer(
     cfg,
     state_dim=collector.state_dim,
@@ -288,11 +298,13 @@ def run_real(args: argparse.Namespace) -> int:
     obs_fn=obs_fn,
     feat_fn=feat_fn,
     geom_fn=geom_fn,
+    palm_step_fn=palm_step_fn,
     num_envs=int(collector.env.num_envs),
   )
-  # Share the same actor weights the collector uses when ee_mode=actor.
+  # Share the same actor the collector rolls out (required for ee_mode=actor).
   trainer.actor = actor
   trainer.opt_actor = torch.optim.Adam(trainer.actor.parameters(), lr=cfg.actor_lr)
+  trainer.snapshot_good()
 
   print(f"[info] warmup collect {args.warmup_collect} steps …")
   t0 = time.perf_counter()

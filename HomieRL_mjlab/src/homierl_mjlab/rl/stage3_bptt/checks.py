@@ -41,7 +41,7 @@ def check_fd_jacobian() -> float:
 
 
 def check_bptt_actor_graph() -> dict[str, float]:
-  """Tiny synthetic BPTT: actor → control stitch → WM → reward → J."""
+  """Tiny synthetic BPTT: actor → control → WM + palm_kin → reward → J."""
   device = torch.device("cpu")
   state_dim, ctrl_dim, obs_dim = 16, 8, 12
   actor = Stage3Actor(obs_dim, (32, 32), action_scale_m=0.02)
@@ -51,6 +51,15 @@ def check_bptt_actor_graph() -> dict[str, float]:
     p.requires_grad_(False)
   for p in critic.parameters():
     p.requires_grad_(False)
+
+  rate_m = 0.04
+
+  def palm_step(state, action, goal, geom):
+    del goal, geom
+    palm = state[..., -3:]
+    err = action - palm
+    n = torch.linalg.norm(err, dim=-1, keepdim=True).clamp_min(1e-9)
+    return palm + err * (rate_m / n).clamp(max=1.0)
 
   s = torch.randn(8, state_dim, requires_grad=True)
   goal = torch.randn(8, 3)
@@ -62,12 +71,13 @@ def check_bptt_actor_graph() -> dict[str, float]:
   for _ in range(4):
     obs = torch.cat((s[..., :9], last), -1)
     a = actor(obs)
-    # Fake control: pad action into control vector
     u = torch.zeros(8, ctrl_dim)
     u = u.clone()
     u[:, :3] = a
-    s = wm(s, u, ctx)
-    palm = s[:, :3]
+    s_wm = wm(s, u, ctx)
+    palm_kin = palm_step(s, a, goal, geom)
+    s = torch.cat((s_wm[..., :-3], palm_kin), dim=-1)
+    palm = s[..., -3:]
     clearance = torch.ones(8, 3) * 0.1
     r = stage3_reward(
       palm_pos=palm,

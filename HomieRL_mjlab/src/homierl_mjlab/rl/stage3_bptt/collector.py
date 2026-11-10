@@ -430,38 +430,57 @@ class Stage3SimCollector:
     return out
 
   def make_fns(self):
-    """Callables for Stage3BpttTrainer imagination (v1 open-loop loco)."""
+    """Callables for Stage3BpttTrainer imagination (v1 open-loop loco).
 
-    scale = self.ee_scale
+    Returns ``(control_fn, obs_fn, feat_fn, geom_fn, palm_step_fn)``.
+    ``palm_step_fn`` is a first-order EE kinematics used after the WM step so
+    actor → palm/clearance rewards keep a real gradient (WM alone is too weak).
+    """
+
     arm_left = self.arm_left
     n_j = self.n_joints
-    device = self.device
-    jp = self.env.action_manager.get_term("joint_pos")
     ee = self.env.action_manager.get_term("ee_residual")
-    robot = self.env.scene["robot"]
-    loco_ids = jp.target_ids
     arm_ids = ee._left_ids if arm_left else ee._right_ids
+    hierarchical = self.hierarchical
+    rate_m = float(self.cfg.subgoal_rate_limit_m)
+    max_dq = float(self.cfg.max_joint_delta)
+    # Rough m→rad gain so cartesian error perturbs arm joints in u for the WM.
+    cart_to_joint = 2.0
+
+    def palm_step_fn(state, action, goal, geom):
+      """Differentiable palm move toward hierarchical subgoal / residual Δp."""
+      del goal, geom
+      palm = state[..., -3:]
+      if hierarchical:
+        # Imagination obs treats ee0≈0 in base → actor offset ≈ absolute subgoal.
+        target = action
+        err = target - palm
+        n = torch.linalg.norm(err, dim=-1, keepdim=True).clamp_min(1e-9)
+        step = err * (rate_m / n).clamp(max=1.0)
+      else:
+        step = torch.clamp(action, -rate_m, rate_m)
+      return palm + step
 
     def control_fn(state, delta_p, goal, geom):
-      # Open-loop: hold current default + write arm via identity (Δp embedded).
-      # Full DLS-from-state imagination lands in a follow-up; v1 keeps WM
-      # learning from real controls while BPTT still sees delta_p→reward path
-      # through geom_fn on predicted palm (state tail).
+      # Hold predicted q as PD target; bias active arm with cartesian error.
       del goal, geom
-      b = state.shape[0]
-      u = robot.data.default_joint_pos[:1].expand(b, -1).clone()
-      # Encode Δp into a few unused channels? Prefer concatenating is wrong dim.
-      # Instead keep last real control structure: arm joints unchanged here;
-      # WM was trained on real DLS controls. Actor still gets reward via palm.
-      u = u.clone()
-      # Mildly bias arm joints with delta for a weak differentiable path.
-      k = min(3, arm_ids.numel())
-      u[:, arm_ids[:k]] = u[:, arm_ids[:k]] + delta_p[:, :k]
+      q = state[..., :n_j]
+      palm = state[..., -3:]
+      u = q.clone()
+      if hierarchical:
+        err = delta_p - palm
+      else:
+        err = delta_p
+      k = min(3, int(arm_ids.numel()))
+      if k > 0:
+        dq = torch.clamp(err[:, :k] * cart_to_joint, -max_dq, max_dq)
+        u = u.clone()
+        idx = arm_ids[:k]
+        u[:, idx] = u[:, idx] + dq
       return u
 
     d_max = float(self.cfg.d_max)
     sdf_k = int(self.cfg.sdf_query_count)
-    hierarchical = self.hierarchical
 
     def obs_fn(state, goal, geom, last_a):
       palm = state[..., -3:]
@@ -500,4 +519,4 @@ class Stage3SimCollector:
         clearance = torch.ones(state.shape[0], 3, device=state.device) * d_max
       return palm, clearance
 
-    return control_fn, obs_fn, feat_fn, geom_fn
+    return control_fn, obs_fn, feat_fn, geom_fn, palm_step_fn

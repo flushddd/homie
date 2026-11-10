@@ -56,6 +56,7 @@ class Stage3BpttTrainer:
     obs_fn: Callable[..., torch.Tensor],
     feat_fn: Callable[..., torch.Tensor],
     geom_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    palm_step_fn: Callable[..., torch.Tensor] | None = None,
     num_envs: int = 1,
   ):
     self.cfg = cfg
@@ -64,6 +65,7 @@ class Stage3BpttTrainer:
     self.obs_fn = obs_fn
     self.feat_fn = feat_fn
     self.geom_fn = geom_fn
+    self.palm_step_fn = palm_step_fn
     self.num_envs_hint = int(num_envs)
 
     scale = (
@@ -231,7 +233,14 @@ class Stage3BpttTrainer:
       obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
       a = self.actor(obs)
       u = self.control_fn(s, a, goals, geoms)
-      s = self.wm(s, u, ctx)
+      s_wm = self.wm(s, u, ctx)
+      # Keep actor→reward grads via first-order EE kinematics (WM palm path alone
+      # is too weak / often ~zero for hierarchical subgoals).
+      if self.palm_step_fn is not None:
+        palm_kin = self.palm_step_fn(s, a, goals, geoms)
+        s = torch.cat((s_wm[..., :-3], palm_kin), dim=-1)
+      else:
+        s = s_wm
       palm, clearance = self.geom_fn(s, goals, geoms)
       r = stage3_reward(
         palm_pos=palm,
@@ -262,9 +271,10 @@ class Stage3BpttTrainer:
       loss=loss, opt=self.opt_actor, module=self.actor, key="actor_loss"
     )
     # Remap keys to historical names used in logs.
+    gn = out.get("actor_loss_grad_norm", out.get("actor_grad_norm", 0.0))
     mapped = {
       "actor_loss": out.get("actor_loss", float("nan")),
-      "actor_grad_norm": out.get("actor_loss_grad_norm", out.get("actor_grad_norm", 0.0)),
+      "actor_grad_norm": float(gn) if gn == gn else 0.0,  # NaN → 0 for logs
       "J_mean": float(j.detach().mean()) if _finite(j) else float("nan"),
     }
     if out.get("actor_loss_skipped"):
