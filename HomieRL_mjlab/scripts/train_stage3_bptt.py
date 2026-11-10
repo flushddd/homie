@@ -38,6 +38,8 @@ def _tb_log(writer: SummaryWriter, it: int, logs: dict[str, float], *, collect_s
   mapping = (
     ("collect_rew_mean", "Train/mean_reward"),
     ("ppo_step_rew_mean", "Train/ppo_step_reward"),
+    ("mean_episode_length", "Train/mean_episode_length"),
+    ("episode_length_count", "Train/episode_length_count"),
     ("collect_neg_clearance_frac", "Train/neg_clearance_frac"),
     ("collect_present_frac", "Train/present_frac"),
     ("replay_size", "Train/replay_size"),
@@ -143,6 +145,8 @@ def _print_iter_log(
   core = [
     ("collect_rew_mean", "Stage3 reward"),
     ("ppo_step_rew_mean", "PPO step reward"),
+    ("mean_episode_length", "Mean episode length"),
+    ("episode_length_count", "Episode length count"),
     ("collect_neg_clearance_frac", "Neg clearance frac"),
     ("collect_present_frac", "Present frac"),
     ("replay_size", "Replay size"),

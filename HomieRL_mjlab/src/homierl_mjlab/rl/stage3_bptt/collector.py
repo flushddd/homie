@@ -187,6 +187,8 @@ class Stage3SimCollector:
     self._env_ep_id = torch.zeros(
       self.env.num_envs, device=self.device, dtype=torch.long
     )
+    # Per-env step count (policy steps); mirrors PPO Train/mean_episode_length.
+    self._ep_len = torch.zeros(self.env.num_envs, device=self.device)
     self.hier = HierarchicalSubgoalState(self.env.num_envs, self.device)
     # Snapshot anchors after first reset.
     self.hier.ensure_all(self.env, arm_left=self.arm_left)
@@ -317,6 +319,7 @@ class Stage3SimCollector:
     ppo_step_rew_sum = 0.0
     # PPO episode-term logs (extras["log"] on reset) — monitor loco health only.
     ep_logs: list[dict] = []
+    finished_ep_lens: list[float] = []
     for step_i in range(int(num_steps)):
       state = pack_robot_state(self.env, arm_left=self.arm_left)
       _, geom = goal_geom_from_env(self.env)
@@ -401,9 +404,12 @@ class Stage3SimCollector:
         episode_id=self._env_ep_id,
       )
       self.last_a = high_a.detach()
+      self._ep_len += 1.0
       done_mask = dones.bool()
       if bool(done_mask.any()):
         done_ids = done_mask.nonzero(as_tuple=False).flatten()
+        finished_ep_lens.extend(self._ep_len[done_mask].detach().cpu().tolist())
+        self._ep_len[done_mask] = 0.0
         self._env_ep_id[done_mask] += 1
         self.last_a[done_mask] = 0.0
         self.hier.reset_envs(self.env, done_ids, arm_left=self.arm_left)
@@ -426,6 +432,13 @@ class Stage3SimCollector:
       "ppo_ep_log_count": float(len(ep_logs)),
       "control_mode_hierarchical": 1.0 if self.hierarchical else 0.0,
     }
+    if finished_ep_lens:
+      out["mean_episode_length"] = float(sum(finished_ep_lens) / len(finished_ep_lens))
+      out["episode_length_count"] = float(len(finished_ep_lens))
+    else:
+      # No episode finished this collect window — report running mean across envs.
+      out["mean_episode_length"] = float(self._ep_len.mean().item())
+      out["episode_length_count"] = 0.0
     out.update(_aggregate_ep_logs(ep_logs))
     return out
 
