@@ -35,26 +35,39 @@ class Stage3BpttCfg:
   w_target: float = 1.0
   # Safe ≥ target, but not so large that constant penetration kills all gradients.
   w_safe: float = 1.5
+  # Dense clearance-above-margin bonus (guides away before collision).
+  w_margin: float = 0.5
   w_smooth: float = 0.05
   w_stability: float = 0.0
 
   # --- world model ---
   wm_hidden: tuple[int, ...] = (512, 512, 256)
-  wm_lr: float = 1e-3
+  wm_lr: float = 3e-4  # lower than 1e-3; residual WM blows up less often
   wm_window: int = 8
   wm_batch: int = 256
   wm_warmup_steps: int = 2000
+  # Clamp per-step residual Δs predicted by WM (joint/root units mixed).
+  wm_residual_clip: float = 0.5
+  # Huber δ for WM fit (more robust than plain MSE on outliers).
+  wm_huber_delta: float = 1.0
 
   # --- actor / critic ---
   actor_hidden: tuple[int, ...] = (256, 256, 128)
   critic_hidden: tuple[int, ...] = (256, 256, 128)
-  actor_lr: float = 3e-4
-  critic_lr: float = 1e-3
+  actor_lr: float = 1e-4
+  critic_lr: float = 3e-4
   gamma: float = 0.99
   lam: float = 0.95
   imagine_horizon: int = 8
   grad_clip: float = 1.0
   target_critic_tau: float = 0.005
+  # Clamp imagined stage3 reward before BPTT (avoid J → ±inf).
+  reward_clip: float = 5.0
+  # Skip optimizer step / restore weights when loss or grads are non-finite.
+  nan_guard: bool = True
+  # After this many consecutive NaN train iters, reload last-good + shrink LRs.
+  nan_reload_patience: int = 3
+  nan_lr_decay: float = 0.5
 
   # --- loop ---
   replay_capacity: int = 200_000

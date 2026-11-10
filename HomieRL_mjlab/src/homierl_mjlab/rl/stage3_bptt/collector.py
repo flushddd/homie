@@ -373,6 +373,7 @@ class Stage3SimCollector:
         d_max=self.cfg.d_max,
         w_target=self.cfg.w_target,
         w_safe=self.cfg.w_safe,
+        w_margin=self.cfg.w_margin,
         w_smooth=self.cfg.w_smooth,
         present=present,
       )

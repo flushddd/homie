@@ -394,7 +394,9 @@
         "--ee-mode",
         "attractor",
         "--log-dir",
-        "logs/stage3_bptt_smoke"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt_smoke"
       ]
     },
     {
@@ -431,7 +433,9 @@
         "--ee-mode",
         "attractor",
         "--log-dir",
-        "logs/stage3_bptt"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
       ]
     },
     {
@@ -470,7 +474,9 @@
         "--control-mode",
         "hierarchical_subgoal",
         "--log-dir",
-        "logs/stage3_bptt_4096"
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
       ]
     }
   ],

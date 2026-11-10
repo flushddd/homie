@@ -52,10 +52,11 @@ class Stage3Critic(nn.Module):
 
 
 class WorldModel(nn.Module):
-  """Deterministic next-state residual model: ``s' = s + f(s, u, ctx)``.
+  """Deterministic next-state residual model: ``s' = s + clip(f(s, u, ctx))``.
 
   ``u`` is the full applied joint-position command (same semantics as PD
   targets in sim). ``ctx`` holds static goal/geometry encodings.
+  Residual clamp slows long-horizon explosion that often ends in NaN.
   """
 
   def __init__(
@@ -64,11 +65,13 @@ class WorldModel(nn.Module):
     control_dim: int,
     ctx_dim: int = 0,
     hidden: Sequence[int] = (512, 512, 256),
+    residual_clip: float = 0.5,
   ):
     super().__init__()
     self.state_dim = int(state_dim)
     self.control_dim = int(control_dim)
     self.ctx_dim = int(ctx_dim)
+    self.residual_clip = float(residual_clip)
     self.net = _mlp(state_dim + control_dim + ctx_dim, hidden, state_dim)
 
   def forward(
@@ -77,6 +80,8 @@ class WorldModel(nn.Module):
     control: torch.Tensor,
     ctx: torch.Tensor | None = None,
   ) -> torch.Tensor:
+    state = torch.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+    control = torch.nan_to_num(control, nan=0.0, posinf=0.0, neginf=0.0)
     if ctx is None:
       if self.ctx_dim > 0:
         ctx = torch.zeros(
@@ -84,9 +89,12 @@ class WorldModel(nn.Module):
         )
       else:
         x = torch.cat((state, control), dim=-1)
-        return state + self.net(x)
+        delta = self.net(x)
+        return state + delta.clamp(-self.residual_clip, self.residual_clip)
+    ctx = torch.nan_to_num(ctx, nan=0.0, posinf=0.0, neginf=0.0)
     x = torch.cat((state, control, ctx), dim=-1)
-    return state + self.net(x)
+    delta = self.net(x)
+    return state + delta.clamp(-self.residual_clip, self.residual_clip)
 
   def rollout(
     self,

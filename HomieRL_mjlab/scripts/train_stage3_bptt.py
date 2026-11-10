@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -34,7 +35,18 @@ def _parse() -> argparse.Namespace:
   p.add_argument("--stage2-checkpoint", type=str, default="")
   p.add_argument("--num-envs", type=int, default=16)
   p.add_argument("--device", type=str, default="cuda:0")
-  p.add_argument("--log-dir", type=str, default="logs/stage3_bptt")
+  p.add_argument(
+    "--log-dir",
+    type=str,
+    default="logs/rsl_rl/homie_g1",
+    help="Experiment root; each run creates <stamp>_<run-name>/ under this.",
+  )
+  p.add_argument(
+    "--run-name",
+    type=str,
+    default="stage3_bptt",
+    help="Suffix for the dated run folder (mjlab/rsl_rl style).",
+  )
   p.add_argument(
     "--curriculum",
     type=str,
@@ -226,21 +238,26 @@ def run_real(args: argparse.Namespace) -> int:
       f"(SuperMimic-style {steps_per_env} steps/env); needs substantial VRAM."
     )
 
+  # mjlab/rsl_rl layout: <log-dir>/<YYYY-mm-dd_HH-MM-SS>_<run-name>/
+  stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+  run_name = (args.run_name or "stage3_bptt").strip() or "stage3_bptt"
+  log_dir = Path(args.log_dir) / f"{stamp}_{run_name}"
+  log_dir.mkdir(parents=True, exist_ok=True)
+
   cfg = Stage3BpttCfg(
     device=args.device,
     stage2_checkpoint=args.stage2_checkpoint,
-    log_dir=args.log_dir,
+    log_dir=str(log_dir),
     curriculum=cur,
     collect_steps_per_iter=args.collect_per_iter,
     replay_capacity=max(200_000, need_cap),
     control_mode=str(args.control_mode),
   )
-  log_dir = Path(args.log_dir)
-  log_dir.mkdir(parents=True, exist_ok=True)
   print(
     f"[stage3_bptt] num_envs={n_envs} replay_capacity={cfg.replay_capacity} "
     f"(~{cfg.replay_capacity // n_envs} steps/env) control_mode={cfg.control_mode}"
   )
+  print(f"[INFO] Logging experiment in directory: {log_dir}")
 
   actor = None
   # obs_dim set after collector builds (depends on sdf_query_count)
@@ -284,10 +301,12 @@ def run_real(args: argparse.Namespace) -> int:
   print(json.dumps({**logs, "wall_s": warm_s}, indent=2))
   print(f"[info] warmup wall {warm_s:.1f}s")
 
-  def _save_ckpt(tag: int) -> Path:
-    ckpt = log_dir / f"stage3_bptt_{tag}.pt"
+  def _save_ckpt(tag: int | str) -> Path:
+    ckpt = log_dir / f"model_{tag}.pt"
     payload = trainer.state_dict()
     payload["stage2_checkpoint"] = args.stage2_checkpoint
+    payload["log_dir"] = str(log_dir)
+    payload["control_mode"] = cfg.control_mode
     torch.save(payload, ckpt)
     print(f"[info] saved {ckpt}")
     return ckpt
@@ -313,6 +332,12 @@ def run_real(args: argparse.Namespace) -> int:
     tot_timesteps += int(env_steps)
     tot_time += iter_s
     merged = {**clogs, **tlogs}
+    if merged.get("nan_reloaded", 0.0) > 0.5:
+      print(
+        f"[warn] NaN streak → restored last-good weights; "
+        f"wm_lr={merged.get('wm_lr', float('nan')):.2e}"
+      )
+      _save_ckpt(f"last_good_iter{it}")
     _print_iter_log(
       it=it,
       tot_iter=tot_iter,
@@ -325,7 +350,14 @@ def run_real(args: argparse.Namespace) -> int:
       logs=merged,
     )
     if (it + 1) % save_every == 0:
-      _save_ckpt(it + 1)
+      # Avoid overwriting a finite ckpt with NaN weights.
+      if any(
+        isinstance(merged.get(k), float) and merged[k] != merged[k]
+        for k in ("wm_loss", "critic_loss", "actor_loss")
+      ):
+        print(f"[warn] skip periodic save at iter {it+1}: non-finite train losses")
+      else:
+        _save_ckpt(it + 1)
 
   if tot_iter % save_every != 0:
     _save_ckpt(tot_iter)
