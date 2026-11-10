@@ -22,10 +22,46 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT / "src") not in sys.path:
   sys.path.insert(0, str(_ROOT / "src"))
+
+
+def _tb_log(writer: SummaryWriter, it: int, logs: dict[str, float], *, collect_s: float, update_s: float, env_steps: float, iter_s: float) -> None:
+  """Write Stage-3 BPTT scalars (same layout as the short Nov-9 smoke events)."""
+  fps = env_steps / max(iter_s, 1e-6)
+  writer.add_scalar("Perf/total_fps", fps, it)
+  writer.add_scalar("Perf/collection_time", collect_s, it)
+  writer.add_scalar("Perf/learning_time", update_s, it)
+  mapping = (
+    ("collect_rew_mean", "Train/mean_reward"),
+    ("ppo_step_rew_mean", "Train/ppo_step_reward"),
+    ("collect_neg_clearance_frac", "Train/neg_clearance_frac"),
+    ("collect_present_frac", "Train/present_frac"),
+    ("replay_size", "Train/replay_size"),
+    ("wm_loss", "Loss/world_model"),
+    ("critic_loss", "Loss/critic"),
+    ("actor_loss", "Loss/actor"),
+    ("actor_grad_norm", "Loss/actor_grad_norm"),
+    ("J_mean", "Train/imagination_J"),
+    ("nan_streak", "Train/nan_streak"),
+  )
+  for src, dst in mapping:
+    if src in logs and isinstance(logs[src], (int, float)):
+      v = float(logs[src])
+      if v == v:  # skip NaN
+        writer.add_scalar(dst, v, it)
+  for key, val in logs.items():
+    if not key.startswith("ppo/") or not isinstance(val, (int, float)):
+      continue
+    v = float(val)
+    if v != v:
+      continue
+    # Homie-style episode terms under Episode/
+    writer.add_scalar(f"Episode/{key[len('ppo/'):]}", v, it)
+  writer.flush()
 
 
 def _parse() -> argparse.Namespace:
@@ -264,6 +300,16 @@ def run_real(args: argparse.Namespace) -> int:
     f"(~{cfg.replay_capacity // n_envs} steps/env) control_mode={cfg.control_mode}"
   )
   print(f"[INFO] Logging experiment in directory: {log_dir}")
+  writer = SummaryWriter(log_dir=str(log_dir), flush_secs=10)
+  writer.add_text(
+    "config/stage3_bptt",
+    (
+      f"ee_mode={args.ee_mode} control_mode={args.control_mode} "
+      f"curriculum={cur} num_envs={n_envs} "
+      f"stage2={args.stage2_checkpoint}"
+    ),
+    0,
+  )
 
   # obs_dim set after collector builds (depends on sdf_query_count)
   collector = Stage3SimCollector(
@@ -361,6 +407,15 @@ def run_real(args: argparse.Namespace) -> int:
       tot_time=tot_time,
       logs=merged,
     )
+    _tb_log(
+      writer,
+      it,
+      merged,
+      collect_s=collect_s,
+      update_s=update_s,
+      env_steps=env_steps,
+      iter_s=iter_s,
+    )
     if (it + 1) % save_every == 0:
       # Avoid overwriting a finite ckpt with NaN weights.
       if any(
@@ -374,6 +429,7 @@ def run_real(args: argparse.Namespace) -> int:
   if tot_iter % save_every != 0:
     _save_ckpt(tot_iter)
 
+  writer.close()
   print(f"[ok] real train loop finished (curriculum {cur}) log_dir={log_dir}")
   return 0
 
