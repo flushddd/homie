@@ -13,7 +13,11 @@ import torch.nn.functional as F
 from homierl_mjlab.rl.stage3_bptt.cfg import Stage3BpttCfg
 from homierl_mjlab.rl.stage3_bptt.networks import Stage3Actor, Stage3Critic, WorldModel
 from homierl_mjlab.rl.stage3_bptt.replay import EpisodeReplay
-from homierl_mjlab.rl.stage3_bptt.rewards_stage3 import stage3_reward
+from homierl_mjlab.rl.stage3_bptt.rewards_stage3 import (
+  soft_stability_reward,
+  stage3_reward,
+  tilt_angle_from_root_quat,
+)
 
 
 def _finite(x: torch.Tensor) -> bool:
@@ -33,6 +37,10 @@ def _params_finite(module: nn.Module) -> bool:
   return True
 
 
+def math_isfinite(x: float) -> bool:
+  return x == x and abs(x) != float("inf")
+
+
 class Stage3BpttTrainer:
   """Alternating: WM → critic → BPTT actor (SuperMimic-style short AC).
 
@@ -40,6 +48,7 @@ class Stage3BpttTrainer:
     - ``control = stitch(logged_loco_u, dls(arm | delta_p))`` is provided by
       ``control_fn(state, delta_p, goal, geom) -> control``.
     - Palm / clearance for rewards via ``geom_fn(state, goal, geom)``.
+    - ``present`` from replay gates safe/margin like real collect (P0).
   """
 
   def __init__(
@@ -156,9 +165,14 @@ class Stage3BpttTrainer:
       return {key: float("nan"), f"{key}_restored": 1.0}
     return {key: float(loss.detach().item()), f"{key}_grad_norm": gn}
 
+  def _tilt_from_state(self, state: torch.Tensor) -> torch.Tensor:
+    """Root tilt from packed state ``…|pos3|quat_wxyz4|lin3|ang3|palm3``."""
+    quat = state[..., -16:-12]
+    return tilt_angle_from_root_quat(quat)
+
   def update_world_model(self) -> dict[str, float]:
     cfg = self.cfg
-    states, controls, _, _, goals, geoms = self.replay.sample_contiguous_windows(
+    states, controls, _, _, _, goals, geoms, _ = self.replay.sample_contiguous_windows(
       cfg.wm_batch, cfg.wm_window, num_envs_hint=getattr(self, "num_envs_hint", None)
     )
     states, controls, goals, geoms = _sanitize(states, controls, goals, geoms)
@@ -175,13 +189,28 @@ class Stage3BpttTrainer:
 
   def update_critic(self) -> dict[str, float]:
     cfg = self.cfg
-    states, controls, rewards, terms, goals, geoms = self.replay.sample_contiguous_windows(
+    (
+      states,
+      controls,
+      rewards,
+      terms,
+      _truncs,
+      goals,
+      geoms,
+      _present,
+    ) = self.replay.sample_contiguous_windows(
       cfg.wm_batch, cfg.wm_window, num_envs_hint=getattr(self, "num_envs_hint", None)
     )
     states, controls, rewards, terms, goals, geoms = _sanitize(
       states, controls, rewards, terms, goals, geoms
     )
-    rewards = rewards.clamp(-float(cfg.reward_clip), float(cfg.reward_clip))
+    clip = float(cfg.reward_clip)
+    if cfg.clip_critic_reward:
+      clipped = rewards.clamp(-clip, clip)
+      clip_frac = float((rewards.abs() > clip).float().mean().item())
+    else:
+      clipped = rewards
+      clip_frac = 0.0
     b, h, _ = controls.shape
     feats = []
     for t in range(h + 1):
@@ -192,14 +221,16 @@ class Stage3BpttTrainer:
       returns = torch.zeros(b, h, device=self.device)
       gae = torch.zeros(b, device=self.device)
       for t in reversed(range(h)):
+        # Bootstrap through time_out (truncated); stop only on true terminated.
         mask = 1.0 - terms[:, t]
-        delta = rewards[:, t] + cfg.gamma * mask * v_tgt[:, t + 1] - v_tgt[:, t]
+        delta = clipped[:, t] + cfg.gamma * mask * v_tgt[:, t + 1] - v_tgt[:, t]
         gae = delta + cfg.gamma * cfg.lam * mask * gae
         returns[:, t] = gae + v_tgt[:, t]
     loss = F.mse_loss(values[:, :-1], returns.detach())
     out = self._step_or_skip(
       loss=loss, opt=self.opt_critic, module=self.critic, key="critic_loss"
     )
+    out["critic_reward_clip_frac"] = clip_frac
     if out.get("critic_loss_skipped") or out.get("critic_loss_restored"):
       return out
     with torch.no_grad():
@@ -208,56 +239,88 @@ class Stage3BpttTrainer:
     return out
 
   def update_actor_bptt(self) -> dict[str, float]:
-    """Freeze WM + critic weights; BPTT through imagined H steps."""
+    """Freeze WM + critic **weights**; grads still flow through WM/critic inputs."""
     cfg = self.cfg
-    states, _, _, _, goals, geoms = self.replay.sample_contiguous_windows(
+    states, _, _, _, _, goals, geoms, present = self.replay.sample_contiguous_windows(
       max(32, cfg.wm_batch // 4),
       1,
       num_envs_hint=getattr(self, "num_envs_hint", None),
     )
-    states, goals, geoms = _sanitize(states, goals, geoms)
+    states, goals, geoms, present = _sanitize(states, goals, geoms, present)
     s = states[:, 0].detach().requires_grad_(True)
     ctx = torch.cat((goals, geoms), dim=-1)
     last_a = torch.zeros(s.shape[0], 3, device=self.device)
     returns = []
     discount = torch.ones(s.shape[0], device=self.device)
     surv = torch.ones(s.shape[0], device=self.device)
+    present_b = present.reshape(s.shape[0]) if cfg.imag_use_present else None
+    term_acc: dict[str, list[torch.Tensor]] = {}
+    clip = float(cfg.reward_clip)
+    clip_hits = 0
+    clip_total = 0
 
     for p in self.wm.parameters():
       p.requires_grad_(False)
     for p in self.critic.parameters():
       p.requires_grad_(False)
 
-    for t in range(cfg.imagine_horizon):
+    use_palm = bool(cfg.use_palm_step) and self.palm_step_fn is not None
+    for _t in range(cfg.imagine_horizon):
       obs = self.obs_fn(s, goals, geoms, last_a)
       obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
       a = self.actor(obs)
       u = self.control_fn(s, a, goals, geoms)
       s_wm = self.wm(s, u, ctx)
-      # Keep actor→reward grads via first-order EE kinematics (WM palm path alone
-      # is too weak / often ~zero for hierarchical subgoals).
-      if self.palm_step_fn is not None:
+      if use_palm:
         palm_kin = self.palm_step_fn(s, a, goals, geoms)
         s = torch.cat((s_wm[..., :-3], palm_kin), dim=-1)
       else:
         s = s_wm
       palm, clearance = self.geom_fn(s, goals, geoms)
-      r = stage3_reward(
+      stab = None
+      if float(cfg.w_stability) != 0.0:
+        tilt = self._tilt_from_state(s)
+        stab = soft_stability_reward(
+          tilt,
+          limit_rad=cfg.stability_limit_rad,
+          soft_rad=cfg.stability_soft_rad,
+        )
+      r, terms = stage3_reward(
         palm_pos=palm,
         goal_pos=goals[..., :3],
         clearance=clearance,
         action=a,
         last_action=last_a,
         sigma_p=cfg.sigma_p,
+        sigma_far=cfg.sigma_far,
         d_safe=cfg.d_safe,
         d_max=cfg.d_max,
+        reach_threshold=cfg.reach_threshold,
         w_target=cfg.w_target,
+        w_approach=cfg.w_approach,
         w_safe=cfg.w_safe,
         w_margin=cfg.w_margin,
         w_smooth=cfg.w_smooth,
+        w_soft_success=cfg.w_soft_success,
         w_stability=cfg.w_stability,
+        stability=stab,
+        present=present_b,
+        return_terms=True,
       )
-      r = r.clamp(-float(cfg.reward_clip), float(cfg.reward_clip))
+      for k, v in terms.items():
+        term_acc.setdefault(k, []).append(v.detach())
+      if cfg.clip_imag_reward:
+        clip_hits += int((r.abs() > clip).sum().item())
+        clip_total += int(r.numel())
+        r = r.clamp(-clip, clip)
+      if cfg.imag_soft_survival:
+        tilt = self._tilt_from_state(s)
+        soft = soft_stability_reward(
+          tilt,
+          limit_rad=cfg.stability_limit_rad,
+          soft_rad=cfg.stability_soft_rad,
+        )
+        surv = surv * (0.5 + 0.5 * (1.0 + soft)).clamp(0.05, 1.0)
       returns.append(discount * surv * r)
       discount = discount * cfg.gamma
       last_a = a
@@ -270,13 +333,18 @@ class Stage3BpttTrainer:
     out = self._step_or_skip(
       loss=loss, opt=self.opt_actor, module=self.actor, key="actor_loss"
     )
-    # Remap keys to historical names used in logs.
     gn = out.get("actor_loss_grad_norm", out.get("actor_grad_norm", 0.0))
     mapped = {
       "actor_loss": out.get("actor_loss", float("nan")),
-      "actor_grad_norm": float(gn) if gn == gn else 0.0,  # NaN → 0 for logs
+      "actor_grad_norm": float(gn) if gn == gn else 0.0,
       "J_mean": float(j.detach().mean()) if _finite(j) else float("nan"),
+      "imag_reward_clip_frac": float(clip_hits) / max(clip_total, 1),
+      "imag_present_frac": float(present.mean().item()),
+      "imag_use_palm_step": 1.0 if use_palm else 0.0,
     }
+    for k, vs in term_acc.items():
+      stacked = torch.stack(vs, dim=0)
+      mapped[f"imag/{k}"] = float(stacked.float().mean().cpu())
     if out.get("actor_loss_skipped"):
       mapped["actor_skipped"] = 1.0
     if out.get("actor_loss_restored"):
@@ -302,7 +370,10 @@ class Stage3BpttTrainer:
     bad = any(
       (k in logs and isinstance(logs[k], float) and not math_isfinite(logs[k]))
       for k in ("wm_loss", "critic_loss", "actor_loss", "J_mean")
-    ) or any(logs.get(k, 0.0) > 0.5 for k in ("wm_loss_restored", "critic_loss_restored", "actor_restored"))
+    ) or any(
+      logs.get(k, 0.0) > 0.5
+      for k in ("wm_loss_restored", "critic_loss_restored", "actor_restored")
+    )
     if bad:
       self.nan_streak += 1
       logs["nan_streak"] = float(self.nan_streak)
@@ -329,9 +400,17 @@ class Stage3BpttTrainer:
       "opt_wm": self.opt_wm.state_dict(),
       "iter": self.iter,
       "cfg": asdict(self.cfg),
+      "reward_schema": "stage3_v2_present_approach_stability",
     }
 
   def load_state_dict(self, sd: dict) -> None:
+    schema = sd.get("reward_schema")
+    if schema not in (None, "stage3_v2_present_approach_stability"):
+      raise RuntimeError(
+        f"Incompatible Stage3 checkpoint reward_schema={schema!r}; "
+        "expected stage3_v2_present_approach_stability (or legacy None). "
+        "Do not silent-load — restart from phase-2 loco ckpt."
+      )
     self.actor.load_state_dict(sd["actor"])
     self.critic.load_state_dict(sd["critic"])
     self.critic_tgt.load_state_dict(sd["critic_tgt"])
@@ -341,7 +420,3 @@ class Stage3BpttTrainer:
     self.opt_wm.load_state_dict(sd["opt_wm"])
     self.iter = int(sd.get("iter", 0))
     self.snapshot_good()
-
-
-def math_isfinite(x: float) -> bool:
-  return x == x and abs(x) != float("inf")

@@ -42,12 +42,17 @@ def _tb_log(writer: SummaryWriter, it: int, logs: dict[str, float], *, collect_s
     ("episode_length_count", "Train/episode_length_count"),
     ("collect_neg_clearance_frac", "Train/neg_clearance_frac"),
     ("collect_present_frac", "Train/present_frac"),
+    ("reach_success_frac", "Train/reach_success_frac"),
+    ("clear_reach_success_frac", "Train/clear_reach_success_frac"),
+    ("mean_goal_distance", "Train/mean_goal_distance"),
     ("replay_size", "Train/replay_size"),
     ("wm_loss", "Loss/world_model"),
     ("critic_loss", "Loss/critic"),
     ("actor_loss", "Loss/actor"),
     ("actor_grad_norm", "Loss/actor_grad_norm"),
     ("J_mean", "Train/imagination_J"),
+    ("imag_reward_clip_frac", "Train/imag_reward_clip_frac"),
+    ("critic_reward_clip_frac", "Train/critic_reward_clip_frac"),
     ("nan_streak", "Train/nan_streak"),
   )
   for src, dst in mapping:
@@ -56,13 +61,17 @@ def _tb_log(writer: SummaryWriter, it: int, logs: dict[str, float], *, collect_s
       if v == v:  # skip NaN
         writer.add_scalar(dst, v, it)
   for key, val in logs.items():
-    if not key.startswith("ppo/") or not isinstance(val, (int, float)):
+    if not isinstance(val, (int, float)):
       continue
     v = float(val)
     if v != v:
       continue
-    # Homie-style episode terms under Episode/
-    writer.add_scalar(f"Episode/{key[len('ppo/'):]}", v, it)
+    if key.startswith("ppo/"):
+      writer.add_scalar(f"Episode/{key[len('ppo/'):]}", v, it)
+    elif key.startswith("real/"):
+      writer.add_scalar(f"RewardReal/{key[len('real/'):]}", v, it)
+    elif key.startswith("imag/"):
+      writer.add_scalar(f"RewardImag/{key[len('imag/'):]}", v, it)
   writer.flush()
 
 
@@ -149,6 +158,9 @@ def _print_iter_log(
     ("episode_length_count", "Episode length count"),
     ("collect_neg_clearance_frac", "Neg clearance frac"),
     ("collect_present_frac", "Present frac"),
+    ("reach_success_frac", "Reach success frac"),
+    ("clear_reach_success_frac", "Clear-reach success frac"),
+    ("mean_goal_distance", "Mean goal distance"),
     ("replay_size", "Replay size"),
     ("ppo_ep_log_count", "PPO ep log count"),
     ("wm_loss", "World-model loss"),
@@ -252,6 +264,7 @@ def run_synthetic_smoke(device: str) -> int:
       ),
       goal=torch.zeros(1, goal_dim, device=trainer.device),
       geom=torch.zeros(1, geom_dim, device=trainer.device),
+      present=torch.zeros(1, device=trainer.device),
       env_id=torch.zeros(1, device=trainer.device, dtype=torch.long),
       episode_id=torch.zeros(1, device=trainer.device, dtype=torch.long),
     )

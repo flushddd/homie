@@ -23,8 +23,15 @@ from homierl_mjlab.rl.stage3_bptt.env_bridge import (
   palm_pos_base,
 )
 from homierl_mjlab.rl.stage3_bptt.geom_clearance import (
+  _present_from_geom,
   palm_probe_clearance,
   sdf_query_from_geom,
+)
+from homierl_mjlab.rl.stage3_bptt.rewards_stage3 import (
+  mean_terms,
+  soft_stability_reward,
+  stage3_reward,
+  tilt_angle_from_root_quat,
 )
 from homierl_mjlab.rl.stage3_bptt.hierarchical import (
   HierarchicalSubgoalState,
@@ -35,7 +42,6 @@ from homierl_mjlab.rl.stage3_bptt.hierarchical import (
 )
 from homierl_mjlab.rl.stage3_bptt.networks import Stage3Actor
 from homierl_mjlab.rl.stage3_bptt.replay import EpisodeReplay
-from homierl_mjlab.rl.stage3_bptt.rewards_stage3 import stage3_reward
 
 
 def _configure_grasp_reach(env_cfg) -> None:
@@ -189,6 +195,8 @@ class Stage3SimCollector:
     )
     # Per-env step count (policy steps); mirrors PPO Train/mean_episode_length.
     self._ep_len = torch.zeros(self.env.num_envs, device=self.device)
+    # Last finished-episode mean (hold across iters with zero completions).
+    self._last_mean_ep_len = 0.0
     self.hier = HierarchicalSubgoalState(self.env.num_envs, self.device)
     # Snapshot anchors after first reset.
     self.hier.ensure_all(self.env, arm_left=self.arm_left)
@@ -317,6 +325,10 @@ class Stage3SimCollector:
     present_sum = 0.0
     rew_sum = 0.0
     ppo_step_rew_sum = 0.0
+    reach_sum = 0.0
+    clear_reach_sum = 0.0
+    dist_sum = 0.0
+    term_sums: dict[str, float] = {}
     # PPO episode-term logs (extras["log"] on reset) — monitor loco health only.
     ep_logs: list[dict] = []
     finished_ep_lens: list[float] = []
@@ -365,21 +377,49 @@ class Stage3SimCollector:
         present = self.env.command_manager.get_term("container").present
       except Exception:  # noqa: BLE001
         present = torch.zeros(n, device=self.device)
-      r = stage3_reward(
+      stab = None
+      if float(self.cfg.w_stability) != 0.0:
+        # Root quat in packed state: …|pos3|quat4|…|palm3
+        quat = state[..., -16:-12]
+        tilt = tilt_angle_from_root_quat(quat)
+        stab = soft_stability_reward(
+          tilt,
+          limit_rad=self.cfg.stability_limit_rad,
+          soft_rad=self.cfg.stability_soft_rad,
+        )
+      r, terms = stage3_reward(
         palm_pos=palm,
         goal_pos=goal,
         clearance=clr,
         action=high_a,
         last_action=self.last_a,
         sigma_p=self.cfg.sigma_p,
+        sigma_far=self.cfg.sigma_far,
         d_safe=self.cfg.d_safe,
         d_max=self.cfg.d_max,
+        reach_threshold=self.cfg.reach_threshold,
         w_target=self.cfg.w_target,
+        w_approach=self.cfg.w_approach,
         w_safe=self.cfg.w_safe,
         w_margin=self.cfg.w_margin,
         w_smooth=self.cfg.w_smooth,
+        w_soft_success=self.cfg.w_soft_success,
+        w_stability=self.cfg.w_stability,
+        stability=stab,
         present=present,
+        return_terms=True,
       )
+      for k, v in mean_terms(terms, prefix="real/").items():
+        # Running mean across collect steps.
+        term_sums[k] = term_sums.get(k, 0.0) + v
+      # Hard reach success (eval metric; not the training soft term).
+      dist = torch.linalg.norm(palm - goal, dim=-1)
+      reach_ok = (dist < float(self.cfg.reach_threshold)).float()
+      # "Clear reach": success and no active-arm penetration this step.
+      clear_ok = reach_ok * ((clr.min(dim=-1).values >= 0.0) | (present < 0.5)).float()
+      reach_sum += float(reach_ok.mean().item())
+      clear_reach_sum += float(clear_ok.mean().item())
+      dist_sum += float(dist.mean().item())
       dones_f = dones.float()
       truncated = torch.zeros_like(dones_f)
       if isinstance(extras, dict) and "time_outs" in extras:
@@ -400,6 +440,7 @@ class Stage3SimCollector:
         truncated=truncated,
         goal=goal,
         geom=geom,
+        present=present,
         env_id=env_ids,
         episode_id=self._env_ep_id,
       )
@@ -422,22 +463,30 @@ class Stage3SimCollector:
       coll_env_sum += float(hit.float().mean().item())
       present_sum += float((present > 0.5).float().mean().item())
 
+    denom = max(num_steps, 1)
     out = {
       "collect_steps": float(num_steps),
-      "collect_rew_mean": rew_sum / max(num_steps, 1),
-      "ppo_step_rew_mean": ppo_step_rew_sum / max(num_steps, 1),
-      "collect_neg_clearance_frac": coll_env_sum / max(num_steps, 1),
-      "collect_present_frac": present_sum / max(num_steps, 1),
+      "collect_rew_mean": rew_sum / denom,
+      "ppo_step_rew_mean": ppo_step_rew_sum / denom,
+      "collect_neg_clearance_frac": coll_env_sum / denom,
+      "collect_present_frac": present_sum / denom,
+      "reach_success_frac": reach_sum / denom,
+      "clear_reach_success_frac": clear_reach_sum / denom,
+      "mean_goal_distance": dist_sum / denom,
       "replay_size": float(replay.size),
       "ppo_ep_log_count": float(len(ep_logs)),
       "control_mode_hierarchical": 1.0 if self.hierarchical else 0.0,
     }
+    for k, v in term_sums.items():
+      out[k] = v / denom
     if finished_ep_lens:
-      out["mean_episode_length"] = float(sum(finished_ep_lens) / len(finished_ep_lens))
+      self._last_mean_ep_len = float(sum(finished_ep_lens) / len(finished_ep_lens))
+      out["mean_episode_length"] = self._last_mean_ep_len
       out["episode_length_count"] = float(len(finished_ep_lens))
     else:
-      # No episode finished this collect window — report running mean across envs.
-      out["mean_episode_length"] = float(self._ep_len.mean().item())
+      # Do NOT use unfinished running lengths — with synced time_outs that
+      # creates a fake sawtooth every ~max_ep_len/collect_steps iters.
+      out["mean_episode_length"] = float(self._last_mean_ep_len)
       out["episode_length_count"] = 0.0
     out.update(_aggregate_ep_logs(ep_logs))
     return out
@@ -497,21 +546,25 @@ class Stage3SimCollector:
 
     def obs_fn(state, goal, geom, last_a):
       palm = state[..., -3:]
-      # Analytic SDF/clearance from packed geom (not fake "always safe").
+      b = state.shape[0]
+      # Analytic SDF/clearance from packed geom; absent container → zero SDF /
+      # max clearance (do not expose a fake box to actor/critic).
       if geom is not None and geom.shape[-1] >= 10:
-        sdf = sdf_query_from_geom(geom, query_count=sdf_k, d_max=d_max)
+        present = _present_from_geom(geom).reshape(b, 1)
+        sdf = sdf_query_from_geom(geom, query_count=sdf_k, d_max=d_max) * present
         clr3 = palm_probe_clearance(palm, geom, d_max=d_max)
-        pad = torch.ones(
-          state.shape[0], 3, device=state.device, dtype=state.dtype
+        clr3 = torch.where(
+          present > 0.5, clr3, torch.ones_like(clr3) * d_max
         )
+        pad = torch.ones(b, 3, device=state.device, dtype=state.dtype) * d_max
         clr = (
           torch.cat((clr3, pad), dim=-1)
           if arm_left
           else torch.cat((pad, clr3), dim=-1)
         )
       else:
-        sdf = torch.zeros(state.shape[0], sdf_k, device=state.device)
-        clr = torch.ones(state.shape[0], 6, device=state.device) * d_max
+        sdf = torch.zeros(b, sdf_k, device=state.device)
+        clr = torch.ones(b, 6, device=state.device) * d_max
       if hierarchical:
         # Match build_hierarchical_obs: palm, goal, goal−ee0≈goal, palm−ee0≈palm,
         # last_a, sdf, clr (imagination lacks live ee0; approximate).

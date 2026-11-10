@@ -33,12 +33,31 @@ class Stage3BpttCfg:
 
   # --- rewards ---
   w_target: float = 1.0
+  # Far-field approach (larger σ); keep smaller than near target so near precision wins.
+  w_approach: float = 0.3
+  sigma_far: float = 0.35
   # Safe ≥ target, but not so large that constant penetration kills all gradients.
   w_safe: float = 1.5
   # Dense clearance-above-margin bonus (guides away before collision).
+  # Set 0 for margin ablation (P2).
   w_margin: float = 0.5
   w_smooth: float = 0.05
-  w_stability: float = 0.0
+  # Continuous near-goal peak (eval still uses hard reach_threshold).
+  w_soft_success: float = 0.2
+  # Soft body tilt cost (imagination + optional collect); 0 disables.
+  w_stability: float = 0.15
+  stability_limit_rad: float = 1.047  # ~60° soft start (fell_over hard-stop is 70°)
+  stability_soft_rad: float = 0.25
+  # Soft survival weight in imagination from predicted tilt (not a hard truncate).
+  imag_soft_survival: bool = True
+  # Keep palm_step_fn path (P1: do not delete; set False to ablate).
+  use_palm_step: bool = True
+  # Imagination must gate safe/margin with stored present (P0).
+  imag_use_present: bool = True
+  # Soft-clip collect reward for critic targets only (raw replay stays unclipped).
+  clip_critic_reward: bool = True
+  # Soft-clip imagined actor rewards (log clip rate; avoid saturating forever).
+  clip_imag_reward: bool = True
 
   # --- world model ---
   wm_hidden: tuple[int, ...] = (512, 512, 256)

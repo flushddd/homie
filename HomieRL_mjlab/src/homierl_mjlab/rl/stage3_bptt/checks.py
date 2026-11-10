@@ -85,6 +85,7 @@ def check_bptt_actor_graph() -> dict[str, float]:
       clearance=clearance,
       action=a,
       last_action=last,
+      present=torch.ones(8),
     )
     rets.append(disc * r)
     disc = disc * 0.99
@@ -102,11 +103,51 @@ def check_bptt_actor_graph() -> dict[str, float]:
   }
 
 
+def check_present_reward_gate() -> dict[str, float]:
+  """Same state/geometry: present=0 must zero safe/margin; present=1 keeps them."""
+  palm = torch.zeros(4, 3)
+  goal = torch.tensor([[0.3, 0.0, 0.0]]).expand(4, 3)
+  # Deep penetration-like clearance (negative meters after * d_max).
+  clr = torch.full((4, 3), -0.2)
+  a = torch.zeros(4, 3)
+  last = torch.zeros(4, 3)
+  r0, t0 = stage3_reward(
+    palm_pos=palm,
+    goal_pos=goal,
+    clearance=clr,
+    action=a,
+    last_action=last,
+    present=torch.zeros(4),
+    return_terms=True,
+  )
+  r1, t1 = stage3_reward(
+    palm_pos=palm,
+    goal_pos=goal,
+    clearance=clr,
+    action=a,
+    last_action=last,
+    present=torch.ones(4),
+    return_terms=True,
+  )
+  return {
+    "w_safe_absent": float(t0["w_safe"].mean()),
+    "w_margin_absent": float(t0["w_margin"].mean()),
+    "w_safe_present": float(t1["w_safe"].mean()),
+    "r_absent": float(r0.mean()),
+    "r_present": float(r1.mean()),
+  }
+
+
 def run_all_checks() -> dict[str, object]:
   out: dict[str, object] = {}
   out["dls_grad"] = check_dls_grad()
   out["fd_jac_rel_err"] = check_fd_jacobian()
   out["bptt_graph"] = check_bptt_actor_graph()
+  gate = check_present_reward_gate()
+  out["present_gate"] = gate
+  assert abs(gate["w_safe_absent"]) < 1e-8
+  assert abs(gate["w_margin_absent"]) < 1e-8
+  assert gate["w_safe_present"] < -1e-6
   return out
 
 
