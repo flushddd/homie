@@ -179,9 +179,70 @@
         "--run-name",
         "stage3_bptt"
       ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage12 BPTT Checks",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage12_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--check"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage12 BPTT Phase1 (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage12_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--phase",
+        "1",
+        "--num_envs",
+        "4096",
+        "--collect_steps",
+        "50",
+        "--device",
+        "cuda:0"
+      ]
     }
   ],
   "inputs": [
+    {
+      "id": "homiePhase1Ckpt",
+      "type": "promptString",
+      "description": "Phase-1 checkpoint filename",
+      "default": "model_11000.pt"
+    },
+    {
+      "id": "homieResumeCkpt",
+      "type": "promptString",
+      "description": "Checkpoint to resume (prefer pre-crash, e.g. model_9000.pt)",
+      "default": "model_9000.pt"
+    },
+    {
+      "id": "homieResumePhase2Ckpt",
+      "type": "promptString",
+      "description": "Phase-2 checkpoint filename",
+      "default": "model_18800.pt"
+    },
+    {
+      "id": "homiePhase2CkptForPhase3",
+      "type": "promptString",
+      "description": "Phase-2 checkpoint filename for Phase-3 resume",
+      "default": "model_17400.pt"
+    },
+    {
+      "id": "homieResumePhase3Ckpt",
+      "type": "promptString",
+      "description": "Phase-3 checkpoint filename",
+      "default": "model_0.pt"
+    },
     {
       "id": "homieStage2CkptForBptt",
       "type": "promptString",
