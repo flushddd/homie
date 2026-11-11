@@ -30,6 +30,9 @@ class Stage3BpttCfg:
   subgoal_rate_limit_m: float = 0.04
   # Frozen phase-2 teacher MSE weight on a_body (regularizer, not the only loco signal).
   w_teacher: float = 2.0
+  # HIM inference mean is clipped to ±100; Stage3 body is tanh ∈ [-1, 1].
+  # Clip teacher actions to this bound before BC / curriculum MSE / env exec.
+  teacher_action_clip: float = 1.0
   # Blend Phase-1/2 env PPO step reward into Stage3 replay / critic targets.
   # This is the same Episode_Reward/* stack (tracking, orientation, height, …).
   w_loco: float = 1.0

@@ -472,6 +472,11 @@ class Stage3SimCollector:
         obs_td = self.vec.get_observations()
         with torch.inference_mode():
           full_teacher = self.policy(obs_td)
+        # HIM act_inference mean is only clipped to ±100; Stage3 body is tanh
+        # ∈ [-1, 1]. Clip teacher to the env action range so BC / curriculum MSE
+        # are on the same scale (else teacher_mse sticks ~10–15 and never gates).
+        teacher_clip = float(getattr(self.cfg, "teacher_action_clip", 1.0))
+        full_teacher = full_teacher.clamp(-teacher_clip, teacher_clip)
         teacher_body = full_teacher[..., : self.body_dim].detach()
         if self.ee_mode != "actor" or self.actor is None:
           a_body = teacher_body.clone()
@@ -507,6 +512,8 @@ class Stage3SimCollector:
           ee_delta = high_a
         with torch.inference_mode():
           full_a = self.policy(obs_td)
+        teacher_clip = float(getattr(self.cfg, "teacher_action_clip", 1.0))
+        full_a = full_a.clamp(-teacher_clip, teacher_clip)
         teacher_body = full_a[..., : self.body_dim].detach()
         ee_raw = meters_to_ee_raw(ee_delta, self.ee_scale)
         act = full_a.clone()
