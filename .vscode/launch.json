@@ -1,0 +1,198 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "HomieRL mjlab: Play Stage3 BPTT (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/play_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--bptt-checkpoint",
+        "${input:homieBpttCheckpoint}",
+        "--curriculum",
+        "A",
+        "--ee-mode",
+        "actor",
+        "--device",
+        "cuda:0",
+        "--log-every",
+        "25"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Checks",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--check"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Smoke (1 env)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "1",
+        "--device",
+        "cuda:0",
+        "--curriculum",
+        "A",
+        "--curriculum-auto",
+        "--start-phase",
+        "body",
+        "--warmup-collect",
+        "20",
+        "--collect-per-iter",
+        "10",
+        "--iters",
+        "2",
+        "--save-every",
+        "1",
+        "--ee-mode",
+        "actor",
+        "--control-mode",
+        "body_ee_palm_delta",
+        "--log-dir",
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt_smoke"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train (16)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "16",
+        "--device",
+        "cuda:0",
+        "--curriculum",
+        "A",
+        "--curriculum-auto",
+        "--start-phase",
+        "body",
+        "--warmup-collect",
+        "1000",
+        "--collect-per-iter",
+        "200",
+        "--iters",
+        "100000",
+        "--save-every",
+        "500",
+        "--ee-mode",
+        "actor",
+        "--control-mode",
+        "body_ee_palm_delta",
+        "--log-dir",
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Stage3 BPTT Train (4096)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/train_stage3_bptt.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--stage2-checkpoint",
+        "${input:homieStage2CkptForBptt}",
+        "--num-envs",
+        "4096",
+        "--device",
+        "cuda:0",
+        "--curriculum",
+        "A",
+        "--curriculum-auto",
+        "--start-phase",
+        "body",
+        "--warmup-collect",
+        "1000",
+        "--collect-per-iter",
+        "32",
+        "--iters",
+        "100000",
+        "--save-every",
+        "200",
+        "--ee-mode",
+        "actor",
+        "--control-mode",
+        "body_ee_palm_delta",
+        "--log-dir",
+        "logs/rsl_rl/homie_g1",
+        "--run-name",
+        "stage3_bptt"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "homieStage2CkptForBptt",
+      "type": "promptString",
+      "description": "Frozen phase-2 checkpoint for Stage3 BPTT (full path under HomieRL_mjlab/)",
+      "default": "logs/rsl_rl/homie_g1/phase2/model_18600.pt"
+    },
+    {
+      "id": "homieBpttCheckpoint",
+      "type": "promptString",
+      "description": "Stage3 BPTT actor ckpt (train_stage3_bptt model_*.pt; has key 'actor')",
+      "default": "logs/rsl_rl/homie_g1/phase3/model_9400.pt"
+    }
+  ]
+}
