@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
@@ -834,22 +835,32 @@ def homie_g1_flat_env_cfg(
     if "bump_bend_curriculum" in cfg.events:
       cfg.events["bump_bend_curriculum"].params["ratio_step"] = 0.0
     cont = cfg.commands.get("container")
+    # Oracle play (env HOMIE_PLAY_ORACLE_SUBGOAL=1): no crate, Δp=0 → IK chases
+    # Viser grasp target only (= p_sub := p_goal diagnostic for frozen loco+IK).
+    oracle_play = int(phase) >= 3 and str(
+      os.environ.get("HOMIE_PLAY_ORACLE_SUBGOAL", "")
+    ).strip() in ("1", "true", "True", "yes", "YES")
     if cont is not None and int(phase) >= 3:
-      # Play: default crate on (Viser "Show container" can toggle); low+far grasp.
-      cont.presence_prob = 1.0
-      cont.presence_requires_reach = False
-      cont.presence_requires_need_waist = False
-      cont.presence_also_on_low_z = False
-      cont.relocate_grasp_when_present = True
-      cont.grasp_pos_x = (0.45, 0.45)
-      cont.grasp_pos_y = (0.15, 0.15)
-      cont.grasp_pos_z = (-0.46, -0.46)
-      cont.resampling_time_range = (1e9, 1e9)
-      cont.inner_size_xy = (0.36, 0.36)
-      cont.height = (0.13, 0.13)
-      cont.thickness = (0.025, 0.025)
-      cont.bottom_thickness = (0.016, 0.016)
-      cont.target_offset_xy = (0.0, 0.0)
+      if oracle_play:
+        cont.presence_prob = 0.0
+        cont.debug_vis = False
+        cont.resampling_time_range = (1e9, 1e9)
+      else:
+        # Play: default crate on (Viser "Show container" can toggle); low+far grasp.
+        cont.presence_prob = 1.0
+        cont.presence_requires_reach = False
+        cont.presence_requires_need_waist = False
+        cont.presence_also_on_low_z = False
+        cont.relocate_grasp_when_present = True
+        cont.grasp_pos_x = (0.45, 0.45)
+        cont.grasp_pos_y = (0.15, 0.15)
+        cont.grasp_pos_z = (-0.46, -0.46)
+        cont.resampling_time_range = (1e9, 1e9)
+        cont.inner_size_xy = (0.36, 0.36)
+        cont.height = (0.13, 0.13)
+        cont.thickness = (0.025, 0.025)
+        cont.bottom_thickness = (0.016, 0.016)
+        cont.target_offset_xy = (0.0, 0.0)
     # Play phase-3 demo: slower IK; Arm chase checkbox gates motion (set target first).
     if int(phase) >= 3 and "ee_residual" in cfg.actions:
       ee = cfg.actions["ee_residual"]
@@ -860,6 +871,10 @@ def homie_g1_flat_env_cfg(
       ee.joint_target_blend = 0.06
       ee.ik_iterations = 3
       ee.avoid_xy_slow = 0.15
+      if oracle_play:
+        # Bypass Stage-3 residual: DLS tracks grasp target only (p_sub = p_goal).
+        ee.use_policy_delta = False
+        ee.avoid_container = False
     # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
     cfg.events["log_waist_pitch"] = EventTermCfg(
       func=homie_mdp.log_waist_pitch,

@@ -1,10 +1,11 @@
-"""Hierarchical Stage-3: actor proposes subgoals for the frozen loco+IK chain.
+"""Stage-3 subgoal helpers: palm-delta (default) and legacy hierarchical ee0-offset.
 
-``p_goal_W`` — true task goal (reward / success); never overwritten by the actor.
-``p_ee0_W`` — palm world position at episode start (per-env anchor).
-``a_t`` — offset in **world** meters relative to ``p_ee0_W`` (not a step Δ from current palm).
-``p_sub_W = rate_limit(p_ee0_W + a_t)`` — short-horizon target injected into grasp so
-legs/waist/IK all chase it; EE residual is held at 0 (no double control).
+``body_ee_palm_delta`` (default):
+  ``p_sub_B = palm_B + delta_B`` (current palm, Homie base); rate-limit in world;
+  ``p_goal_W`` stays true task goal for reward; only ``p_sub`` is injected into grasp.
+
+``hierarchical_subgoal`` (legacy):
+  ``p_sub_W = rate_limit(p_ee0_W + a_t)``; EE residual held at 0.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from homierl_mjlab.mdp.base_frame import base_to_world, world_to_base
+from homierl_mjlab.mdp.base_frame import base_to_world, rotate_world_to_base, world_to_base
 from homierl_mjlab.mdp.palm import (
   LEFT_EE_LINK,
   RIGHT_EE_LINK,
@@ -59,7 +60,7 @@ def rate_limit(
 
 
 class HierarchicalSubgoalState:
-  """Per-env anchors + previous subgoal for hierarchical Stage-3."""
+  """Per-env anchors + previous subgoal for hierarchical Stage-3 (legacy)."""
 
   def __init__(self, num_envs: int, device: torch.device):
     self.device = device
@@ -83,7 +84,6 @@ class HierarchicalSubgoalState:
     goal_w = grasp.target_pos_w[env_ids].clone()
     self.p_ee0_w[env_ids] = palm_w
     self.p_goal_w[env_ids] = goal_w
-    # Start at the anchor (zero offset); lower stack sees current palm.
     self.p_sub_w[env_ids] = palm_w
     self.last_offset_w[env_ids] = 0.0
     self.initialized[env_ids] = True
@@ -113,6 +113,69 @@ class HierarchicalSubgoalState:
     return self.p_sub_w
 
 
+class PalmDeltaSubgoalState:
+  """True goal + rate-limited world subgoal for ``body_ee_palm_delta``.
+
+  Does **not** store episode ``p_ee0``; subgoal is always current palm + delta.
+  """
+
+  def __init__(self, num_envs: int, device: torch.device):
+    self.device = device
+    self.p_goal_w = torch.zeros(num_envs, 3, device=device)
+    self.p_sub_w = torch.zeros(num_envs, 3, device=device)
+    self.last_delta_b = torch.zeros(num_envs, 3, device=device)
+    self.last_body = torch.zeros(num_envs, 14, device=device)
+    self.initialized = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+  def reset_envs(
+    self,
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    *,
+    arm_left: bool,
+  ) -> None:
+    if env_ids.numel() == 0:
+      return
+    palm_w = palm_pos_world(env, arm_left=arm_left)[env_ids]
+    grasp = env.command_manager.get_term("grasp")
+    # Capture true goal once; actor injects only p_sub afterward.
+    goal_w = grasp.target_pos_w[env_ids].clone()
+    self.p_goal_w[env_ids] = goal_w
+    self.p_sub_w[env_ids] = palm_w
+    self.last_delta_b[env_ids] = 0.0
+    self.last_body[env_ids] = 0.0
+    self.initialized[env_ids] = True
+
+  def ensure_all(
+    self,
+    env: ManagerBasedRlEnv,
+    *,
+    arm_left: bool,
+  ) -> None:
+    missing = (~self.initialized).nonzero(as_tuple=False).flatten()
+    if missing.numel():
+      self.reset_envs(env, missing, arm_left=arm_left)
+
+  def apply_palm_delta_base(
+    self,
+    env: ManagerBasedRlEnv,
+    delta_b: torch.Tensor,
+    *,
+    arm_left: bool,
+    rate_m: float,
+  ) -> torch.Tensor:
+    """``p_sub_B = palm_B + delta_B`` → world, rate-limit, store. Returns ``p_sub_w``."""
+    robot = env.scene["robot"]
+    env_ids = torch.arange(env.num_envs, device=env.device)
+    palm_w = palm_pos_world(env, arm_left=arm_left)
+    palm_b = world_to_base(robot, palm_w, env_ids)
+    p_sub_b = palm_b + delta_b
+    raw_w = base_to_world(robot, p_sub_b, env_ids)
+    self.p_sub_w = rate_limit(raw_w, self.p_sub_w, max_step_m=rate_m)
+    self.last_delta_b = delta_b.detach()
+    return self.p_sub_w
+
+
 def inject_subgoal_into_grasp(
   env: ManagerBasedRlEnv,
   p_sub_w: torch.Tensor,
@@ -125,7 +188,6 @@ def inject_subgoal_into_grasp(
   if env_ids.numel() == 0:
     return
   grasp.target_pos_w[env_ids] = p_sub_w[env_ids]
-  # Keep body-frame command / extend_dist / obs in sync with world target.
   if hasattr(grasp, "_reproject_base_from_anchor"):
     grasp._reproject_base_from_anchor(env_ids)
   if hasattr(grasp, "_update_extend_dist"):
@@ -142,15 +204,29 @@ def attractor_offset_w(
 ) -> torch.Tensor:
   """Stage-A collector: offset from ``p_ee0`` toward true ``p_goal`` (world)."""
   palm_w = palm_pos_world(env, arm_left=arm_left)
-  # Prefer going to the goal; express as offset from episode anchor.
   desired = hier.p_goal_w - hier.p_ee0_w
-  # Also nudge from current palm error so early steps move.
   toward = hier.p_goal_w - palm_w
   blend = 0.7 * desired + 0.3 * (palm_w + toward - hier.p_ee0_w)
   step = torch.clamp(blend, -float(clip_m), float(clip_m))
   n = torch.linalg.norm(step, dim=-1, keepdim=True).clamp_min(1e-6)
   step = step * (float(scale_m) / n).clamp(max=1.0)
   return step
+
+
+def attractor_palm_delta_b(
+  env: ManagerBasedRlEnv,
+  state: PalmDeltaSubgoalState,
+  *,
+  arm_left: bool,
+  scale_m: float,
+) -> torch.Tensor:
+  """Attractor: unit step in base from current palm toward true goal."""
+  robot = env.scene["robot"]
+  env_ids = torch.arange(env.num_envs, device=env.device)
+  palm_w = palm_pos_world(env, arm_left=arm_left)
+  err_b = rotate_world_to_base(robot, state.p_goal_w - palm_w, env_ids)
+  n = torch.linalg.norm(err_b, dim=-1, keepdim=True).clamp_min(1e-6)
+  return err_b * (float(scale_m) / n).clamp(max=1.0)
 
 
 def build_hierarchical_obs(
@@ -161,15 +237,12 @@ def build_hierarchical_obs(
   sdf: torch.Tensor,
   clearance: torch.Tensor,
 ) -> torch.Tensor:
-  """Actor obs: palm, true-goal, goal−ee0, palm−ee0, last offset, SDF, clearance."""
+  """Legacy actor obs: palm, true-goal, goal−ee0, palm−ee0, last offset, SDF, clr."""
   robot = env.scene["robot"]
   env_ids = torch.arange(env.num_envs, device=env.device)
   palm_w = palm_pos_world(env, arm_left=arm_left)
   palm_b = world_to_base(robot, palm_w, env_ids)
   goal_b = world_to_base(robot, hier.p_goal_w, env_ids)
-  # Directional offsets in base (rotate only) so policy is yaw-invariant.
-  from homierl_mjlab.mdp.base_frame import rotate_world_to_base
-
   goal_m_ee0_b = rotate_world_to_base(robot, hier.p_goal_w - hier.p_ee0_w, env_ids)
   palm_m_ee0_b = rotate_world_to_base(robot, palm_w - hier.p_ee0_w, env_ids)
   last_off_b = rotate_world_to_base(robot, hier.last_offset_w, env_ids)
@@ -180,5 +253,43 @@ def build_hierarchical_obs(
 
 
 def hierarchical_obs_dim(sdf_query_count: int) -> int:
-  # palm3 + goal3 + (goal-ee0)3 + (palm-ee0)3 + last_off3 + sdfK + clr6
   return 3 + 3 + 3 + 3 + 3 + int(sdf_query_count) + 6
+
+
+def build_body_ee_obs(
+  env: ManagerBasedRlEnv,
+  state: PalmDeltaSubgoalState,
+  *,
+  arm_left: bool,
+  sdf: torch.Tensor,
+  clearance: torch.Tensor,
+  last_a: torch.Tensor,
+) -> torch.Tensor:
+  """Obs: palm, goal, goal−palm, prev_sub−palm, last_a(17), SDF, clearance.
+
+  No ee0-relative terms. ``last_a`` is packed ``[a_body(14), a_ee(3)]``.
+  """
+  robot = env.scene["robot"]
+  env_ids = torch.arange(env.num_envs, device=env.device)
+  palm_w = palm_pos_world(env, arm_left=arm_left)
+  palm_b = world_to_base(robot, palm_w, env_ids)
+  goal_b = world_to_base(robot, state.p_goal_w, env_ids)
+  goal_m_palm_b = rotate_world_to_base(robot, state.p_goal_w - palm_w, env_ids)
+  prev_sub_m_palm_b = rotate_world_to_base(robot, state.p_sub_w - palm_w, env_ids)
+  return torch.cat(
+    (
+      palm_b,
+      goal_b,
+      goal_m_palm_b,
+      prev_sub_m_palm_b,
+      last_a,
+      sdf,
+      clearance,
+    ),
+    dim=-1,
+  )
+
+
+def body_ee_obs_dim(sdf_query_count: int, *, action_dim: int = 17) -> int:
+  # palm3 + goal3 + (goal-palm)3 + (prev_sub-palm)3 + last_a + sdfK + clr6
+  return 3 + 3 + 3 + 3 + int(action_dim) + int(sdf_query_count) + 6

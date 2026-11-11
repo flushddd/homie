@@ -22,8 +22,15 @@ Phase-3 PPO packs `a17 | grasp7 | sdf | clearance | ee_err` → 229-D one-step.
 
 | Field | Dim | Unit / frame | Notes |
 |-------|-----|--------------|-------|
-| `control_mode` | — | cfg | `hierarchical_subgoal` (default) or `ee_residual` |
-| hierarchical action | 3 | meters, **world** offset from episode `p_ee0` | `p_sub = rate_limit(p_ee0 + a)`; injected into **grasp** (loco+IK); EE residual = 0 |
+| `control_mode` | — | cfg | **`body_ee_palm_delta` (default)**; legacy: `hierarchical_subgoal`, `ee_residual` |
+| progressive curriculum | — | auto (default) | **body** (arm locked, teacher exec, no box) → **arm** (reach≥0.5) → **box** (presence +0.05 when clear-reach≥0.3, max 0.35) |
+| loco rewards in Stage3 | — | `w_loco * ppo_rew` | Phase-1/2 env PPO step reward **blended into replay** (not monitor-only); teacher MSE is regularizer |
+| `action_semantics` | — | ckpt gate | `body14_ee3_palm_delta_v1` — refuse silent load of old 3-D hier ckpts |
+| body+EE action | 17 | `a_body(14)` tanh + `a_ee(3)` m **base** | `p_sub_B = palm_B + delta_B`; rate-limit in world; inject `p_sub`; EE residual = 0 |
+| body decode | 14 | loco joints | `q = q_default + 0.25 * a_body` on `LOCO_JOINT_NAMES`; arms via IK only |
+| teacher | 14 | frozen phase-2 HIM | MSE(`a_body`, teacher) with `w_teacher` (default 5); weights `requires_grad_(False)` |
+| Stage3 obs (body_ee) | `12+17+K+6` | base | palm, goal, goal−palm, prev_sub−palm, last_a(17), SDF, clearance (**no ee0**) |
+| hierarchical action (legacy) | 3 | meters, **world** offset from episode `p_ee0` | `p_sub = rate_limit(p_ee0 + a)`; EE residual = 0 |
 | legacy `delta_p` | 3 | meters, **base** | `p_cmd = p_palm + scale * tanh(raw)` on EE IK only |
 | Stage3 obs (hierarchical) | `15+K+6` | base | palm, true goal, goal−ee0, palm−ee0, last offset, SDF, clearance |
 | Applied control logged | full joint position targets | rad | same PD interface as sim |

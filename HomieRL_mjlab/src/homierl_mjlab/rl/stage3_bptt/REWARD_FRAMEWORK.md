@@ -11,28 +11,30 @@ Two **separate** reward systems run in parallel:
 
 | System | Used for | Optimizes? |
 |--------|----------|------------|
-| **A. Stage3 BPTT reward** `stage3_reward(...)` | Replay labels + imagination BPTT actor/critic | **Yes** — high-level actor (3-D subgoal / Δp) |
-| **B. Phase-3 PPO episode rewards** | Console / TensorBoard monitor only | **No** — loco is frozen phase-2; logged via env `extras["log"]` |
+| **A. Stage3 BPTT reward** `stage3_reward(...)` | Replay + imagination | **Yes** — reach/SDF/stability (reach off in body phase) |
+| **B. Phase-1/2 loco PPO step reward** | Blended into replay as `w_loco * ppo_rew` | **Yes** — same env Episode_Reward stack (tracking, height, …) |
+| **C. Teacher MSE** | Actor loss regularizer | **Yes** — not the only loco signal; body phase also **executes teacher** in sim |
 
 Training loop (each iter):
 
-1. **Collect** in Phase-3 sim: frozen HIM loco + hierarchical subgoal (or EE residual) from Stage3 actor / attractor.
-2. Store `(state, control, reward=stage3_reward, goal, geom, terminated)` in replay.
-3. Fit **world model** (next-state residual) on real `(s,u)→s'`.
-4. Fit **critic** with GAE on stored `stage3_reward`.
-5. **Actor BPTT**: short imagination horizon `H=8`, maximize `J = Σ γ^t r_t + γ^H V(s_H)` with `loss = -J`.
+1. **Collect**: body phase → teacher drives loco (`body_exec_teacher`); arm phase → actor body + palm-delta. Residual EE = 0.
+2. Store `reward = stage3_reward + w_loco * ppo_rew` (+ teacher_body for BC).
+3. Fit **world model** on real `(s,u)→s'`.
+4. Fit **critic** with GAE on blended reward (loco + stage3).
+5. **Actor BPTT**: imag `J` (stage3 terms) + `w_teacher * MSE(a_body, teacher)`.
 
-Control mode (default): `hierarchical_subgoal`
+Control mode (default): `body_ee_palm_delta` (`action_semantics=body14_ee3_palm_delta_v1`)
 
-- Actor outputs world/base-style **offset from episode EE anchor** `p_ee0` (scale `0.55 m`), rate-limited (`0.04 m/step`).
-- Offset → grasp subgoal `p_sub`; frozen loco+IK chase it; **EE residual held at 0**.
-- True task goal `p_goal` is **not** overwritten for success metrics / Stage3 target term (collector uses true goal for `stage3_reward`).
+- `a_ee`: tanh × `ee_delta_scale_m` (0.03 m) in Homie **base**; `p_sub_B = palm_B + delta_B`; rate-limit in world.
+- `a_body`: applied to loco joints (`q = q_default + 0.25 * a`); supervised by frozen phase-2 HIM (cannot copy HIM weights into Stage3 MLP — obs mismatch).
+- True task goal `p_goal` is **not** overwritten for reward; only `p_sub` is injected into grasp for IK/loco obs.
+- Legacy `hierarchical_subgoal` / `ee_residual` remain for ablation; **do not mix** old 3-D replay / ckpts.
 
 Imagination gap (important for analysis):
 
-- After WM step, palm for reward uses a **first-order kinematic `palm_step_fn`** toward the actor subgoal (WM palm alone was too weak for grads).
-- Imagination **does not** pass `present` into `stage3_reward` (safe/margin always on).
-- Imagination **does not** truncate on fall/timeout (`surv≡1`).
+- After WM step, palm for reward uses a **first-order kinematic `palm_step_fn`** = current palm + delta (approximate vs full arm FK).
+- Imagination gates safe/margin with stored `present` when `imag_use_present=True`.
+- Soft survival from predicted tilt when `imag_soft_survival=True` (not a hard truncate).
 
 ---
 

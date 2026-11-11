@@ -1,4 +1,4 @@
-"""Stage-3 actor (Δp), critic, and dynamics world model."""
+"""Stage-3 actor (body+EE), critic, and dynamics world model."""
 
 from __future__ import annotations
 
@@ -19,25 +19,67 @@ def _mlp(in_dim: int, hidden: Sequence[int], out_dim: int) -> nn.Sequential:
 
 
 class Stage3Actor(nn.Module):
-  """Deterministic 3-D action (meters), ``tanh``-scaled.
+  """Deterministic actor.
 
-  - ``ee_residual`` mode: Δp in base from current palm.
-  - ``hierarchical_subgoal`` mode: world-frame offset from episode ``p_ee0``.
-  Do not apply an extra tanh outside.
+  Default ``body_ee_palm_delta``: ``out_dim = body_dim + ee_dim`` (17).
+  ``forward`` returns ``(a_body, a_ee_delta)`` both tanh-scaled.
+  Body uses scale 1.0 (decode ``q = q_default + body_action_scale * a`` outside).
+  EE uses ``ee_delta_scale_m`` (meters in Homie base).
+
+  Legacy modes use ``out_dim=3`` and ``forward_legacy`` / single tensor path.
   """
 
   def __init__(
     self,
     obs_dim: int,
     hidden: Sequence[int] = (256, 256, 128),
+    *,
+    body_dim: int = 14,
+    ee_dim: int = 3,
+    ee_delta_scale_m: float = 0.03,
     action_scale_m: float = 0.02,
+    control_mode: str = "body_ee_palm_delta",
+    near_zero_body_init: bool = True,
   ):
     super().__init__()
-    self.net = _mlp(obs_dim, hidden, 3)
+    self.control_mode = str(control_mode)
+    self.body_dim = int(body_dim)
+    self.ee_dim = int(ee_dim)
+    self.ee_delta_scale_m = float(ee_delta_scale_m)
+    # Legacy single-scale for hierarchical / residual 3-D actors.
     self.action_scale_m = float(action_scale_m)
 
-  def forward(self, obs: torch.Tensor) -> torch.Tensor:
-    return torch.tanh(self.net(obs)) * self.action_scale_m
+    if self.control_mode == "body_ee_palm_delta":
+      self.out_dim = self.body_dim + self.ee_dim
+    else:
+      self.out_dim = 3
+    self.net = _mlp(obs_dim, hidden, self.out_dim)
+
+    if self.control_mode == "body_ee_palm_delta" and near_zero_body_init:
+      last = self.net[-1]
+      assert isinstance(last, nn.Linear)
+      nn.init.zeros_(last.bias)
+      # Small body head so teacher BC dominates early; EE slightly larger.
+      with torch.no_grad():
+        last.weight[: self.body_dim].mul_(0.01)
+        last.weight[self.body_dim :].mul_(0.1)
+
+  def forward(
+    self, obs: torch.Tensor
+  ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    raw = self.net(obs)
+    if self.control_mode != "body_ee_palm_delta":
+      return torch.tanh(raw) * self.action_scale_m
+    a_body = torch.tanh(raw[..., : self.body_dim])
+    a_ee = torch.tanh(raw[..., self.body_dim :]) * self.ee_delta_scale_m
+    return a_body, a_ee
+
+  def forward_packed(self, obs: torch.Tensor) -> torch.Tensor:
+    """Return ``(B, out_dim)`` packed action (body || ee_delta meters)."""
+    out = self.forward(obs)
+    if isinstance(out, tuple):
+      return torch.cat(out, dim=-1)
+    return out
 
 
 class Stage3Critic(nn.Module):
@@ -111,10 +153,8 @@ class WorldModel(nn.Module):
       states ``(H+1, B, S)`` including ``state0``.
     """
     if controls.dim() == 3 and controls.shape[1] == state0.shape[0]:
-      # (H, B, U)
       seq = controls
     else:
-      # (B, H, U)
       seq = controls.transpose(0, 1)
     h = seq.shape[0]
     states = [state0]

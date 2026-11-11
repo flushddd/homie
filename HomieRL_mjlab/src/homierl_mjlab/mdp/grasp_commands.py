@@ -784,12 +784,24 @@ class GraspTargetCommand(CommandTerm):
         initial_value=False,
         hint="OFF=loco (Twist). ON=waist/reach mode + XYZ gizmo. Set target first, then Arm chase.",
       )
+      import os as _os
+
+      _oracle = str(_os.environ.get("HOMIE_PLAY_ORACLE_SUBGOAL", "")).strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+      )
       arm_chase = server.gui.add_checkbox(
         "Arm chase (slow)",
-        initial_value=False,
-        hint="OFF=hold arms (pose target freely). ON=slow IK toward target — for demo recording.",
+        initial_value=bool(_oracle),
+        hint=(
+          "OFF=hold arms (pose target freely). ON=slow IK toward target — for demo recording."
+          + (" [oracle: default ON, residual=0]" if _oracle else "")
+        ),
       )
-      self._env._homie_play_arm_chase = False
+      self._env._homie_play_arm_chase = bool(_oracle)
 
       @arm_chase.on_update
       def _(_ev, _ac=arm_chase, _env=self._env) -> None:
