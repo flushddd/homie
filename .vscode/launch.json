@@ -363,6 +363,29 @@
       ]
     },
     {
+      "name": "HomieRL mjlab: Play Stage3 a_body(14) stability (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/play_stage3_abody_stability.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--bptt-checkpoint",
+        "${input:homieBpttCheckpoint}",
+        "--device",
+        "cuda:0",
+        "--log-every",
+        "25"
+      ]
+    },
+    {
       "name": "HomieRL mjlab: Play Stage3 BPTT (Viser)",
       "type": "debugpy",
       "request": "launch",
@@ -673,7 +696,7 @@
       "id": "homieBpttCheckpoint",
       "type": "promptString",
       "description": "Stage3 BPTT actor ckpt (train_stage3_bptt model_*.pt; has key 'actor')",
-      "default": "logs/rsl_rl/homie_g1/phase3/model_9400.pt"
+      "default": "logs/rsl_rl/homie_g1/phase3/model_200.pt"
     }
   ]
 }

@@ -70,6 +70,18 @@ def _parse() -> argparse.Namespace:
       "actor: BPTT policy"
     ),
   )
+  p.add_argument(
+    "--body-only",
+    action="store_true",
+    help="Zero a_ee; pin p_sub to palm; arm chase OFF — test a_body(14) only.",
+  )
+  p.add_argument(
+    "--loco-source",
+    type=str,
+    default="actor",
+    choices=("actor", "teacher", "zero"),
+    help="Who fills a_body(14) in actor/body-only play: actor|teacher|zero.",
+  )
   p.add_argument("--num-envs", type=int, default=1)
   p.add_argument(
     "--log-every",
@@ -277,9 +289,18 @@ class _PlayEnvAdapter:
 class Stage3BpttPlayPolicy:
   """PolicyProtocol: high-level BPTT action → stitch with frozen loco/teacher."""
 
-  def __init__(self, collector, *, log_every: int = 25):
+  def __init__(
+    self,
+    collector,
+    *,
+    log_every: int = 25,
+    body_only: bool = False,
+    loco_source: str = "actor",
+  ):
     self.collector = collector
     self.log_every = max(0, int(log_every))
+    self.body_only = bool(body_only)
+    self.loco_source = str(loco_source)
     self._step = 0
 
   def reset(self) -> None:
@@ -342,36 +363,100 @@ class Stage3BpttPlayPolicy:
     )
 
     if c.body_ee:
+      # Stage3 dual-head: a_body(14) + a_ee(3). Env residual held at 0;
+      # arms chase injected p_sub via DLS when arm chase is ON.
+      need_teacher_body = False
       if mode == "goal":
         p_sub = st.p_goal_w
         st.p_sub_w = p_sub.clone()
-        a_body = torch.zeros(n, c.body_dim, device=c.device)
         a_ee = torch.zeros(n, 3, device=c.device)
+        need_teacher_body = True
       elif mode == "palm":
         palm_w = palm_pos_world(c.env, arm_left=c.arm_left)
         st.p_sub_w = palm_w.clone()
         p_sub = st.p_sub_w
-        a_body = torch.zeros(n, c.body_dim, device=c.device)
         a_ee = torch.zeros(n, 3, device=c.device)
+        need_teacher_body = True
+      elif mode == "actor" and (
+        c.actor is not None or self.loco_source in ("teacher", "zero")
+      ):
+        if c.actor is not None:
+          a_body, a_ee = c._actor_body_ee()
+        else:
+          a_body = torch.zeros(n, c.body_dim, device=c.device)
+          a_ee = torch.zeros(n, 3, device=c.device)
+        if self.loco_source == "zero":
+          a_body = torch.zeros(n, c.body_dim, device=c.device)
+        elif self.loco_source == "teacher":
+          need_teacher_body = True
+        if self.body_only or self.loco_source != "actor":
+          a_ee = torch.zeros(n, 3, device=c.device)
+          palm_w = palm_pos_world(c.env, arm_left=c.arm_left)
+          st.p_sub_w = palm_w.clone()
+          st.last_delta_b.zero_()
+          p_sub = st.p_sub_w
+        else:
+          p_sub = st.apply_palm_delta_base(
+            c.env,
+            a_ee,
+            arm_left=c.arm_left,
+            rate_m=c.cfg.subgoal_rate_limit_m,
+          )
       else:
-        a_body, a_ee = c._actor_body_ee()
+        from homierl_mjlab.rl.stage3_bptt.hierarchical import (
+          attractor_palm_delta_b,
+        )
+
+        a_ee = attractor_palm_delta_b(
+          c.env,
+          st,
+          arm_left=c.arm_left,
+          scale_m=min(c.cfg.ee_delta_scale_m, 0.02),
+        )
         p_sub = st.apply_palm_delta_base(
           c.env,
           a_ee,
           arm_left=c.arm_left,
           rate_m=c.cfg.subgoal_rate_limit_m,
         )
+        need_teacher_body = True
+
       inject_subgoal_into_grasp(c.env, p_sub)
       c.env._homie_bptt_goal_w = st.p_goal_w
       c.env._homie_bptt_sub_w = st.p_sub_w
       obs_td = c.vec.get_observations()
       with torch.inference_mode():
         full_teacher = c.policy(obs_td)
-      if mode in ("goal", "palm") or c.actor is None:
-        a_body = full_teacher[..., : c.body_dim]
+      from homierl_mjlab.rl.stage3_bptt.collector import (
+        normalize_teacher_actions,
+        safe_exec_body,
+      )
+
+      # Same train norm: HIM ±100 → tanh/[-1,1] space as Stage3 a_body.
+      full_teacher = normalize_teacher_actions(
+        full_teacher,
+        mode=str(getattr(c.cfg, "teacher_action_norm", "tanh")),
+        clip=float(getattr(c.cfg, "teacher_action_clip", 1.0)),
+      )
+      teacher_body = full_teacher[..., : c.body_dim].detach()
+      if need_teacher_body or c.actor is None:
+        a_body = teacher_body
+        exec_body = teacher_body
+      elif self.loco_source == "zero":
+        a_body = torch.zeros(n, c.body_dim, device=c.device)
+        exec_body = teacher_body
+      else:
+        # Trust-region in the normalized space — no takeoff.
+        exec_body = safe_exec_body(
+          a_body,
+          teacher_body,
+          mix=1.0,
+          trust=float(getattr(c.cfg, "body_trust_region", 0.20)),
+          max_norm=float(getattr(c.cfg, "body_max_norm", 2.5)),
+        )
       packed = torch.cat((a_body, a_ee), dim=-1)
       act = full_teacher.clone()
-      act[:, : c.body_dim] = a_body
+      act[:, : c.body_dim] = exec_body
       if act.shape[-1] >= 17:
         act[:, 14:17] = 0.0
       elif act.shape[-1] == 14:
@@ -547,6 +632,8 @@ def main() -> int:
     device=args.device,
     stage2_checkpoint=stage2,
     curriculum=cur,
+    curriculum_auto=False,
+    body_exec_teacher=False,
     control_mode=str(control_mode),
     arm_side=str(saved_cfg.get("arm_side", "right")),
     sdf_query_count=int(saved_cfg.get("sdf_query_count", 64)),
@@ -558,23 +645,32 @@ def main() -> int:
     ee_delta_scale_m=float(saved_cfg.get("ee_delta_scale_m", 0.03)),
     body_dim=int(saved_cfg.get("body_dim", 14)),
     ee_dim=int(saved_cfg.get("ee_dim", 3)),
+    body_trust_region=float(saved_cfg.get("body_trust_region", 0.20)),
+    body_max_norm=float(saved_cfg.get("body_max_norm", 2.5)),
+    body_exec_mix=float(saved_cfg.get("body_exec_mix", 0.0)),
+    teacher_action_norm=str(saved_cfg.get("teacher_action_norm", "tanh")),
+    teacher_action_clip=float(saved_cfg.get("teacher_action_clip", 1.0)),
   )
   cfg.action_semantics = cfg.resolve_action_semantics()
   if "actor_hidden" in saved_cfg:
     cfg.actor_hidden = tuple(saved_cfg["actor_hidden"])
 
+  loco_src = str(args.loco_source)
+  body_only = bool(args.body_only)
   print(
     f"[bptt-play] control_mode={cfg.control_mode} semantics={cfg.action_semantics} "
-    f"curriculum={cur} ee_mode={args.ee_mode}"
+    f"curriculum={cur} ee_mode={args.ee_mode} loco_source={loco_src} "
+    f"body_only={body_only}"
   )
   if str(args.ee_mode) == "palm":
     print("[bptt-play] actor BYPASSED — p_sub := palm (stand / loco only)")
-  elif need_actor:
+  elif need_actor and loco_src == "actor":
     print(
-      "[bptt-play] actor mode uses custom viewer (need inject p_sub); "
-      "IK = play slow settings (not train gains). "
-      "For pure loco+IK use --ee-mode goal / Oracle Launch."
+      "[bptt-play] loco from Stage3 a_body — if this flies, body head is not "
+      "ready (train still in body/teacher-exec phase)"
     )
+  elif need_actor and loco_src == "teacher":
+    print("[bptt-play] loco from frozen phase-2 teacher (Stage3 a_body ignored)")
   print(f"[bptt-play] stage2={stage2}")
   print(f"[bptt-play] bptt={bptt_path if bptt_path else '(none)'}")
   print(
@@ -591,7 +687,7 @@ def main() -> int:
     play=True,
   )
   collector.ee_mode = str(args.ee_mode)
-  if need_actor:
+  if need_actor and loco_src == "actor":
     actor = Stage3Actor(
       collector.obs_dim,
       cfg.actor_hidden,
@@ -607,32 +703,51 @@ def main() -> int:
     for p_ in actor.parameters():
       p_.requires_grad_(False)
     collector.actor = actor
+    print(
+      f"[bptt-play] loaded Stage3 actor out_dim={getattr(actor, 'out_dim', '?')} "
+      f"obs_dim={collector.obs_dim}"
+    )
   else:
     collector.actor = None
-    print("[bptt-play] Stage3 actor not loaded (control-link test)")
+    if need_actor:
+      print(f"[bptt-play] Stage3 actor not loaded (loco_source={loco_src})")
+    else:
+      print("[bptt-play] Stage3 actor not loaded (control-link test)")
 
   collector.env._homie_play_arm_chase = False
   ee = collector.env.action_manager.get_term("ee_residual")
   if hasattr(ee, "_require_play_arm_chase"):
-    ee._require_play_arm_chase = True
+    ee._require_play_arm_chase = not body_only
   if (collector.hierarchical or collector.body_ee) and hasattr(ee, "_use_policy_delta"):
     ee._use_policy_delta = False
-  print(
-    "[bptt-play] Arm IK off until Viser: Enable waist target → set XYZ → "
-    "Arm chase (slow) ON"
-  )
+  if body_only:
+    print(
+      "[bptt-play] --body-only: a_ee:=0, p_sub:=palm, arm chase OFF "
+      "(verify a_body / lower-limb only)"
+    )
+  else:
+    print(
+      "[bptt-play] Arm IK off until Viser: Enable waist target → set XYZ → "
+      "Arm chase (slow) ON"
+    )
 
   _install_dual_target_debug_vis(
     collector.env, show_sub=collector.hierarchical or collector.body_ee
   )
-  collector._force_reach_flags()
+  if not body_only:
+    collector._force_reach_flags()
   st = _goal_state(collector)
   st.ensure_all(collector.env, arm_left=collector.arm_left)
   collector.env._homie_bptt_goal_w = st.p_goal_w
   collector.env._homie_bptt_sub_w = st.p_sub_w
 
   play_env = _PlayEnvAdapter(collector)
-  policy = Stage3BpttPlayPolicy(collector, log_every=int(args.log_every))
+  policy = Stage3BpttPlayPolicy(
+    collector,
+    log_every=int(args.log_every),
+    body_only=body_only or loco_src != "actor",
+    loco_source=loco_src,
+  )
   viewer = ViserPlayViewer(
     play_env, policy, verbosity=VerbosityLevel.INFO
   )

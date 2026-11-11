@@ -30,14 +30,28 @@ class Stage3BpttCfg:
   subgoal_rate_limit_m: float = 0.04
   # Frozen phase-2 teacher MSE weight on a_body (regularizer, not the only loco signal).
   w_teacher: float = 2.0
-  # HIM inference mean is clipped to ±100; Stage3 body is tanh ∈ [-1, 1].
-  # Clip teacher actions to this bound before BC / curriculum MSE / env exec.
+  # HIM act_inference mean is only numerically clipped to ±100; Stage3 a_body is
+  # tanh ∈ [-1, 1]. Normalize teacher into that space before BC / MSE / exec /
+  # trust-region (else teacher_mse sticks ~10–15 and never unlocks; raw a_body
+  # also fights an unscaled teacher and can take off).
+  #   "tanh": soft map R→(-1,1) — preferred normalization
+  #   "clip": hard clamp to ±teacher_action_clip (legacy 4315ad3)
+  teacher_action_norm: str = "tanh"
   teacher_action_clip: float = 1.0
   # Blend Phase-1/2 env PPO step reward into Stage3 replay / critic targets.
   # This is the same Episode_Reward/* stack (tracking, orientation, height, …).
   w_loco: float = 1.0
   # Body curriculum: execute teacher loco in sim (Actor only learns; no bad a_body on robot).
   body_exec_teacher: bool = True
+  # While arm locked + body_exec_teacher: fraction of actor mixed into sim exec
+  # (0 = pure teacher / never takeoff; >0 lets a_body see loco reward gradually).
+  body_exec_mix: float = 0.0
+  # Hard trust region around teacher for any actor component in exec_body:
+  #   exec = teacher + clip(blend - teacher, ±trust). Prevents fly-away when
+  #   a_body is wrong (play/train). 0 disables. Keep >0 after arm unlock too.
+  body_trust_region: float = 0.20
+  # Soft cap on ||a_body|| before blend (tanh coords); 0 = off.
+  body_max_norm: float = 2.5
   # Legacy scales (kept for hierarchical / residual ablation).
   action_scale_m: float = 0.02
   subgoal_offset_scale_m: float = 0.55

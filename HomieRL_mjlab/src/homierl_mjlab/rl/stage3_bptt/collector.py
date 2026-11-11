@@ -109,6 +109,57 @@ def meters_to_ee_raw(
   return 0.5 * torch.log((1.0 + x) / (1.0 - x))
 
 
+def normalize_teacher_actions(
+  actions: torch.Tensor,
+  *,
+  mode: str = "tanh",
+  clip: float = 1.0,
+) -> torch.Tensor:
+  """Map HIM teacher means into Stage3 body space (≈ tanh / [-1, 1]).
+
+  HIM ``act_inference`` only clamps to ±100 for numerics; Stage3 ``a_body`` is
+  ``tanh``-normalized. BC / curriculum MSE / trust-region all require the same
+  scale — hard clip saturates, soft ``tanh`` preserves ranking.
+  """
+  m = str(mode).lower().strip()
+  if m in ("tanh", "soft", "normalize"):
+    return torch.tanh(actions)
+  c = float(clip)
+  return actions.clamp(-c, c)
+
+
+def safe_exec_body(
+  a_body: torch.Tensor,
+  teacher_body: torch.Tensor,
+  *,
+  mix: float,
+  trust: float,
+  max_norm: float = 0.0,
+) -> torch.Tensor:
+  """Blend actor body into **normalized** teacher, then trust-region.
+
+  Both ``a_body`` (tanh) and ``teacher_body`` must already be in the same
+  [-1, 1]-ish space (see ``normalize_teacher_actions``). Then::
+
+    exec = teacher + clip(blend(actor, teacher) - teacher, ±trust)
+
+  ``mix=0`` → pure teacher. ``mix=1`` + ``trust>0`` → actor stays near teacher
+  (prevents takeoff from an unnormalized / untrained a_body).
+  """
+  mix = float(max(0.0, min(1.0, mix)))
+  if mix <= 1e-8:
+    return teacher_body
+  a = a_body
+  if max_norm > 1e-8:
+    n = torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-6)
+    a = a * (float(max_norm) / n).clamp(max=1.0)
+  blended = (1.0 - mix) * teacher_body + mix * a
+  trust = float(trust)
+  if trust <= 1e-8:
+    return blended
+  return teacher_body + (blended - teacher_body).clamp(-trust, trust)
+
+
 def _scalarize_log_val(v) -> float:
   if isinstance(v, torch.Tensor):
     return float(v.detach().float().mean().cpu())
@@ -472,21 +523,33 @@ class Stage3SimCollector:
         obs_td = self.vec.get_observations()
         with torch.inference_mode():
           full_teacher = self.policy(obs_td)
-        # HIM act_inference mean is only clipped to ±100; Stage3 body is tanh
-        # ∈ [-1, 1]. Clip teacher to the env action range so BC / curriculum MSE
-        # are on the same scale (else teacher_mse sticks ~10–15 and never gates).
-        teacher_clip = float(getattr(self.cfg, "teacher_action_clip", 1.0))
-        full_teacher = full_teacher.clamp(-teacher_clip, teacher_clip)
+        # Normalize HIM (±100 numeric) → Stage3 tanh space before BC / exec.
+        full_teacher = normalize_teacher_actions(
+          full_teacher,
+          mode=str(getattr(self.cfg, "teacher_action_norm", "tanh")),
+          clip=float(getattr(self.cfg, "teacher_action_clip", 1.0)),
+        )
         teacher_body = full_teacher[..., : self.body_dim].detach()
         if self.ee_mode != "actor" or self.actor is None:
           a_body = teacher_body.clone()
         packed_a = torch.cat((a_body, a_ee), dim=-1)
-        # Body phase: teacher drives sim so Phase-1/2 rewards stay meaningful;
-        # Actor a_body is still logged for BC (does not crash the robot).
-        exec_teacher = (not self.arm_unlocked) and bool(
+        # Sim exec: never apply raw a_body. Normalized teacher (+ trust-region)
+        # keeps feet on the ground; packed_a still stores actor for BC / critic.
+        pure_teacher = (not self.arm_unlocked) and bool(
           getattr(self.cfg, "body_exec_teacher", True)
         )
-        exec_body = teacher_body if exec_teacher else a_body
+        mix = (
+          float(getattr(self.cfg, "body_exec_mix", 0.0))
+          if pure_teacher
+          else 1.0
+        )
+        exec_body = safe_exec_body(
+          a_body,
+          teacher_body,
+          mix=mix,
+          trust=float(getattr(self.cfg, "body_trust_region", 0.20)),
+          max_norm=float(getattr(self.cfg, "body_max_norm", 2.5)),
+        )
         act = full_teacher.clone()
         act[:, : self.body_dim] = exec_body
         # Residual EE held at 0 — IK chases injected grasp only.
@@ -512,8 +575,11 @@ class Stage3SimCollector:
           ee_delta = high_a
         with torch.inference_mode():
           full_a = self.policy(obs_td)
-        teacher_clip = float(getattr(self.cfg, "teacher_action_clip", 1.0))
-        full_a = full_a.clamp(-teacher_clip, teacher_clip)
+        full_a = normalize_teacher_actions(
+          full_a,
+          mode=str(getattr(self.cfg, "teacher_action_norm", "tanh")),
+          clip=float(getattr(self.cfg, "teacher_action_clip", 1.0)),
+        )
         teacher_body = full_a[..., : self.body_dim].detach()
         ee_raw = meters_to_ee_raw(ee_delta, self.ee_scale)
         act = full_a.clone()
@@ -672,6 +738,18 @@ class Stage3SimCollector:
           and bool(getattr(self.cfg, "body_exec_teacher", True))
         )
         else 0.0
+      ),
+      "body_exec_mix": float(
+        getattr(self.cfg, "body_exec_mix", 0.0)
+        if (
+          self.body_ee
+          and (not self.arm_unlocked)
+          and bool(getattr(self.cfg, "body_exec_teacher", True))
+        )
+        else (1.0 if self.body_ee else 0.0)
+      ),
+      "body_trust_region": float(
+        getattr(self.cfg, "body_trust_region", 0.20) if self.body_ee else 0.0
       ),
     }
     if self.body_ee:

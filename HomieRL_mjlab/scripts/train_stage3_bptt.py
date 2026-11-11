@@ -60,6 +60,8 @@ def _tb_log(writer: SummaryWriter, it: int, logs: dict[str, float], *, collect_s
     ("actor_ee_norm", "Train/actor_ee_norm"),
     ("w_loco", "Train/w_loco"),
     ("body_exec_teacher", "Train/body_exec_teacher"),
+    ("body_exec_mix", "Train/body_exec_mix"),
+    ("body_trust_region", "Train/body_trust_region"),
     ("real/ppo_loco", "RewardReal/ppo_loco"),
     ("real/w_loco", "RewardReal/w_loco"),
     ("actor_a_body_norm", "Train/actor_a_body_norm"),
@@ -176,6 +178,20 @@ def _parse() -> argparse.Namespace:
     default=None,
     help="Palm-delta tanh scale in meters (default cfg 0.03).",
   )
+  p.add_argument(
+    "--body-trust-region",
+    type=float,
+    default=None,
+    help="Max |exec_body - teacher| per dim (default cfg 0.20). "
+    "Keeps loco from taking off when a_body is wrong; 0 disables.",
+  )
+  p.add_argument(
+    "--body-exec-mix",
+    type=float,
+    default=None,
+    help="While arm locked + body_exec_teacher: actor mix into sim "
+    "(default cfg 0.0 = pure teacher).",
+  )
   p.add_argument("--save-every", type=int, default=200)
   return p.parse_args()
 
@@ -230,6 +246,9 @@ def _print_iter_log(
     ("teacher_mse_collect", "Teacher MSE (collect)"),
     ("actor_body_norm", "Actor body norm"),
     ("actor_ee_norm", "Actor EE norm"),
+    ("body_exec_teacher", "Body exec teacher"),
+    ("body_exec_mix", "Body exec mix"),
+    ("body_trust_region", "Body trust region"),
     ("curr_phase", "Curriculum phase"),
     ("curr_arm_unlocked", "Arm unlocked"),
     ("curr_presence_prob", "Presence prob"),
@@ -445,6 +464,10 @@ def run_real(args: argparse.Namespace) -> int:
     cfg.w_loco = float(args.w_loco)
   if args.ee_delta_scale_m is not None:
     cfg.ee_delta_scale_m = float(args.ee_delta_scale_m)
+  if args.body_trust_region is not None:
+    cfg.body_trust_region = float(args.body_trust_region)
+  if args.body_exec_mix is not None:
+    cfg.body_exec_mix = float(args.body_exec_mix)
   print(
     f"[stage3_bptt] num_envs={n_envs} replay_capacity={cfg.replay_capacity} "
     f"(~{cfg.replay_capacity // n_envs} steps/env) "
@@ -454,8 +477,10 @@ def run_real(args: argparse.Namespace) -> int:
     print(
       f"[stage3_bptt] body_ee: ee_delta_scale_m={cfg.ee_delta_scale_m} "
       f"w_teacher={cfg.w_teacher} w_loco={cfg.w_loco} "
-      f"body_exec_teacher={cfg.body_exec_teacher} — FRESH log/replay "
-      "(Phase-1/2 PPO rewards blended into Stage3 targets)."
+      f"body_exec_teacher={cfg.body_exec_teacher} "
+      f"body_exec_mix={cfg.body_exec_mix} "
+      f"body_trust_region={cfg.body_trust_region} — FRESH log/replay "
+      "(Phase-1/2 PPO rewards blended; trust-region stops takeoff)."
     )
   print(f"[INFO] Logging experiment in directory: {log_dir}")
   writer = SummaryWriter(log_dir=str(log_dir), flush_secs=10)
