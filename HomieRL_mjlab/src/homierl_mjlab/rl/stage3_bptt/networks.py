@@ -21,9 +21,10 @@ def _mlp(in_dim: int, hidden: Sequence[int], out_dim: int) -> nn.Sequential:
 class Stage3Actor(nn.Module):
   """Deterministic actor.
 
-  Default ``body_ee_palm_delta`` with ``loco_obs_dim>0`` (v2):
-    * ``body_net(loco_obs) → a_body(14)`` — distill HIM loco
-    * ``ee_net(reach_obs) → a_ee(3)`` — palm Δp command into p_sub
+  Default ``body_ee_palm_delta`` with ``loco_obs_dim>0`` (v3):
+    * ``body_net(loco_obs) → a_body(14)`` raw (no tanh; phase-1/2 HIM space)
+    * ``ee_net(reach_obs) → a_ee(3)`` meters Δp, hard-clipped (no tanh);
+      injected as ``p_sub`` like oracle grasp chase (policy EE residual off)
 
   Obs layout must be ``[loco | reach]``. Legacy ``loco_obs_dim=0`` keeps a
   single MLP on the full vector (reach-only or packed).
@@ -41,6 +42,7 @@ class Stage3Actor(nn.Module):
     control_mode: str = "body_ee_palm_delta",
     near_zero_body_init: bool = True,
     loco_obs_dim: int = 0,
+    body_action_clip: float = 100.0,
   ):
     super().__init__()
     self.control_mode = str(control_mode)
@@ -48,6 +50,7 @@ class Stage3Actor(nn.Module):
     self.ee_dim = int(ee_dim)
     self.ee_delta_scale_m = float(ee_delta_scale_m)
     self.action_scale_m = float(action_scale_m)
+    self.body_action_clip = float(body_action_clip)
     self.obs_dim = int(obs_dim)
     self.loco_obs_dim = max(0, int(loco_obs_dim))
     self.reach_obs_dim = max(0, self.obs_dim - self.loco_obs_dim)
@@ -87,22 +90,44 @@ class Stage3Actor(nn.Module):
           last.weight[: self.body_dim].mul_(0.01)
           last.weight[self.body_dim :].mul_(0.1)
 
+  def _clip_body(self, a_body: torch.Tensor) -> torch.Tensor:
+    c = float(self.body_action_clip)
+    if c > 0.0:
+      return a_body.clamp(-c, c)
+    return a_body
+
+  def _clip_ee(self, a_ee: torch.Tensor) -> torch.Tensor:
+    """Meters in base; hard clip (oracle-style inject, no tanh×scale)."""
+    s = float(self.ee_delta_scale_m)
+    if s > 0.0:
+      return a_ee.clamp(-s, s)
+    return a_ee
+
   def forward(
     self, obs: torch.Tensor
   ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if self.body_net is not None and self.ee_net is not None:
       loco = obs[..., : self.loco_obs_dim]
       reach = obs[..., self.loco_obs_dim :]
-      a_body = torch.tanh(self.body_net(loco))
-      a_ee = torch.tanh(self.ee_net(reach)) * self.ee_delta_scale_m
+      # Raw HIM joint actions (phase-1/2); no tanh.
+      a_body = self._clip_body(self.body_net(loco))
+      # Palm Δp in meters → p_sub inject; residual path unused.
+      a_ee = self._clip_ee(self.ee_net(reach))
       return a_body, a_ee
     assert self.net is not None
     raw = self.net(obs)
     if self.control_mode != "body_ee_palm_delta":
-      return torch.tanh(raw) * self.action_scale_m
-    a_body = torch.tanh(raw[..., : self.body_dim])
-    a_ee = torch.tanh(raw[..., self.body_dim :]) * self.ee_delta_scale_m
+      # Legacy hierarchical / residual: still clip to ±action_scale_m.
+      return self._clip_ee_legacy(raw)
+    a_body = self._clip_body(raw[..., : self.body_dim])
+    a_ee = self._clip_ee(raw[..., self.body_dim :])
     return a_body, a_ee
+
+  def _clip_ee_legacy(self, raw: torch.Tensor) -> torch.Tensor:
+    s = float(self.action_scale_m)
+    if s > 0.0:
+      return raw.clamp(-s, s)
+    return raw
 
   def forward_packed(self, obs: torch.Tensor) -> torch.Tensor:
     """Return ``(B, out_dim)`` packed action (body ‖ ee_delta meters)."""

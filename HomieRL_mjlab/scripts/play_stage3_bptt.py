@@ -467,11 +467,11 @@ class Stage3BpttPlayPolicy:
         safe_exec_body,
       )
 
-      # Same train norm: HIM ±100 → tanh/[-1,1] space as Stage3 a_body.
+      # Same as phase-1/2: raw HIM mean, ±clip_actions.
       full_teacher = normalize_teacher_actions(
         full_teacher,
-        mode=str(getattr(c.cfg, "teacher_action_norm", "tanh")),
-        clip=float(getattr(c.cfg, "teacher_action_clip", 1.0)),
+        mode=str(getattr(c.cfg, "teacher_action_norm", "none")),
+        clip=float(getattr(c.cfg, "teacher_action_clip", 100.0)),
       )
       teacher_body = full_teacher[..., : c.body_dim].detach()
       if need_teacher_body or c.actor is None:
@@ -487,7 +487,7 @@ class Stage3BpttPlayPolicy:
           teacher_body,
           mix=1.0,
           trust=float(getattr(c.cfg, "body_trust_region", 0.20)),
-          max_norm=float(getattr(c.cfg, "body_max_norm", 2.5)),
+          max_norm=float(getattr(c.cfg, "body_max_norm", 0.0)),
         )
       packed = torch.cat((a_body, a_ee), dim=-1)
       act = full_teacher.clone()
@@ -671,8 +671,8 @@ def main() -> int:
     if ckpt_sem is None:
       print(
         "error: refusing to load Stage3 ckpt without action_semantics into "
-        f"{ACTION_SEMANTICS_BODY_EE}. Old layouts / 3-D hier actors are "
-        "incompatible — retrain with loco-obs body_ee (v2).",
+        f"{ACTION_SEMANTICS_BODY_EE}. Old layouts are incompatible — "
+        "retrain with loco-obs + raw a_body (v3).",
         file=sys.stderr,
       )
       return 2
@@ -680,7 +680,7 @@ def main() -> int:
       print(
         f"error: action_semantics mismatch ckpt={ckpt_sem!r} "
         f"expected={ACTION_SEMANTICS_BODY_EE!r}\n"
-        "  v1 reach-only actors need a fresh train with include_loco_obs.",
+        "  Prior tanh / reach-only actors need a fresh Stage3 train.",
         file=sys.stderr,
       )
       return 2
@@ -707,10 +707,11 @@ def main() -> int:
     body_dim=int(saved_cfg.get("body_dim", 14)),
     ee_dim=int(saved_cfg.get("ee_dim", 3)),
     body_trust_region=float(saved_cfg.get("body_trust_region", 0.20)),
-    body_max_norm=float(saved_cfg.get("body_max_norm", 2.5)),
+    body_max_norm=float(saved_cfg.get("body_max_norm", 0.0)),
     body_exec_mix=float(saved_cfg.get("body_exec_mix", 0.0)),
-    teacher_action_norm=str(saved_cfg.get("teacher_action_norm", "tanh")),
-    teacher_action_clip=float(saved_cfg.get("teacher_action_clip", 1.0)),
+    teacher_action_norm=str(saved_cfg.get("teacher_action_norm", "none")),
+    teacher_action_clip=float(saved_cfg.get("teacher_action_clip", 100.0)),
+    body_action_clip=float(saved_cfg.get("body_action_clip", 100.0)),
   )
   cfg.action_semantics = cfg.resolve_action_semantics()
   if "actor_hidden" in saved_cfg:
@@ -783,6 +784,7 @@ def main() -> int:
       control_mode=cfg.control_mode,
       near_zero_body_init=False,
       loco_obs_dim=loco_dim,
+      body_action_clip=float(getattr(cfg, "body_action_clip", 100.0)),
     ).to(collector.device)
     actor.load_state_dict(payload["actor"])
     actor.eval()

@@ -125,18 +125,22 @@ def meters_to_ee_raw(
 def normalize_teacher_actions(
   actions: torch.Tensor,
   *,
-  mode: str = "tanh",
-  clip: float = 1.0,
+  mode: str = "none",
+  clip: float = 100.0,
 ) -> torch.Tensor:
-  """Map HIM teacher means into Stage3 body space (≈ tanh / [-1, 1]).
+  """Align HIM teacher means with Stage3 ``a_body`` (phase-1/2 joint space).
 
-  HIM ``act_inference`` only clamps to ±100 for numerics; Stage3 ``a_body`` is
-  ``tanh``-normalized. BC / curriculum MSE / trust-region all require the same
-  scale — hard clip saturates, soft ``tanh`` preserves ranking.
+  Default ``none``/``raw``: same as Homie ``clip_actions=100`` — no tanh.
+  Legacy ``tanh`` kept for old v1/v2 checkpoints only.
   """
   m = str(mode).lower().strip()
   if m in ("tanh", "soft", "normalize"):
     return torch.tanh(actions)
+  if m in ("none", "raw", "identity", ""):
+    c = float(clip)
+    if c > 0.0:
+      return actions.clamp(-c, c)
+    return actions
   c = float(clip)
   return actions.clamp(-c, c)
 
@@ -149,15 +153,14 @@ def safe_exec_body(
   trust: float,
   max_norm: float = 0.0,
 ) -> torch.Tensor:
-  """Blend actor body into **normalized** teacher, then trust-region.
+  """Blend actor body into teacher (same raw HIM space), then trust-region.
 
-  Both ``a_body`` (tanh) and ``teacher_body`` must already be in the same
-  [-1, 1]-ish space (see ``normalize_teacher_actions``). Then::
+  Both tensors must already match phase-1/2 joint actions (see
+  ``normalize_teacher_actions``). Then::
 
     exec = teacher + clip(blend(actor, teacher) - teacher, ±trust)
 
-  ``mix=0`` → pure teacher. ``mix=1`` + ``trust>0`` → actor stays near teacher
-  (prevents takeoff from an unnormalized / untrained a_body).
+  ``mix=0`` → pure teacher. ``mix=1`` + ``trust>0`` → actor stays near teacher.
   """
   mix = float(max(0.0, min(1.0, mix)))
   if mix <= 1e-8:
@@ -575,11 +578,11 @@ class Stage3SimCollector:
         obs_td = self.vec.get_observations()
         with torch.inference_mode():
           full_teacher = self.policy(obs_td)
-        # Normalize HIM (±100 numeric) → Stage3 tanh space before BC / exec.
+        # Same space as phase-1/2: raw HIM mean, ±clip_actions (default 100).
         full_teacher = normalize_teacher_actions(
           full_teacher,
-          mode=str(getattr(self.cfg, "teacher_action_norm", "tanh")),
-          clip=float(getattr(self.cfg, "teacher_action_clip", 1.0)),
+          mode=str(getattr(self.cfg, "teacher_action_norm", "none")),
+          clip=float(getattr(self.cfg, "teacher_action_clip", 100.0)),
         )
         teacher_body = full_teacher[..., : self.body_dim].detach()
         if self.ee_mode != "actor" or self.actor is None:
@@ -600,7 +603,7 @@ class Stage3SimCollector:
           teacher_body,
           mix=mix,
           trust=float(getattr(self.cfg, "body_trust_region", 0.20)),
-          max_norm=float(getattr(self.cfg, "body_max_norm", 2.5)),
+          max_norm=float(getattr(self.cfg, "body_max_norm", 0.0)),
         )
         act = full_teacher.clone()
         act[:, : self.body_dim] = exec_body
@@ -633,8 +636,8 @@ class Stage3SimCollector:
           full_a = self.policy(obs_td)
         full_a = normalize_teacher_actions(
           full_a,
-          mode=str(getattr(self.cfg, "teacher_action_norm", "tanh")),
-          clip=float(getattr(self.cfg, "teacher_action_clip", 1.0)),
+          mode=str(getattr(self.cfg, "teacher_action_norm", "none")),
+          clip=float(getattr(self.cfg, "teacher_action_clip", 100.0)),
         )
         teacher_body = full_a[..., : self.body_dim].detach()
         ee_raw = meters_to_ee_raw(ee_delta, self.ee_scale)

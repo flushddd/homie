@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Checkpoint / replay gate — refuse silent load of old actors / obs layouts.
-# v2: body head sees Phase-3 HIM actor (loco) obs; EE head sees reach features.
-ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v2_loco_obs"
+# v3: loco obs + raw a_body (no tanh; same joint space as phase-1/2 HIM).
+ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v3_raw_body"
 ACTION_SEMANTICS_HIER = "hier_ee0_offset_v0"
 ACTION_SEMANTICS_RESIDUAL = "ee_residual_v0"
 
@@ -26,22 +26,24 @@ class Stage3BpttCfg:
   arm_side: str = "right"  # "left" | "right"
   body_dim: int = 14
   ee_dim: int = 3
-  # Homie joint-pos action scale: q = q_default + scale * a_body.
+  # Homie joint-pos action scale: q = q_default + scale * a_body (phase-1/2).
   body_action_scale: float = 0.25
-  # EE palm-delta |Δp| per axis (m) after tanh.
+  # EE palm-delta hard clip |Δp| per axis (m); raw meters, no tanh.
+  # Injected as p_sub (oracle-style); env EE residual stays off.
   ee_delta_scale_m: float = 0.03
   # Max |p_sub_W| change per policy step (m) after base→world.
   subgoal_rate_limit_m: float = 0.04
   # Frozen phase-2 teacher MSE weight on a_body (regularizer, not the only loco signal).
   w_teacher: float = 2.0
-  # HIM act_inference mean is only numerically clipped to ±100; Stage3 a_body is
-  # tanh ∈ [-1, 1]. Normalize teacher into that space before BC / MSE / exec /
-  # trust-region (else teacher_mse sticks ~10–15 and never unlocks; raw a_body
-  # also fights an unscaled teacher and can take off).
-  #   "tanh": soft map R→(-1,1) — preferred normalization
-  #   "clip": hard clamp to ±teacher_action_clip (legacy 4315ad3)
-  teacher_action_norm: str = "tanh"
-  teacher_action_clip: float = 1.0
+  # a_body matches phase-1/2 HIM means: raw (no tanh), numeric clip ±100
+  # (Homie ``normalization.clip_actions``). Teacher uses the same space for BC.
+  #   "none" / "raw": identity + ±clip (default; matches phase-1/2)
+  #   "clip": hard clamp only
+  #   "tanh": legacy soft map (v1/v2) — do not use for new trains
+  teacher_action_norm: str = "none"
+  teacher_action_clip: float = 100.0
+  # Hard clamp on Stage3 a_body before exec / BC (0 = off). Same as clip_actions.
+  body_action_clip: float = 100.0
   # Blend Phase-1/2 env PPO step reward into Stage3 replay / critic targets.
   # This is the same Episode_Reward/* stack (tracking, orientation, height, …).
   w_loco: float = 1.0
@@ -54,8 +56,8 @@ class Stage3BpttCfg:
   #   exec = teacher + clip(blend - teacher, ±trust). Prevents fly-away when
   #   a_body is wrong (play/train). 0 disables. Keep >0 after arm unlock too.
   body_trust_region: float = 0.20
-  # Soft cap on ||a_body|| before blend (tanh coords); 0 = off.
-  body_max_norm: float = 2.5
+  # Soft cap on ||a_body|| before blend (raw HIM coords); 0 = off.
+  body_max_norm: float = 0.0
   # Legacy scales (kept for hierarchical / residual ablation).
   action_scale_m: float = 0.02
   subgoal_offset_scale_m: float = 0.55
