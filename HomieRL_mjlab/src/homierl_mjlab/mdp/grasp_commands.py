@@ -175,8 +175,8 @@ class GraspTargetCommand(CommandTerm):
       "yes",
       "YES",
     )
-    # Slow play = 0.06; oracle slightly faster.
-    self._gui_smooth_alpha: float = 0.10 if _oracle else 0.06
+    # Match slow play target easing.
+    self._gui_smooth_alpha: float = 0.1
     self._gui_arm_chase: Any | None = None
     self._waist_pitch_joint_id: int | None = None
     try:

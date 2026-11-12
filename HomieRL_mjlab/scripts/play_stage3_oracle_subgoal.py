@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Phase-3 oracle play: phase-2 loco (99/14) + DLS IK, EE residual=0.
+"""Phase-3 oracle play (remap trial): phase-2 ckpt → 229/17 + DLS.
 
-Sets ``HOMIE_PLAY_ORACLE_SUBGOAL=1`` so the Phase-3 *play* env keeps the
-phase-2 observation/action layout (no ``99→229`` remap). No crate. DLS
-chases the Viser grasp target (``p_sub := p_goal``); Arm chase default ON.
-
-How to judge:
-  - If the arm/waist reaches the gizmo with Arm chase ON → lower stack OK;
-    Stage-3 actor / rate-limit / WM are the suspects.
-  - If it still cannot reach → check ckpt, grasp ranges, Phase-3 IK interface.
+Sets ``HOMIE_PLAY_ORACLE_SUBGOAL=1``. Keeps Phase-3 obs/act layout so the
+runner remaps ``99→229`` / ``14→17``. EE residual ignored; DLS chases Viser
+grasp. Phase-3-only obs trails zeroed; Show container default OFF.
 
 Example::
 
@@ -37,7 +32,7 @@ def main() -> int:
     print(
       "usage: play_stage3_oracle_subgoal.py --checkpoint-file <phase2.pt> "
       "[other mjlab.play flags]\n"
-      "Sets HOMIE_PLAY_ORACLE_SUBGOAL=1 → phase2 obs/act 99/14, no crate, "
+      "Sets HOMIE_PLAY_ORACLE_SUBGOAL=1 → Phase3 229/17 remap, no crate, "
       "EE Δp=0, Arm chase default ON.",
       file=sys.stderr,
     )
@@ -54,11 +49,10 @@ def main() -> int:
     ]
 
   print(
-    "[oracle-play] phase2 99/14 (no remap) + DLS; EE residual OFF; no crate\n"
-    "  Expect: Actor in_features from 99-hist, NOT 'Remap 99->229'\n"
-    "  1) Open Viser — robot should stand quietly first\n"
-    "  2) Enable waist target + set XYZ gizmo / sliders\n"
-    "  3) Arm chase default ON — watch if palm reaches the target\n"
+    "[oracle-play] remap 99->229 + slow DLS (crate OFF)\n"
+    "  Expect: Remap phase-3 obs/act; Show container default OFF\n"
+    "  1) Stand → Enable waist target → drag XYZ\n"
+    "  2) Arm chase ON — palm tracks with play-grade IK\n"
     f"  argv: {argv}"
   )
 
