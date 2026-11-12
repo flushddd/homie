@@ -41,7 +41,7 @@ alwaysApply: true
     zero-range sliders). Early note used 99/14; later confirmed **remap is OK**
     — instability was mainly **Show container default ON**.
 
-- **`953071e13407398e0f7c9c1f8bd26bcdc5131869`** (`953071e`): "Oracle play:
+- **`3f183734d72586c2acb1bb2018ce7b03ad5afed0`** (`3f18373`): "Oracle play:
   remap 229/17 with slow DLS; keep container default OFF."
   - **Current oracle play baseline**: Phase-3 **229/17** (phase-2 remaps
     `99→229`); zero sdf/clr/ee_err/a[14:] in oracle obs; EE residual ignored
