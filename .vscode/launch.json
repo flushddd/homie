@@ -372,11 +372,40 @@
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
+        "HOMIE_PLAY_ORACLE_SUBGOAL": "1",
         "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
         "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
         "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
       },
       "args": [
+        "--mode",
+        "body",
+        "--bptt-checkpoint",
+        "${input:homieBpttCheckpoint}",
+        "--device",
+        "cuda:0",
+        "--log-every",
+        "25"
+      ]
+    },
+    {
+      "name": "HomieRL mjlab: Play Stage3 a_body + IK vs oracle (Viser)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/HomieRL_mjlab/.venv/bin/python",
+      "program": "${workspaceFolder}/HomieRL_mjlab/scripts/play_stage3_abody_stability.py",
+      "cwd": "${workspaceFolder}/HomieRL_mjlab",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "HOMIE_PLAY_ORACLE_SUBGOAL": "1",
+        "VIRTUAL_ENV": "${workspaceFolder}/HomieRL_mjlab/.venv",
+        "PATH": "${workspaceFolder}/HomieRL_mjlab/.venv/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/HomieRL_mjlab/src${pathSeparator}${env:PYTHONPATH}"
+      },
+      "args": [
+        "--mode",
+        "body+ik",
         "--bptt-checkpoint",
         "${input:homieBpttCheckpoint}",
         "--device",

@@ -73,7 +73,29 @@ def _parse() -> argparse.Namespace:
   p.add_argument(
     "--body-only",
     action="store_true",
-    help="Zero a_ee; pin p_sub to palm; arm chase OFF — test a_body(14) only.",
+    help=(
+      "Shorthand: --zero-ee-delta --subgoal palm + arm chase OFF "
+      "(a_body / lower-limb stability only)."
+    ),
+  )
+  p.add_argument(
+    "--zero-ee-delta",
+    action="store_true",
+    help=(
+      "Force a_ee:=0 (ignore Stage3 EE head). Use with --subgoal palm|goal. "
+      "Implies zero EE when --body-only."
+    ),
+  )
+  p.add_argument(
+    "--subgoal",
+    type=str,
+    default="auto",
+    choices=("auto", "palm", "goal"),
+    help=(
+      "Where p_sub goes when a_ee is forced to 0: "
+      "palm (hold current palm; loco-only), goal (inject Viser p_goal; DLS chase). "
+      "auto: palm if --body-only else goal if --zero-ee-delta else unused."
+    ),
   )
   p.add_argument(
     "--loco-source",
@@ -295,11 +317,15 @@ class Stage3BpttPlayPolicy:
     *,
     log_every: int = 25,
     body_only: bool = False,
+    zero_ee: bool = False,
+    subgoal: str = "palm",
     loco_source: str = "actor",
   ):
     self.collector = collector
     self.log_every = max(0, int(log_every))
     self.body_only = bool(body_only)
+    self.zero_ee = bool(zero_ee) or self.body_only
+    self.subgoal = str(subgoal)
     self.loco_source = str(loco_source)
     self._step = 0
 
@@ -389,12 +415,21 @@ class Stage3BpttPlayPolicy:
           a_body = torch.zeros(n, c.body_dim, device=c.device)
         elif self.loco_source == "teacher":
           need_teacher_body = True
-        if self.body_only or self.loco_source != "actor":
+        # Force a_ee:=0 for body-only / zero-ee / non-actor loco — then pin
+        # p_sub to palm (loco stability) or Viser p_goal (body + DLS).
+        force_zero_ee = (
+          self.zero_ee or self.body_only or self.loco_source != "actor"
+        )
+        if force_zero_ee:
           a_ee = torch.zeros(n, 3, device=c.device)
-          palm_w = palm_pos_world(c.env, arm_left=c.arm_left)
-          st.p_sub_w = palm_w.clone()
           st.last_delta_b.zero_()
-          p_sub = st.p_sub_w
+          if self.subgoal == "goal":
+            p_sub = st.p_goal_w
+            st.p_sub_w = p_sub.clone()
+          else:
+            palm_w = palm_pos_world(c.env, arm_left=c.arm_left)
+            st.p_sub_w = palm_w.clone()
+            p_sub = st.p_sub_w
         else:
           p_sub = st.apply_palm_delta_base(
             c.env,
@@ -574,17 +609,42 @@ def main() -> int:
   stage2 = args.stage2_checkpoint or str(payload.get("stage2_checkpoint") or "")
   if not stage2:
     print(
-      "error: need --stage2-checkpoint (not stored in this bptt ckpt)",
+      "error: need --stage2-checkpoint (not stored in this bptt ckpt).\n"
+      "  Stage3 actor is a_body+a_ee only; frozen phase-2 HIM is still the "
+      "loco/teacher policy loaded into the env.",
       file=sys.stderr,
     )
     return 2
   if not Path(stage2).is_file():
+    # Payload often stores a dated train path that was later moved/copied.
+    candidates: list[str] = []
     alt = str(payload.get("stage2_checkpoint") or "")
-    if alt and alt != stage2 and Path(alt).is_file():
-      print(f"[bptt-play] stage2 CLI missing; using payload path: {alt}")
-      stage2 = alt
+    if alt and alt != stage2:
+      candidates.append(alt)
+    # Common local aliases used in this repo / launch.json.
+    for rel in (
+      "logs/rsl_rl/homie_g1/phase2/model_18600.pt",
+      "logs/rsl_rl/homie_g1/phase2/model_18600(2).pt",
+    ):
+      candidates.append(str((_ROOT / rel) if not Path(rel).is_absolute() else Path(rel)))
+      candidates.append(rel)
+    resolved = ""
+    for c in candidates:
+      if c and Path(c).is_file():
+        resolved = c
+        break
+    if resolved:
+      print(
+        f"[bptt-play] stage2 path missing ({stage2}); using {resolved}"
+      )
+      stage2 = resolved
     else:
-      print(f"error: stage2 checkpoint not found: {stage2}", file=sys.stderr)
+      print(
+        f"error: stage2 checkpoint not found: {stage2}\n"
+        "  Pass --stage2-checkpoint <phase2/model_*.pt> "
+        "(frozen HIM loco/teacher required even for a_body-only play).",
+        file=sys.stderr,
+      )
       return 2
 
   if str(args.ee_mode) == "goal":
@@ -611,15 +671,16 @@ def main() -> int:
     if ckpt_sem is None:
       print(
         "error: refusing to load Stage3 ckpt without action_semantics into "
-        f"{ACTION_SEMANTICS_BODY_EE}. Old 3-D hierarchical actors are "
-        "incompatible — retrain with --control-mode body_ee_palm_delta.",
+        f"{ACTION_SEMANTICS_BODY_EE}. Old layouts / 3-D hier actors are "
+        "incompatible — retrain with loco-obs body_ee (v2).",
         file=sys.stderr,
       )
       return 2
     if ckpt_sem != ACTION_SEMANTICS_BODY_EE:
       print(
         f"error: action_semantics mismatch ckpt={ckpt_sem!r} "
-        f"expected={ACTION_SEMANTICS_BODY_EE!r}",
+        f"expected={ACTION_SEMANTICS_BODY_EE!r}\n"
+        "  v1 reach-only actors need a fresh train with include_loco_obs.",
         file=sys.stderr,
       )
       return 2
@@ -657,10 +718,22 @@ def main() -> int:
 
   loco_src = str(args.loco_source)
   body_only = bool(args.body_only)
+  zero_ee = bool(args.zero_ee_delta) or body_only or loco_src != "actor"
+  subgoal = str(args.subgoal)
+  if subgoal == "auto":
+    if body_only:
+      subgoal = "palm"
+    elif zero_ee:
+      subgoal = "goal"
+    else:
+      subgoal = "palm"
+  # body-only always locks arms; body+ik (zero-ee + goal) uses oracle UX
+  # (Arm chase checkbox after waist target).
+  arm_chase_gate = (not body_only) and (subgoal == "goal" or not zero_ee)
   print(
     f"[bptt-play] control_mode={cfg.control_mode} semantics={cfg.action_semantics} "
     f"curriculum={cur} ee_mode={args.ee_mode} loco_source={loco_src} "
-    f"body_only={body_only}"
+    f"body_only={body_only} zero_ee={zero_ee} subgoal={subgoal}"
   )
   if str(args.ee_mode) == "palm":
     print("[bptt-play] actor BYPASSED — p_sub := palm (stand / loco only)")
@@ -675,7 +748,7 @@ def main() -> int:
   print(f"[bptt-play] bptt={bptt_path if bptt_path else '(none)'}")
   print(
     "[bptt-play] spheres: orange=p_goal from Viser body xyz; "
-    "cyan=p_sub (palm+delta). Prefer y<0 for right-arm ckpt."
+    "cyan=p_sub (palm+delta or pinned). Prefer y<0 for right-arm ckpt."
   )
 
   collector = Stage3SimCollector(
@@ -688,6 +761,18 @@ def main() -> int:
   )
   collector.ee_mode = str(args.ee_mode)
   if need_actor and loco_src == "actor":
+    loco_dim = int(
+      payload.get("loco_obs_dim", getattr(collector, "loco_obs_dim", 0)) or 0
+    )
+    if loco_dim <= 0:
+      loco_dim = int(getattr(collector, "loco_obs_dim", 0) or 0)
+    if int(collector.obs_dim) != int(
+      payload.get("obs_dim", collector.obs_dim) or collector.obs_dim
+    ):
+      print(
+        f"[bptt-play] warn: ckpt obs_dim={payload.get('obs_dim')} "
+        f"vs collector={collector.obs_dim} (loco={loco_dim})"
+      )
     actor = Stage3Actor(
       collector.obs_dim,
       cfg.actor_hidden,
@@ -697,6 +782,7 @@ def main() -> int:
       action_scale_m=collector.actor_action_scale,
       control_mode=cfg.control_mode,
       near_zero_body_init=False,
+      loco_obs_dim=loco_dim,
     ).to(collector.device)
     actor.load_state_dict(payload["actor"])
     actor.eval()
@@ -717,13 +803,19 @@ def main() -> int:
   collector.env._homie_play_arm_chase = False
   ee = collector.env.action_manager.get_term("ee_residual")
   if hasattr(ee, "_require_play_arm_chase"):
-    ee._require_play_arm_chase = not body_only
+    ee._require_play_arm_chase = bool(arm_chase_gate)
   if (collector.hierarchical or collector.body_ee) and hasattr(ee, "_use_policy_delta"):
     ee._use_policy_delta = False
-  if body_only:
+  if body_only or (zero_ee and subgoal == "palm"):
     print(
-      "[bptt-play] --body-only: a_ee:=0, p_sub:=palm, arm chase OFF "
-      "(verify a_body / lower-limb only)"
+      "[bptt-play] a_ee:=0, p_sub:=palm, arm chase OFF "
+      "(verify Stage3 a_body / lower-limb stability)"
+    )
+  elif zero_ee and subgoal == "goal":
+    print(
+      "[bptt-play] a_ee:=0, p_sub:=p_goal — Stage3 a_body + DLS "
+      "(compare to oracle loco+IK). Arm chase OFF until Viser: "
+      "Enable waist target → set XYZ → Arm chase ON"
     )
   else:
     print(
@@ -734,7 +826,7 @@ def main() -> int:
   _install_dual_target_debug_vis(
     collector.env, show_sub=collector.hierarchical or collector.body_ee
   )
-  if not body_only:
+  if arm_chase_gate:
     collector._force_reach_flags()
   st = _goal_state(collector)
   st.ensure_all(collector.env, arm_left=collector.arm_left)
@@ -745,7 +837,9 @@ def main() -> int:
   policy = Stage3BpttPlayPolicy(
     collector,
     log_every=int(args.log_every),
-    body_only=body_only or loco_src != "actor",
+    body_only=body_only,
+    zero_ee=zero_ee,
+    subgoal=subgoal,
     loco_source=loco_src,
   )
   viewer = ViserPlayViewer(

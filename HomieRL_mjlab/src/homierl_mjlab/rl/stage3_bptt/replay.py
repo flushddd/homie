@@ -22,6 +22,7 @@ class TransitionBatch:
   env_id: torch.Tensor
   actor_action: torch.Tensor | None = None
   teacher_body: torch.Tensor | None = None
+  loco_obs: torch.Tensor | None = None
 
 
 class EpisodeReplay:
@@ -31,7 +32,7 @@ class EpisodeReplay:
   multiple of ``N`` so wrap never splits a step (otherwise env stride breaks).
 
   Stores per-step ``present`` so imagination can match real safe/margin gating.
-  Optional ``actor_action`` / ``teacher_body`` for body_ee BC (zeros if unused).
+  Optional ``actor_action`` / ``teacher_body`` / ``loco_obs`` for body_ee BC.
   Old checkpoints without ``present`` are not auto-migrated — rebuild replay.
   """
 
@@ -47,6 +48,7 @@ class EpisodeReplay:
     num_envs: int = 1,
     actor_action_dim: int = 0,
     teacher_body_dim: int = 0,
+    loco_obs_dim: int = 0,
     action_semantics: str = "",
   ):
     self.num_envs = max(1, int(num_envs))
@@ -60,6 +62,7 @@ class EpisodeReplay:
     self._steps_written = 0
     self.actor_action_dim = int(actor_action_dim)
     self.teacher_body_dim = int(teacher_body_dim)
+    self.loco_obs_dim = int(loco_obs_dim)
     self.action_semantics = str(action_semantics)
     z = lambda d: torch.zeros(cap, d, device=device)
     self.state = z(state_dim)
@@ -79,6 +82,7 @@ class EpisodeReplay:
     self.teacher_body = (
       z(self.teacher_body_dim) if self.teacher_body_dim > 0 else None
     )
+    self.loco_obs = z(self.loco_obs_dim) if self.loco_obs_dim > 0 else None
     self._ep_counter = 0
 
   def add_batch(
@@ -98,6 +102,7 @@ class EpisodeReplay:
     new_episode: torch.Tensor | None = None,
     actor_action: torch.Tensor | None = None,
     teacher_body: torch.Tensor | None = None,
+    loco_obs: torch.Tensor | None = None,
   ) -> None:
     del new_episode
     n = int(state.shape[0])
@@ -132,6 +137,8 @@ class EpisodeReplay:
       self.actor_action[slots] = actor_action
     if self.teacher_body is not None and teacher_body is not None:
       self.teacher_body[slots] = teacher_body
+    if self.loco_obs is not None and loco_obs is not None:
+      self.loco_obs[slots] = loco_obs
     self.ptr = int((self.ptr + n) % self.capacity)
     self.size = min(self.capacity, self.size + n)
     self._steps_written += 1
@@ -153,6 +160,7 @@ class EpisodeReplay:
       env_id=self.env_id[idx],
       actor_action=None if self.actor_action is None else self.actor_action[idx],
       teacher_body=None if self.teacher_body is None else self.teacher_body[idx],
+      loco_obs=None if self.loco_obs is None else self.loco_obs[idx],
     )
 
   def _num_complete_steps(self) -> int:
@@ -172,7 +180,8 @@ class EpisodeReplay:
     Returns:
       ``states (B,H+1,S), controls (B,H,U), rewards (B,H), terminated (B,H),
       truncated (B,H), goals (B,G), geoms (B,Geom), present (B,),
-      teacher_body (B,H,14)|None, actor_action (B,H,A)|None``
+      teacher_body (B,H,14)|None, actor_action (B,H,A)|None,
+      loco_obs (B,H,L)|None``
     """
     h = int(horizon)
     n_envs = int(num_envs_hint) if num_envs_hint is not None else self.num_envs
@@ -197,7 +206,7 @@ class EpisodeReplay:
       [],
       [],
     )
-    teachers, actor_acts = [], []
+    teachers, actor_acts, locos = [], [], []
     tries = 0
     max_start = n_steps - h
     while len(states) < batch and tries < batch * 100:
@@ -225,6 +234,8 @@ class EpisodeReplay:
         teachers.append(self.teacher_body[idx[:-1]])
       if self.actor_action is not None:
         actor_acts.append(self.actor_action[idx[:-1]])
+      if self.loco_obs is not None:
+        locos.append(self.loco_obs[idx[:-1]])
     if not states:
       raise RuntimeError(
         "Failed to sample contiguous replay windows "
@@ -243,4 +254,5 @@ class EpisodeReplay:
     )
     teacher_t = torch.stack(teachers, 0) if teachers else None
     actor_t = torch.stack(actor_acts, 0) if actor_acts else None
-    return out + (teacher_t, actor_t)
+    loco_t = torch.stack(locos, 0) if locos else None
+    return out + (teacher_t, actor_t, loco_t)

@@ -157,7 +157,9 @@ def check_refuse_old_semantics() -> dict[str, float]:
     refused = 1.0 if "action_semantics" in str(e) else 0.5
   return {
     "refused_legacy": refused,
-    "expected_semantics": 1.0 if trainer.action_semantics == ACTION_SEMANTICS_BODY_EE else 0.0,
+    "expected_semantics": (
+      1.0 if trainer.action_semantics == ACTION_SEMANTICS_BODY_EE else 0.0
+    ),
   }
 
 

@@ -495,8 +495,8 @@ class HomieOnPolicyRunner:
 
   # Actor one-step layouts:
   #   phase-1: proprio68 | a12 | ith+tz | container10  (~92)
-  #   phase-2: proprio68 | a14 | grasp7 | container10 = 99
-  #   phase-3: proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
+  #   phase-2 / phase-3 env: proprio68 | a14 | grasp7 | container10 = 99
+  #   legacy SDF (BPTT only): proprio68 | a17 | grasp7 | sdf128 | clr6 | ee3 = 229
   _HOMIE_PROPRIO = 68
   _HOMIE_GRASP = 7
   _HOMIE_CONTAINER = 10

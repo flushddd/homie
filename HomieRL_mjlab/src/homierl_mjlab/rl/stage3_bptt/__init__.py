@@ -1,7 +1,7 @@
-"""Stage-3 BPTT + world-model training (parallel to PPO Phase-3).
+"""Stage-3 BPTT + world-model training (parallel to env Phase-3).
 
-See ``INTERFACES.md`` for dims and limitations. Existing task
-``Mjlab-Homie-Flat-Unitree-G1-Phase3`` (PPO) is unchanged.
+See ``INTERFACES.md`` for dims and limitations. Registered Phase-3 env uses
+phase-2 obs/act (99/14) + DLS IK; BPTT builds its own actor obs on top.
 """
 
 from homierl_mjlab.rl.stage3_bptt.cfg import Stage3BpttCfg

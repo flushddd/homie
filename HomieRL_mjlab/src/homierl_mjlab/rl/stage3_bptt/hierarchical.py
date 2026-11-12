@@ -256,7 +256,7 @@ def hierarchical_obs_dim(sdf_query_count: int) -> int:
   return 3 + 3 + 3 + 3 + 3 + int(sdf_query_count) + 6
 
 
-def build_body_ee_obs(
+def build_body_ee_reach_obs(
   env: ManagerBasedRlEnv,
   state: PalmDeltaSubgoalState,
   *,
@@ -265,10 +265,7 @@ def build_body_ee_obs(
   clearance: torch.Tensor,
   last_a: torch.Tensor,
 ) -> torch.Tensor:
-  """Obs: palm, goal, goal−palm, prev_sub−palm, last_a(17), SDF, clearance.
-
-  No ee0-relative terms. ``last_a`` is packed ``[a_body(14), a_ee(3)]``.
-  """
+  """Reach features only: palm, goal, deltas, last_a(17), SDF, clearance."""
   robot = env.scene["robot"]
   env_ids = torch.arange(env.num_envs, device=env.device)
   palm_w = palm_pos_world(env, arm_left=arm_left)
@@ -290,6 +287,45 @@ def build_body_ee_obs(
   )
 
 
-def body_ee_obs_dim(sdf_query_count: int, *, action_dim: int = 17) -> int:
+def build_body_ee_obs(
+  env: ManagerBasedRlEnv,
+  state: PalmDeltaSubgoalState,
+  *,
+  arm_left: bool,
+  sdf: torch.Tensor,
+  clearance: torch.Tensor,
+  last_a: torch.Tensor,
+  loco_obs: torch.Tensor | None = None,
+) -> torch.Tensor:
+  """Full Stage3 obs: optional HIM loco obs ‖ reach features.
+
+  Layout ``[loco | reach]`` so the body head can slice ``[:loco_dim]``.
+  ``last_a`` is packed ``[a_body(14), a_ee(3)]``.
+  """
+  reach = build_body_ee_reach_obs(
+    env,
+    state,
+    arm_left=arm_left,
+    sdf=sdf,
+    clearance=clearance,
+    last_a=last_a,
+  )
+  if loco_obs is None:
+    return reach
+  return torch.cat((loco_obs, reach), dim=-1)
+
+
+def body_ee_reach_obs_dim(sdf_query_count: int, *, action_dim: int = 17) -> int:
   # palm3 + goal3 + (goal-palm)3 + (prev_sub-palm)3 + last_a + sdfK + clr6
   return 3 + 3 + 3 + 3 + int(action_dim) + int(sdf_query_count) + 6
+
+
+def body_ee_obs_dim(
+  sdf_query_count: int,
+  *,
+  action_dim: int = 17,
+  loco_obs_dim: int = 0,
+) -> int:
+  return int(loco_obs_dim) + body_ee_reach_obs_dim(
+    sdf_query_count, action_dim=action_dim
+  )

@@ -69,6 +69,7 @@ class Stage3BpttTrainer:
     geom_fn: Callable[..., tuple[torch.Tensor, torch.Tensor]],
     palm_step_fn: Callable[..., torch.Tensor] | None = None,
     num_envs: int = 1,
+    loco_obs_dim: int = 0,
   ):
     self.cfg = cfg
     self.device = torch.device(cfg.device)
@@ -82,6 +83,8 @@ class Stage3BpttTrainer:
     self.body_ee = self.control_mode == "body_ee_palm_delta"
     self.body_dim = int(getattr(cfg, "body_dim", 14))
     self.ee_dim = int(getattr(cfg, "ee_dim", 3))
+    self.obs_dim = int(obs_dim)
+    self.loco_obs_dim = max(0, int(loco_obs_dim))
     self.action_semantics = cfg.resolve_action_semantics()
     self.actor_out_dim = self.body_dim + self.ee_dim if self.body_ee else 3
 
@@ -98,6 +101,7 @@ class Stage3BpttTrainer:
       ),
       control_mode=self.control_mode,
       near_zero_body_init=self.body_ee,
+      loco_obs_dim=self.loco_obs_dim if self.body_ee else 0,
     ).to(self.device)
     self.critic = Stage3Critic(feat_dim, cfg.critic_hidden).to(self.device)
     self.critic_tgt = Stage3Critic(feat_dim, cfg.critic_hidden).to(self.device)
@@ -124,6 +128,7 @@ class Stage3BpttTrainer:
       num_envs=self.num_envs_hint,
       actor_action_dim=self.actor_out_dim,
       teacher_body_dim=self.body_dim if self.body_ee else 0,
+      loco_obs_dim=self.loco_obs_dim if self.body_ee else 0,
       action_semantics=self.action_semantics,
     )
     self.last_action = torch.zeros(1, self.actor_out_dim, device=self.device)
@@ -195,11 +200,13 @@ class Stage3BpttTrainer:
     return tilt_angle_from_root_quat(quat)
 
   def _unpack_windows(self, windows: tuple) -> tuple:
-    """Compat: windows may be 8-tuple (legacy) or 10-tuple (+teacher, actor_a)."""
-    if len(windows) == 10:
+    """Compat: 8 / 10 / 11-tuple (+teacher, actor_a, loco_obs)."""
+    if len(windows) == 11:
       return windows
+    if len(windows) == 10:
+      return windows + (None,)
     if len(windows) == 8:
-      return windows + (None, None)
+      return windows + (None, None, None)
     raise RuntimeError(f"Unexpected window tuple len={len(windows)}")
 
   def update_world_model(self) -> dict[str, float]:
@@ -236,6 +243,7 @@ class Stage3BpttTrainer:
       _present,
       _teacher,
       _actor_a,
+      _loco,
     ) = self._unpack_windows(windows)
     states, controls, rewards, terms, goals, geoms = _sanitize(
       states, controls, rewards, terms, goals, geoms
@@ -292,11 +300,16 @@ class Stage3BpttTrainer:
       present,
       teacher_body,
       _actor_logged,
+      loco_obs,
     ) = self._unpack_windows(windows)
     states, goals, geoms, present = _sanitize(states, goals, geoms, present)
     s = states[:, 0].detach().requires_grad_(True)
     ctx = torch.cat((goals, geoms), dim=-1)
     last_a = torch.zeros(s.shape[0], self.actor_out_dim, device=self.device)
+    # Freeze real HIM loco obs at window start during imagination (no WM for it).
+    loco0 = None
+    if loco_obs is not None and self.loco_obs_dim > 0:
+      loco0 = loco_obs[:, 0].detach()
     returns = []
     discount = torch.ones(s.shape[0], device=self.device)
     surv = torch.ones(s.shape[0], device=self.device)
@@ -316,7 +329,10 @@ class Stage3BpttTrainer:
     a0_body = None
     a0_ee = None
     for _t in range(cfg.imagine_horizon):
-      obs = self.obs_fn(s, goals, geoms, last_a)
+      try:
+        obs = self.obs_fn(s, goals, geoms, last_a, loco_obs=loco0)
+      except TypeError:
+        obs = self.obs_fn(s, goals, geoms, last_a)
       obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
       a_out = self.actor(obs)
       if self.body_ee and isinstance(a_out, tuple):
@@ -485,6 +501,8 @@ class Stage3BpttTrainer:
       "action_semantics": self.action_semantics,
       "control_mode": self.control_mode,
       "actor_out_dim": self.actor_out_dim,
+      "obs_dim": self.obs_dim,
+      "loco_obs_dim": self.loco_obs_dim,
       "arm_unlocked": bool(self.arm_unlocked),
     }
 
@@ -503,7 +521,7 @@ class Stage3BpttTrainer:
         raise RuntimeError(
           "Refusing to load Stage3 checkpoint without action_semantics "
           f"(current={self.action_semantics!r}). Old 3-D hierarchical actors "
-          "are incompatible with body14_ee3_palm_delta_v1 — train fresh."
+          "are incompatible with body14_ee3_palm_delta_v2_loco_obs — train fresh."
         )
     elif ckpt_sem is not None and ckpt_sem != self.action_semantics:
       raise RuntimeError(

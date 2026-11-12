@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# Checkpoint / replay gate — refuse silent load of old 3-D hier actors.
-ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v1"
+# Checkpoint / replay gate — refuse silent load of old actors / obs layouts.
+# v2: body head sees Phase-3 HIM actor (loco) obs; EE head sees reach features.
+ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v2_loco_obs"
 ACTION_SEMANTICS_HIER = "hier_ee0_offset_v0"
 ACTION_SEMANTICS_RESIDUAL = "ee_residual_v0"
 
@@ -14,11 +15,14 @@ ACTION_SEMANTICS_RESIDUAL = "ee_residual_v0"
 class Stage3BpttCfg:
   # --- control ---
   # body_ee_palm_delta (default): Actor [a_body(14), a_ee(3)];
-  #   p_sub_B = palm_B + delta_B; frozen phase-2 teacher supervises body.
+  #   body ← distill frozen phase-2/3 HIM on loco obs;
+  #   a_ee ← palm Δp command injected as p_sub for loco+IK.
   # hierarchical_subgoal (legacy): offset from episode p_ee0; frozen loco policy.
   # ee_residual (legacy): Δp on EE IK only.
   control_mode: str = "body_ee_palm_delta"
   action_semantics: str = ACTION_SEMANTICS_BODY_EE
+  # Concat Phase-3 env actor (HIM) obs in front of reach features for body head.
+  include_loco_obs: bool = True
   arm_side: str = "right"  # "left" | "right"
   body_dim: int = 14
   ee_dim: int = 3

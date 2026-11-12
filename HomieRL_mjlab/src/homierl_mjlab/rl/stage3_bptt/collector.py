@@ -32,11 +32,24 @@ from homierl_mjlab.rl.stage3_bptt.hierarchical import (
   attractor_offset_w,
   attractor_palm_delta_b,
   body_ee_obs_dim,
+  body_ee_reach_obs_dim,
   build_body_ee_obs,
   build_hierarchical_obs,
   hierarchical_obs_dim,
   inject_subgoal_into_grasp,
 )
+
+
+def flat_him_actor_obs(obs_td) -> torch.Tensor:
+  """Flatten Phase-3 env actor / policy obs used by frozen HIM."""
+  if "actor" in obs_td.keys():
+    return obs_td["actor"]
+  if "policy" in obs_td.keys():
+    return obs_td["policy"]
+  keys = list(obs_td.keys())
+  if not keys:
+    raise KeyError("empty observation TensorDict")
+  return obs_td[keys[0]]
 from homierl_mjlab.rl.stage3_bptt.networks import Stage3Actor
 from homierl_mjlab.rl.stage3_bptt.replay import EpisodeReplay
 from homierl_mjlab.rl.stage3_bptt.rewards_stage3 import (
@@ -265,22 +278,43 @@ class Stage3SimCollector:
       self.body_dim + self.ee_dim if self.body_ee else 3
     )
 
+    # HIM actor obs dim (Phase-3 remapped layout) for body-head distillation.
+    self.include_loco_obs = bool(
+      self.body_ee and getattr(cfg, "include_loco_obs", True)
+    )
+    try:
+      self.loco_obs_dim = int(
+        flat_him_actor_obs(self.vec.get_observations()).shape[-1]
+      )
+    except Exception:  # noqa: BLE001
+      self.loco_obs_dim = 0
+    if not self.include_loco_obs:
+      self.loco_obs_dim = 0
+
     if self.body_ee:
-      self.obs_dim = body_ee_obs_dim(
+      self.reach_obs_dim = body_ee_reach_obs_dim(
         cfg.sdf_query_count, action_dim=self.actor_out_dim
+      )
+      self.obs_dim = body_ee_obs_dim(
+        cfg.sdf_query_count,
+        action_dim=self.actor_out_dim,
+        loco_obs_dim=self.loco_obs_dim,
       )
       self.actor_action_scale = float(cfg.ee_delta_scale_m)
     elif self.hierarchical:
-      self.obs_dim = hierarchical_obs_dim(cfg.sdf_query_count)
+      self.reach_obs_dim = hierarchical_obs_dim(cfg.sdf_query_count)
+      self.obs_dim = self.reach_obs_dim
       self.actor_action_scale = float(cfg.subgoal_offset_scale_m)
     else:
-      self.obs_dim = 3 + 3 + 3 + cfg.sdf_query_count + 6
+      self.reach_obs_dim = 3 + 3 + 3 + cfg.sdf_query_count + 6
+      self.obs_dim = self.reach_obs_dim
       self.actor_action_scale = float(cfg.action_scale_m)
     self.feat_dim = self.state_dim + self.goal_dim + self.geom_dim
 
     self.last_a = torch.zeros(
       self.env.num_envs, self.actor_out_dim, device=self.device
     )
+    self._last_loco_obs: torch.Tensor | None = None
     self._env_ep_id = torch.zeros(
       self.env.num_envs, device=self.device, dtype=torch.long
     )
@@ -345,6 +379,16 @@ class Stage3SimCollector:
       clr = torch.ones(self.env.num_envs, 6, device=self.device) * self.cfg.d_max
     return sdf, clr
 
+  def _current_loco_obs(self) -> torch.Tensor | None:
+    if self.loco_obs_dim <= 0:
+      return None
+    loco = flat_him_actor_obs(self.vec.get_observations())
+    if loco.shape[-1] != self.loco_obs_dim:
+      raise RuntimeError(
+        f"loco_obs dim changed: got {loco.shape[-1]} expected {self.loco_obs_dim}"
+      )
+    return loco
+
   def _build_actor_obs(self) -> torch.Tensor:
     sdf, clr = self._sdf_clr()
     if self.body_ee:
@@ -355,6 +399,7 @@ class Stage3SimCollector:
         sdf=sdf,
         clearance=clr,
         last_a=self.last_a,
+        loco_obs=self._current_loco_obs(),
       )
     if self.hierarchical:
       return build_hierarchical_obs(
@@ -371,8 +416,11 @@ class Stage3SimCollector:
   def _actor_body_ee(self) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(a_body, a_ee_delta_m)`` from actor or attractor+teacher."""
     n = self.env.num_envs
+    self._last_loco_obs = None
     if self.ee_mode == "actor" and self.actor is not None:
       obs = self._build_actor_obs()
+      if self.loco_obs_dim > 0:
+        self._last_loco_obs = obs[..., : self.loco_obs_dim].detach()
       with torch.no_grad():
         out = self.actor(obs)
       if isinstance(out, tuple):
@@ -381,6 +429,10 @@ class Stage3SimCollector:
       return torch.zeros(n, self.body_dim, device=self.device), out
 
     # Attractor: EE toward true goal; body from frozen teacher after inject.
+    if self.loco_obs_dim > 0:
+      self._last_loco_obs = self._current_loco_obs()
+      if self._last_loco_obs is not None:
+        self._last_loco_obs = self._last_loco_obs.detach()
     a_ee = attractor_palm_delta_b(
       self.env,
       self.palm_state,
@@ -696,6 +748,11 @@ class Stage3SimCollector:
         episode_id=self._env_ep_id,
         actor_action=packed_a.detach(),
         teacher_body=teacher_body.detach(),
+        loco_obs=(
+          None
+          if self._last_loco_obs is None
+          else self._last_loco_obs.detach()
+        ),
       )
       self.last_a = packed_a.detach()
       if self.body_ee:
@@ -851,8 +908,10 @@ class Stage3SimCollector:
     d_max = float(self.cfg.d_max)
     sdf_k = int(self.cfg.sdf_query_count)
     actor_out = self.actor_out_dim
+    loco_dim = int(self.loco_obs_dim)
 
-    def obs_fn(state, goal, geom, last_a):
+    def obs_fn(state, goal, geom, last_a, loco_obs=None):
+      """Build Stage3 actor obs. Optional ``loco_obs`` freezes HIM proprio in imag."""
       palm = state[..., -3:]
       b = state.shape[0]
       if geom is not None and geom.shape[-1] >= 10:
@@ -877,10 +936,23 @@ class Stage3SimCollector:
       if body_ee:
         # palm, goal, goal-palm, prev_sub-palm≈0, last_a, sdf, clr
         zero = torch.zeros_like(palm)
-        return torch.cat(
+        reach = torch.cat(
           (palm, goal[..., :3], goal[..., :3] - palm, zero, last_a, sdf, clr),
           dim=-1,
         )
+        if loco_dim <= 0:
+          return reach
+        if loco_obs is None:
+          loco = torch.zeros(b, loco_dim, device=state.device, dtype=state.dtype)
+        else:
+          loco = loco_obs
+          if loco.dim() == 3:
+            loco = loco[:, 0]
+          if loco.shape[-1] != loco_dim:
+            raise RuntimeError(
+              f"obs_fn loco dim {loco.shape[-1]} != {loco_dim}"
+            )
+        return torch.cat((loco, reach), dim=-1)
       if hierarchical:
         return torch.cat(
           (palm, goal[..., :3], goal[..., :3], palm, last_a[..., :3], sdf, clr),

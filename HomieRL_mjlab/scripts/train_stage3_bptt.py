@@ -517,6 +517,7 @@ def run_real(args: argparse.Namespace) -> int:
     geom_fn=geom_fn,
     palm_step_fn=palm_step_fn,
     num_envs=int(collector.env.num_envs),
+    loco_obs_dim=int(collector.loco_obs_dim),
   )
   collector.actor = trainer.actor
   collector.ee_mode = str(args.ee_mode)
@@ -543,6 +544,7 @@ def run_real(args: argparse.Namespace) -> int:
   print(
     f"[stage3_bptt] ee_mode={collector.ee_mode} "
     f"actor_out_dim={trainer.actor_out_dim} obs_dim={collector.obs_dim} "
+    f"loco_obs_dim={collector.loco_obs_dim} "
     f"arm_unlocked={collector.arm_unlocked}"
   )
 

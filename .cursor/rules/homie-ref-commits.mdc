@@ -43,8 +43,9 @@ alwaysApply: true
 
 - **`3f183734d72586c2acb1bb2018ce7b03ad5afed0`** (`3f18373`): "Oracle play:
   remap 229/17 with slow DLS; keep container default OFF."
-  - **Current oracle play baseline**: Phase-3 **229/17** (phase-2 remaps
-    `99→229`); zero sdf/clr/ee_err/a[14:] in oracle obs; EE residual ignored
-    (`use_policy_delta=False`, `action_dim=3`); Show container **default OFF**;
-    Enable waist seeds palm + syncs sliders; slow play-grade DLS
-    (`ik_iterations=3`). Do not turn container default back ON when tuning IK.
+  - **User-pinned oracle play baseline** (remember this commit). Phase-3
+    **229/17** (phase-2 remaps `99→229`); zero sdf/clr/ee_err/a[14:] in oracle
+    obs; EE residual ignored (`use_policy_delta=False`, `action_dim=3`); Show
+    container **default OFF**; Enable waist seeds palm + syncs sliders; slow
+    play-grade DLS (`ik_iterations=3`, small step/blend). Remap itself is OK;
+    do not turn container default back ON when tuning IK.

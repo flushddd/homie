@@ -26,10 +26,9 @@ register_mjlab_task(
   runner_cls=HomieOnPolicyRunner,
 )
 
-# Phase-3: 14 loco + 3 EE residual; analytic SDF walls; teacher locks 14 loco dims.
-# Resume a phase-2 checkpoint so ``learn()`` can clone it as teacher.
-# Actor one-step is phase-3-only (grasp + sdf + clearance + ee_err + a17).
-# Phase-1/2 keep their own layouts (ith/tz+container10 / grasp+container10).
+# Phase-3: same obs/act as phase-2 (99 / 14 loco). DLS IK chases grasp in
+# base frame (wrist locked); no policy EE residual / SDF actor trail.
+# Resume a phase-2 checkpoint — dims match, no 229 remap.
 register_mjlab_task(
   task_id="Mjlab-Homie-Flat-Unitree-G1-Phase3",
   env_cfg=homie_g1_flat_env_cfg(phase=3),

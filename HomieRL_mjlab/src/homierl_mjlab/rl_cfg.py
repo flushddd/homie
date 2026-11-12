@@ -41,6 +41,7 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
   ``phase=2`` enables teacher mean+KL loco lock after resume from phase-1 ckpt
   (Homie ``task_registry`` deepcopy + ``set_teacher``).
   ``phase=3`` locks the first 14 loco dims (legs + roll/pitch) on every env.
+  Obs/act match phase-2 (99 / 14); DLS IK is outside the policy.
   """
   phase = int(phase)
   use_teacher = phase >= 2
@@ -49,8 +50,9 @@ def homie_g1_him_runner_cfg(phase: int = 1) -> HomieRlOnPolicyRunnerCfg:
     run_name = "phase3"
     keep_always = True
     keep_loco_weight = 5.0
-    is_waist_idx = 86  # proprio68 + padded a17 + grasp is_waist
-    teacher_one_step = 229
+    # Same as phase-2: proprio68 + a14 + grasp is_waist.
+    is_waist_idx = 83
+    teacher_one_step = 0
   else:
     keep_dims = 12
     run_name = "" if phase <= 1 else "phase2"

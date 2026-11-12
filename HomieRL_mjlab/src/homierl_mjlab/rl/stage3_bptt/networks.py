@@ -21,12 +21,12 @@ def _mlp(in_dim: int, hidden: Sequence[int], out_dim: int) -> nn.Sequential:
 class Stage3Actor(nn.Module):
   """Deterministic actor.
 
-  Default ``body_ee_palm_delta``: ``out_dim = body_dim + ee_dim`` (17).
-  ``forward`` returns ``(a_body, a_ee_delta)`` both tanh-scaled.
-  Body uses scale 1.0 (decode ``q = q_default + body_action_scale * a`` outside).
-  EE uses ``ee_delta_scale_m`` (meters in Homie base).
+  Default ``body_ee_palm_delta`` with ``loco_obs_dim>0`` (v2):
+    * ``body_net(loco_obs) → a_body(14)`` — distill HIM loco
+    * ``ee_net(reach_obs) → a_ee(3)`` — palm Δp command into p_sub
 
-  Legacy modes use ``out_dim=3`` and ``forward_legacy`` / single tensor path.
+  Obs layout must be ``[loco | reach]``. Legacy ``loco_obs_dim=0`` keeps a
+  single MLP on the full vector (reach-only or packed).
   """
 
   def __init__(
@@ -40,33 +40,63 @@ class Stage3Actor(nn.Module):
     action_scale_m: float = 0.02,
     control_mode: str = "body_ee_palm_delta",
     near_zero_body_init: bool = True,
+    loco_obs_dim: int = 0,
   ):
     super().__init__()
     self.control_mode = str(control_mode)
     self.body_dim = int(body_dim)
     self.ee_dim = int(ee_dim)
     self.ee_delta_scale_m = float(ee_delta_scale_m)
-    # Legacy single-scale for hierarchical / residual 3-D actors.
     self.action_scale_m = float(action_scale_m)
+    self.obs_dim = int(obs_dim)
+    self.loco_obs_dim = max(0, int(loco_obs_dim))
+    self.reach_obs_dim = max(0, self.obs_dim - self.loco_obs_dim)
 
     if self.control_mode == "body_ee_palm_delta":
       self.out_dim = self.body_dim + self.ee_dim
     else:
       self.out_dim = 3
-    self.net = _mlp(obs_dim, hidden, self.out_dim)
 
-    if self.control_mode == "body_ee_palm_delta" and near_zero_body_init:
-      last = self.net[-1]
-      assert isinstance(last, nn.Linear)
-      nn.init.zeros_(last.bias)
-      # Small body head so teacher BC dominates early; EE slightly larger.
-      with torch.no_grad():
-        last.weight[: self.body_dim].mul_(0.01)
-        last.weight[self.body_dim :].mul_(0.1)
+    self.body_net: nn.Module | None = None
+    self.ee_net: nn.Module | None = None
+    self.net: nn.Module | None = None
+
+    if (
+      self.control_mode == "body_ee_palm_delta"
+      and self.loco_obs_dim > 0
+      and self.reach_obs_dim > 0
+    ):
+      self.body_net = _mlp(self.loco_obs_dim, hidden, self.body_dim)
+      self.ee_net = _mlp(self.reach_obs_dim, hidden, self.ee_dim)
+      if near_zero_body_init:
+        last_b = self.body_net[-1]
+        last_e = self.ee_net[-1]
+        assert isinstance(last_b, nn.Linear) and isinstance(last_e, nn.Linear)
+        nn.init.zeros_(last_b.bias)
+        nn.init.zeros_(last_e.bias)
+        with torch.no_grad():
+          last_b.weight.mul_(0.01)
+          last_e.weight.mul_(0.1)
+    else:
+      self.net = _mlp(obs_dim, hidden, self.out_dim)
+      if self.control_mode == "body_ee_palm_delta" and near_zero_body_init:
+        last = self.net[-1]
+        assert isinstance(last, nn.Linear)
+        nn.init.zeros_(last.bias)
+        with torch.no_grad():
+          last.weight[: self.body_dim].mul_(0.01)
+          last.weight[self.body_dim :].mul_(0.1)
 
   def forward(
     self, obs: torch.Tensor
   ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if self.body_net is not None and self.ee_net is not None:
+      loco = obs[..., : self.loco_obs_dim]
+      reach = obs[..., self.loco_obs_dim :]
+      a_body = torch.tanh(self.body_net(loco))
+      a_ee = torch.tanh(self.ee_net(reach)) * self.ee_delta_scale_m
+      return a_body, a_ee
+    assert self.net is not None
     raw = self.net(obs)
     if self.control_mode != "body_ee_palm_delta":
       return torch.tanh(raw) * self.action_scale_m
@@ -75,7 +105,7 @@ class Stage3Actor(nn.Module):
     return a_body, a_ee
 
   def forward_packed(self, obs: torch.Tensor) -> torch.Tensor:
-    """Return ``(B, out_dim)`` packed action (body || ee_delta meters)."""
+    """Return ``(B, out_dim)`` packed action (body ‖ ee_delta meters)."""
     out = self.forward(obs)
     if isinstance(out, tuple):
       return torch.cat(out, dim=-1)
