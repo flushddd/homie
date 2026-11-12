@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
-"""Phase-3 oracle play: p_sub := p_goal via standard mjlab play + phase-2 loco.
+"""Phase-3 oracle play: phase-2 loco (99/14) + DLS IK, EE residual=0.
 
-No crate. EE residual forced to 0. Frozen loco+DLS tracks the Viser XYZ goal.
-Use a phase-2 (or phase-3) checkpoint — same lower stack as BPTT.
+Sets ``HOMIE_PLAY_ORACLE_SUBGOAL=1`` so the Phase-3 *play* env keeps the
+phase-2 observation/action layout (no ``99→229`` remap). No crate. DLS
+chases the Viser grasp target (``p_sub := p_goal``); Arm chase default ON.
 
 How to judge:
   - If the arm/waist reaches the gizmo with Arm chase ON → lower stack OK;
     Stage-3 actor / rate-limit / WM are the suspects.
-  - If it still cannot reach → check ckpt, obs remap, grasp ranges, Phase-3 interface.
+  - If it still cannot reach → check ckpt, grasp ranges, Phase-3 IK interface.
 
 Example::
-
-  HOMIE_PLAY_ORACLE_SUBGOAL=1 .venv/bin/python -m mjlab.scripts.play \\
-    Mjlab-Homie-Flat-Unitree-G1-Phase3 --num-envs 1 --viewer viser \\
-    --checkpoint-file logs/rsl_rl/homie_g1/phase2/model_18600.pt
-
-Or this wrapper (sets the env var for you)::
 
   .venv/bin/python scripts/play_stage3_oracle_subgoal.py \\
     --checkpoint-file logs/rsl_rl/homie_g1/phase2/model_18600.pt
@@ -33,8 +28,8 @@ if str(_ROOT / "src") not in sys.path:
 
 
 def main() -> int:
+  # Must be set before importing homierl_mjlab (play_env_cfg built at register).
   os.environ["HOMIE_PLAY_ORACLE_SUBGOAL"] = "1"
-  # Ensure Homie tasks are registered before mjlab.play parses the task id.
   import homierl_mjlab  # noqa: F401
 
   argv = list(sys.argv[1:])
@@ -42,7 +37,8 @@ def main() -> int:
     print(
       "usage: play_stage3_oracle_subgoal.py --checkpoint-file <phase2.pt> "
       "[other mjlab.play flags]\n"
-      "Sets HOMIE_PLAY_ORACLE_SUBGOAL=1 → no crate, EE Δp=0, Arm chase default ON.",
+      "Sets HOMIE_PLAY_ORACLE_SUBGOAL=1 → phase2 obs/act 99/14, no crate, "
+      "EE Δp=0, Arm chase default ON.",
       file=sys.stderr,
     )
     return 2
@@ -58,10 +54,11 @@ def main() -> int:
     ]
 
   print(
-    "[oracle-play] p_sub := p_goal (EE residual OFF, no container)\n"
-    "  1) Open Viser URL printed below\n"
+    "[oracle-play] phase2 99/14 (no remap) + DLS; EE residual OFF; no crate\n"
+    "  Expect: Actor in_features from 99-hist, NOT 'Remap 99->229'\n"
+    "  1) Open Viser — robot should stand quietly first\n"
     "  2) Enable waist target + set XYZ gizmo / sliders\n"
-    "  3) Arm chase should already be ON — watch if palm reaches the target\n"
+    "  3) Arm chase default ON — watch if palm reaches the target\n"
     f"  argv: {argv}"
   )
 

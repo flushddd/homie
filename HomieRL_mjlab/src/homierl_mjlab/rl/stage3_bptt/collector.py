@@ -552,13 +552,17 @@ class Stage3SimCollector:
         )
         act = full_teacher.clone()
         act[:, : self.body_dim] = exec_body
-        # Residual EE held at 0 — IK chases injected grasp only.
-        if act.shape[-1] >= 17:
+        # Env policy action is 14-D (IK residual off). Only pad if the env
+        # still exposes a 3-D EE action slot (legacy use_policy_delta=True).
+        env_act = int(self.env.action_manager.total_action_dim)
+        if env_act >= 17 and act.shape[-1] >= 17:
           act[:, 14:17] = 0.0
-        elif act.shape[-1] == 14:
+        elif env_act >= 17 and act.shape[-1] == 14:
           act = torch.cat(
             (act, torch.zeros(n, 3, device=self.device)), dim=-1
           )
+        elif act.shape[-1] > env_act:
+          act = act[:, :env_act]
         smooth_a = packed_a
       else:
         high_a = self._high_level_action_legacy()
@@ -583,10 +587,13 @@ class Stage3SimCollector:
         teacher_body = full_a[..., : self.body_dim].detach()
         ee_raw = meters_to_ee_raw(ee_delta, self.ee_scale)
         act = full_a.clone()
-        if act.shape[-1] >= 17:
+        env_act = int(self.env.action_manager.total_action_dim)
+        if env_act >= 17 and act.shape[-1] >= 17:
           act[:, 14:17] = ee_raw
-        elif act.shape[-1] == 14:
+        elif env_act >= 17 and act.shape[-1] == 14:
           act = torch.cat((act, ee_raw), dim=-1)
+        elif act.shape[-1] > env_act:
+          act = act[:, :env_act]
         packed_a = high_a
         smooth_a = high_a
 

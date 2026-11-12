@@ -380,9 +380,32 @@ def log_waist_pitch(
       act_pitch = float(env.action_manager.action[idx, 13].item())
   except Exception:  # noqa: BLE001
     pass
+  ee_err = ""
+  try:
+    if bool(getattr(env, "_homie_play_arm_chase", False)):
+      from homierl_mjlab.mdp.palm import link_point_pos_w, palm_offset_tensor
+
+      grasp = env.command_manager.get_term("grasp")
+      arm = float(grasp.target_arm[idx, 0].item())
+      bnames = list(asset.body_names)
+      ee_name = (
+        "left_wrist_yaw_link" if arm < 1.5 else "right_wrist_yaw_link"
+      )
+      ee_body = bnames.index(ee_name)
+      off = palm_offset_tensor(env.device, torch.float32, left=(arm < 1.5))
+      ids = torch.tensor([idx], device=env.device, dtype=torch.long)
+      palm = link_point_pos_w(asset, ee_body, off, ids)[0]
+      tgt = grasp.target_pos_w[idx]
+      err = palm - tgt
+      ee_err = (
+        f" ee_err=({err[0].item():+.3f},{err[1].item():+.3f},"
+        f"{err[2].item():+.3f}) |e|={torch.linalg.norm(err).item():.3f}"
+      )
+  except Exception:  # noqa: BLE001
+    pass
   print(
     f"[play] step={step} env={idx} "
     f"waist_pitch={q:.4f} rad ({q * 57.2957795:.2f} deg) "
-    f"act_pitch={act_pitch:.4f}",
+    f"act_pitch={act_pitch:.4f}{ee_err}",
     flush=True,
   )

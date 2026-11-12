@@ -239,17 +239,19 @@ class TwistHeightCommand(UniformVelocityCommand):
         _env._homie_play_arm_random = bool(_arm.value)
 
       for label, max_val in axes:
+        # Oracle / standing play may set range max to 0; Viser needs min≥0.1.
+        gui_max = max(abs(float(max_val)), 0.1)
         max_input = server.gui.add_slider(
           f"Max {label}",
-          initial_value=max_val,
+          initial_value=gui_max,
           step=0.1,
           min=0.1,
           max=10.0,
         )
         slider = server.gui.add_slider(
           label,
-          min=-max_val,
-          max=max_val,
+          min=-gui_max,
+          max=gui_max,
           step=0.05,
           initial_value=0.0,
         )

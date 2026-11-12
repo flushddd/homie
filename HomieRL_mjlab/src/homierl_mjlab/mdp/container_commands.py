@@ -489,10 +489,12 @@ class ContainerGeometryCommand(CommandTerm):
       return
     if CONTAINER_ENTITY_NAME not in self._env.scene.entities:
       return
+    # Default OFF: checkbox forces presence every step when ON; starting True
+    # drops a crate on the grasp and IK/COM fight the walls.
     with server.gui.add_folder(name.capitalize()):
       show = server.gui.add_checkbox(
         "Show container",
-        initial_value=True,
+        initial_value=False,
         hint="ON=closed crate around grasp target. OFF=hide crate (no SDF walls).",
       )
     self._gui_show = show

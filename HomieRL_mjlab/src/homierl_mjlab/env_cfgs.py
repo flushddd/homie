@@ -872,9 +872,37 @@ def homie_g1_flat_env_cfg(
       ee.ik_iterations = 3
       ee.avoid_xy_slow = 0.15
       if oracle_play:
-        # Bypass Stage-3 residual: DLS tracks grasp target only (p_sub = p_goal).
+        # Phase-2 ckpt must see phase-2 obs/act (99/14) — no 99→229 remap.
+        # EE residual off (action_dim=0); DLS still tracks Viser grasp.
         ee.use_policy_delta = False
         ee.avoid_container = False
+        # Baseline = slow play IK, nudged a bit faster.
+        ee.ee_error_clip = (0.032, 0.032, 0.032)
+        ee.max_joint_delta = 0.022
+        ee.max_ik_solution_delta = 0.045
+        ee.joint_target_blend = 0.09
+        ee.ik_iterations = 3
+        ee.ik_damping = 0.08
+        # Idle stand until user enables waist target / twist.
+        twist.rel_standing_envs = 1.0
+        twist.ranges.lin_vel_x = (0.0, 0.0)
+        twist.ranges.lin_vel_y = (0.0, 0.0)
+        twist.ranges.ang_vel_z = (0.0, 0.0)
+        twist.ranges.height = (0.0, 0.0)
+        # Drop Phase-3-only trails; restore phase-2 layout.
+        for group in cfg.observations.values():
+          terms = group.terms
+          terms.pop("sdf_field", None)
+          terms.pop("arm_clearance", None)
+          terms.pop("ee_target_error", None)
+          terms["actions"] = ObservationTermCfg(func=vel_mdp.last_action)
+          terms["container_geom"] = ObservationTermCfg(
+            func=homie_mdp.container_geometry_command,
+            params={"command_name": "container"},
+          )
+          if "base_lin_vel" in terms:
+            lin = terms.pop("base_lin_vel")
+            terms["base_lin_vel"] = lin
     # Print waist pitch (env 0) ~2 Hz at control rate 50 Hz.
     cfg.events["log_waist_pitch"] = EventTermCfg(
       func=homie_mdp.log_waist_pitch,

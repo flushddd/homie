@@ -165,8 +165,18 @@ class GraspTargetCommand(CommandTerm):
     self._gui_syncing_sliders: bool = False
     # Play: ramp body-frame target toward slider/gizmo (avoid Enable snap).
     self._gui_was_active: bool = False
-    # Lower = slower target easing (better for demo recording).
-    self._gui_smooth_alpha: float = 0.06
+    # Linear EMA (no quintic — retarget re-anchor caused a mid-reach Z dip).
+    import os as _os
+
+    _oracle = str(_os.environ.get("HOMIE_PLAY_ORACLE_SUBGOAL", "")).strip() in (
+      "1",
+      "true",
+      "True",
+      "yes",
+      "YES",
+    )
+    # Slow play = 0.06; oracle slightly faster.
+    self._gui_smooth_alpha: float = 0.10 if _oracle else 0.06
     self._gui_arm_chase: Any | None = None
     self._waist_pitch_joint_id: int | None = None
     try:
@@ -655,17 +665,18 @@ class GraspTargetCommand(CommandTerm):
       y_des0 = float(self._gui_sliders[1].value)
       self.target_arm[idx] = 1.0 if y_des0 > 0.0 else 2.0
       self._seed_gui_target_from_ee(idx)
+      # Critical: sync sliders to the seeded palm. Otherwise x_des stays at
+      # GUI defaults (e.g. x=0.40 forward) and every step smooths away from
+      # the hand → IK/waist yank the robot forward on Enable.
+      self._set_sliders_from_body(
+        float(self.target_position[idx, 0].item()),
+        float(self.target_position[idx, 1].item()),
+        float(self.target_position[idx, 2].item()),
+      )
 
-    if self._gui_xform_dragging:
-      # Gizmo already wrote desired via _apply_world_drag; still ease body cmd.
-      x_des = float(self._gui_sliders[0].value)
-      y_des = float(self._gui_sliders[1].value)
-      z_des = float(self._gui_sliders[2].value)
-    else:
-      x_des = float(self._gui_sliders[0].value)
-      y_des = float(self._gui_sliders[1].value)
-      z_des = float(self._gui_sliders[2].value)
-
+    x_des = float(self._gui_sliders[0].value)
+    y_des = float(self._gui_sliders[1].value)
+    z_des = float(self._gui_sliders[2].value)
     a = float(self._gui_smooth_alpha)
     x = (1.0 - a) * float(self.target_position[idx, 0].item()) + a * x_des
     y = (1.0 - a) * float(self.target_position[idx, 1].item()) + a * y_des
@@ -798,7 +809,7 @@ class GraspTargetCommand(CommandTerm):
         initial_value=bool(_oracle),
         hint=(
           "OFF=hold arms (pose target freely). ON=slow IK toward target — for demo recording."
-          + (" [oracle: default ON, residual=0]" if _oracle else "")
+          + (" [oracle: default ON; phase2 obs 99/14 + DLS]" if _oracle else "")
         ),
       )
       self._env._homie_play_arm_chase = bool(_oracle)

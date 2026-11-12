@@ -177,7 +177,8 @@ class EeResidualIkAction(ActionTerm):
 
   @property
   def action_dim(self) -> int:
-    return 3
+    # When residual is bypassed (oracle), keep policy action at loco width.
+    return 3 if self._use_policy_delta else 0
 
   @property
   def raw_action(self) -> torch.Tensor:
@@ -189,11 +190,12 @@ class EeResidualIkAction(ActionTerm):
     return self._delta
 
   def process_actions(self, actions: torch.Tensor) -> None:
-    self._raw[:] = actions
-    if not self._use_policy_delta:
-      # Play / debug: untrained residual only injects high-freq jitter.
+    if not self._use_policy_delta or actions.shape[-1] == 0:
+      # DLS still chases (target-ee) in apply_actions; delta stays 0.
+      self._raw.zero_()
       self._delta.zero_()
       return
+    self._raw[:] = actions
     delta = self._scale * torch.tanh(self._raw)
     self._delta = torch.maximum(torch.minimum(delta, self._clip), -self._clip)
 

@@ -95,15 +95,26 @@ def twist_command_xy_yaw(
 def padded_last_action(
   env: ManagerBasedRlEnv,
   target_dim: int = HOMIE_ACTION_OBS_DIM,
+  zero_from: int | None = None,
 ) -> torch.Tensor:
-  """``last_action`` zero-padded to ``target_dim`` (phase-3 uses 17)."""
+  """``last_action`` zero-padded to ``target_dim`` (phase-3 uses 17).
+
+  ``zero_from``: if set, force ``out[:, zero_from:] = 0`` (oracle play zeros
+  the 3 EE residual slots so a remapped phase-2 policy does not see junk).
+  """
   act = env.action_manager.action
   if act.shape[-1] >= target_dim:
-    return act[:, :target_dim]
-  pad = torch.zeros(
-    act.shape[0], target_dim - act.shape[-1], device=act.device, dtype=act.dtype
-  )
-  return torch.cat((act, pad), dim=-1)
+    out = act[:, :target_dim].clone()
+  else:
+    pad = torch.zeros(
+      act.shape[0], target_dim - act.shape[-1], device=act.device, dtype=act.dtype
+    )
+    out = torch.cat((act, pad), dim=-1)
+  if zero_from is not None:
+    z = int(zero_from)
+    if 0 <= z < out.shape[-1]:
+      out[:, z:] = 0.0
+  return out
 
 
 def zeros_vector(env: ManagerBasedRlEnv, dim: int) -> torch.Tensor:
