@@ -999,32 +999,47 @@ class HomieOnPolicyRunner:
         self._hist: torch.Tensor | None = None
         self._refill: torch.Tensor | None = None
 
+      @staticmethod
+      def _normal(t: torch.Tensor) -> torch.Tensor:
+        """Clone out of InferenceMode so later inplace updates are allowed."""
+        with torch.inference_mode(False):
+          return t.detach().clone()
+
       def reset(self, env_ids=None):
         """Clear hist, or mark ``env_ids`` to warm-fill on the next call."""
         if env_ids is None or self._hist is None:
           self._hist = None
           self._refill = None
           return
-        if self._refill is None or self._refill.shape[0] != self._hist.shape[0]:
-          self._refill = torch.zeros(
-            self._hist.shape[0], dtype=torch.bool, device=self._hist.device
-          )
-        self._refill[env_ids] = True
+        n = int(self._hist.shape[0])
+        device = self._hist.device
+        # ``_refill`` may have been allocated under torch.inference_mode() when
+        # the collector calls policy(obs); inplace outside that context fails.
+        with torch.inference_mode(False):
+          if self._refill is None or self._refill.shape[0] != n:
+            self._refill = torch.zeros(n, dtype=torch.bool, device=device)
+          elif bool(getattr(self._refill, "is_inference", lambda: False)()):
+            self._refill = self._refill.clone()
+          self._refill[env_ids] = True
 
       def __call__(self, obs) -> torch.Tensor:
-        step = _actor_step(obs)
+        step = self._normal(_actor_step(obs))
         n = int(step.shape[0])
-        if self._hist is None or self._hist.shape[0] != n:
-          # Warm-start history with the current frame (same as adapter.reset).
-          self._hist = step.repeat(1, hist_len)
-          self._refill = torch.zeros(n, dtype=torch.bool, device=step.device)
-        else:
-          new_hist = torch.cat([self._hist[:, one_step:], step], dim=-1)
-          if self._refill is not None and bool(self._refill.any()):
-            ids = self._refill.nonzero(as_tuple=False).flatten()
-            new_hist[ids] = step[ids].repeat(1, hist_len)
-            self._refill[ids] = False
-          self._hist = new_hist
+        # Keep hist/refill as normal tensors even if caller is in InferenceMode.
+        with torch.inference_mode(False):
+          if self._hist is None or self._hist.shape[0] != n:
+            # Warm-start history with the current frame (same as adapter.reset).
+            self._hist = step.repeat(1, hist_len)
+            self._refill = torch.zeros(n, dtype=torch.bool, device=step.device)
+          else:
+            new_hist = torch.cat([self._hist[:, one_step:], step], dim=-1)
+            if self._refill is not None and bool(self._refill.any()):
+              if bool(getattr(self._refill, "is_inference", lambda: False)()):
+                self._refill = self._refill.clone()
+              ids = self._refill.nonzero(as_tuple=False).flatten()
+              new_hist[ids] = step[ids].repeat(1, hist_len)
+              self._refill[ids] = False
+            self._hist = new_hist
         with torch.inference_mode():
           return actor_critic.act_inference(self._hist)
 

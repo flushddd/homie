@@ -416,19 +416,22 @@ class Stage3SimCollector:
   def _advance_loco_hist(self, step: torch.Tensor) -> torch.Tensor:
     """Append one-step loco; envs in ``_loco_need_fill`` warm-start like HIM."""
     assert self._loco_hist is not None and self._loco_need_fill is not None
-    one = self.loco_one_step_dim
-    h = self.loco_history_length
-    if h <= 1:
-      self._loco_hist[:] = step
-      self._loco_need_fill.zero_()
+    # Detach so env InferenceMode tensors do not poison the rolling buffer.
+    with torch.inference_mode(False):
+      step = step.detach()
+      one = self.loco_one_step_dim
+      h = self.loco_history_length
+      if h <= 1:
+        self._loco_hist[:] = step
+        self._loco_need_fill.zero_()
+        return self._loco_hist
+      new_hist = torch.cat([self._loco_hist[:, one:], step], dim=-1)
+      if bool(self._loco_need_fill.any()):
+        ids = self._loco_need_fill.nonzero(as_tuple=False).flatten()
+        new_hist[ids] = step[ids].repeat(1, h)
+        self._loco_need_fill[ids] = False
+      self._loco_hist[:] = new_hist
       return self._loco_hist
-    new_hist = torch.cat([self._loco_hist[:, one:], step], dim=-1)
-    if bool(self._loco_need_fill.any()):
-      ids = self._loco_need_fill.nonzero(as_tuple=False).flatten()
-      new_hist[ids] = step[ids].repeat(1, h)
-      self._loco_need_fill[ids] = False
-    self._loco_hist[:] = new_hist
-    return self._loco_hist
 
   def _build_actor_obs(self, *, loco_hist: torch.Tensor | None = None) -> torch.Tensor:
     sdf, clr = self._sdf_clr()
