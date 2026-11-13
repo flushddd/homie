@@ -197,7 +197,9 @@ class Stage3BpttTrainer:
     return {key: float(loss.detach().item()), f"{key}_grad_norm": gn}
 
   def _tilt_from_state(self, state: torch.Tensor) -> torch.Tensor:
-    quat = state[..., -16:-12]
+    from homierl_mjlab.rl.stage3_bptt.env_bridge import root_quat_wxyz_from_state
+
+    quat = root_quat_wxyz_from_state(state)
     return tilt_angle_from_root_quat(quat)
 
   def _unpack_windows(self, windows: tuple) -> tuple:
@@ -411,15 +413,59 @@ class Stage3BpttTrainer:
     loss = -j.mean()
 
     # Teacher BC on real logged targets at window start (body head only).
+    w_t = float(cfg.w_teacher) if self.body_ee else 0.0
     if (
       self.body_ee
       and teacher_body is not None
       and a0_body is not None
-      and float(cfg.w_teacher) > 0.0
+      and w_t > 0.0
     ):
       tgt = teacher_body[:, 0].detach()
       teacher_mse = F.mse_loss(a0_body, tgt)
-      loss = loss + float(cfg.w_teacher) * teacher_mse
+      loss = loss + w_t * teacher_mse
+
+    # Diagnostic: body_net grad norms for MSE vs BPTT (same batch, before step).
+    body_grad_mse = float("nan")
+    body_grad_bptt = float("nan")
+    body_grad_cos = float("nan")
+    if (
+      self.body_ee
+      and a0_body is not None
+      and getattr(self.actor, "body_net", None) is not None
+    ):
+      try:
+        body_params = [p for n, p in self.actor.named_parameters() if "body_net" in n]
+        loss_bptt_only = -j.mean()
+
+        def _body_flat(loss_t: torch.Tensor) -> torch.Tensor:
+          grads = torch.autograd.grad(
+            loss_t,
+            body_params,
+            retain_graph=True,
+            allow_unused=True,
+          )
+          chunks = [
+            (g if g is not None else torch.zeros_like(p)).reshape(-1)
+            for g, p in zip(grads, body_params)
+          ]
+          return torch.cat(chunks)
+
+        g_bptt = _body_flat(loss_bptt_only)
+        g_mse = (
+          _body_flat(teacher_mse)
+          if teacher_mse is not None
+          else torch.zeros_like(g_bptt)
+        )
+        body_grad_bptt = float(g_bptt.norm().item())
+        body_grad_mse = float(g_mse.norm().item())
+        if float(g_bptt.norm()) > 1e-12 and float(g_mse.norm()) > 1e-12:
+          body_grad_cos = float(
+            F.cosine_similarity(g_mse.unsqueeze(0), g_bptt.unsqueeze(0)).item()
+          )
+        else:
+          body_grad_cos = 0.0
+      except Exception:  # noqa: BLE001
+        pass
 
     out = self._step_or_skip(
       loss=loss, opt=self.opt_actor, module=self.actor, key="actor_loss"
@@ -432,7 +478,13 @@ class Stage3BpttTrainer:
       "imag_reward_clip_frac": float(clip_hits) / max(clip_total, 1),
       "imag_present_frac": float(present.mean().item()),
       "imag_use_palm_step": 1.0 if use_palm else 0.0,
-      "w_teacher": float(cfg.w_teacher) if self.body_ee else 0.0,
+      "w_teacher": w_t,
+      "grad_body_mse": body_grad_mse,
+      "grad_body_bptt": body_grad_bptt,
+      "grad_body_mse_x_w": (
+        w_t * body_grad_mse if body_grad_mse == body_grad_mse else float("nan")
+      ),
+      "grad_body_cos_mse_bptt": body_grad_cos,
     }
     if teacher_mse is not None and _finite(teacher_mse):
       mapped["teacher_mse"] = float(teacher_mse.detach().item())

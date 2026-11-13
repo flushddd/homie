@@ -38,6 +38,7 @@ def pack_root_state(robot) -> torch.Tensor:
 
 
 def pack_robot_state(env: ManagerBasedRlEnv, *, arm_left: bool) -> torch.Tensor:
+  """``q | qd | root_pos3 | quat_wxyz4 | lin_b3 | ang_b3 | palm_b3``."""
   robot = env.scene["robot"]
   q = robot.data.joint_pos
   qd = robot.data.joint_vel
@@ -50,6 +51,71 @@ def pack_robot_state(env: ManagerBasedRlEnv, *, arm_left: bool) -> torch.Tensor:
   palm_w = link_point_pos_w(robot, ee_body, off, env_ids)
   palm_b = world_to_base(robot, palm_w, env_ids)
   return torch.cat((q, qd, root, palm_b), dim=-1)
+
+
+def root_quat_wxyz_from_state(state: torch.Tensor) -> torch.Tensor:
+  """Packed-state root quaternion ``(w,x,y,z)``.
+
+  Layout ends with ``palm_b(3)``; quat sits at ``[..., -13:-9]`` (not ``-16:-12``,
+  which wrongly mixes root_pos with quat.w).
+  """
+  return state[..., -13:-9]
+
+
+def projected_gravity_from_quat_wxyz(quat_wxyz: torch.Tensor) -> torch.Tensor:
+  """Body-frame gravity direction from root quat (matches mjlab projected_gravity)."""
+  w, x, y, z = quat_wxyz.unbind(-1)
+  # Rotate world -Z into body: R^T @ [0,0,-1].
+  gx = 2.0 * (x * z - w * y)
+  gy = 2.0 * (y * z + w * x)
+  gz = 1.0 - 2.0 * (x * x + y * y)
+  # Above is +Z body in world z-row; gravity is -world_Z in body:
+  return torch.stack((-gx, -gy, -gz), dim=-1)
+
+
+def splice_loco_proprio_from_state(
+  loco: torch.Tensor,
+  state: torch.Tensor,
+  *,
+  n_joints: int,
+  default_q: torch.Tensor,
+  ang_vel_scale: float = 0.5,
+  joint_vel_scale: float = 0.05,
+  n_obs_joints: int = 29,
+) -> torch.Tensor:
+  """Refresh HIM one-step proprio slots from predicted packed state.
+
+  Keeps commands / last_action / grasp / sdf / clearance from ``loco`` (not
+  reconstructed). Phase-2/3 actor prefix::
+
+    twist3 | height1 | ang_vel3 | gravity3 | joint_pos29 | joint_vel29 | ...
+
+  This is **partial** closed-loop imag support — not a full HIM obs rebuild.
+  """
+  if loco.shape[-1] < 68:
+    return loco
+  q = state[..., :n_joints]
+  qd = state[..., n_joints : 2 * n_joints]
+  ang = state[..., -6:-3]
+  quat = root_quat_wxyz_from_state(state)
+  grav = projected_gravity_from_quat_wxyz(quat)
+  def_q = default_q.to(device=q.device, dtype=q.dtype)
+  if def_q.dim() == 1:
+    def_q = def_q.unsqueeze(0)
+  n_jp = min(int(n_obs_joints), int(n_joints), 29)
+  jp = q[..., :n_jp] - def_q[..., :n_jp]
+  jv = qd[..., :n_jp] * float(joint_vel_scale)
+  if n_jp < 29:
+    pad_p = torch.zeros(*jp.shape[:-1], 29 - n_jp, device=jp.device, dtype=jp.dtype)
+    pad_v = torch.zeros_like(pad_p)
+    jp = torch.cat((jp, pad_p), dim=-1)
+    jv = torch.cat((jv, pad_v), dim=-1)
+  out = loco.clone()
+  out[..., 4:7] = ang * float(ang_vel_scale)
+  out[..., 7:10] = grav
+  out[..., 10:39] = jp
+  out[..., 39:68] = jv
+  return out
 
 
 def palm_pos_base(env: ManagerBasedRlEnv, *, arm_left: bool) -> torch.Tensor:

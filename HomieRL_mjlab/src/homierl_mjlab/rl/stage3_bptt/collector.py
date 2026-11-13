@@ -557,6 +557,7 @@ class Stage3SimCollector:
       packed_a = torch.zeros(n, self.actor_out_dim, device=self.device)
 
       if self.body_ee:
+        # EE (and provisional body) from pre-inject obs; p_sub uses a_ee only.
         a_body, a_ee = self._actor_body_ee()
         if not self.arm_unlocked:
           # Body-only phase: hold grasp on current palm (no EE chase).
@@ -574,8 +575,11 @@ class Stage3SimCollector:
             rate_m=self.cfg.subgoal_rate_limit_m,
           )
         inject_subgoal_into_grasp(self.env, p_sub)
-        # Teacher sees post-inject grasp so body tracks p_sub-conditioned loco.
+        # Teacher + student body share post-inject HIM loco (same grasp/cmd).
         obs_td = self.vec.get_observations()
+        loco_post = flat_him_actor_obs(obs_td)
+        if self.loco_obs_dim > 0:
+          self._last_loco_obs = loco_post.detach()
         with torch.inference_mode():
           full_teacher = self.policy(obs_td)
         # Same space as phase-1/2: raw HIM mean, ±clip_actions (default 100).
@@ -587,6 +591,10 @@ class Stage3SimCollector:
         teacher_body = full_teacher[..., : self.body_dim].detach()
         if self.ee_mode != "actor" or self.actor is None:
           a_body = teacher_body.clone()
+        elif self.actor is not None and getattr(self.actor, "body_net", None) is not None:
+          # Re-read body head on post-inject loco so BC labels match teacher.
+          with torch.no_grad():
+            a_body = self.actor._clip_body(self.actor.body_net(loco_post))
         packed_a = torch.cat((a_body, a_ee), dim=-1)
         # Sim exec: never apply raw a_body. Normalized teacher (+ trust-region)
         # keeps feet on the ground; packed_a still stores actor for BC / critic.
@@ -669,7 +677,9 @@ class Stage3SimCollector:
         present = torch.zeros(n, device=self.device)
       stab = None
       if float(self.cfg.w_stability) != 0.0:
-        quat = state[..., -16:-12]
+        from homierl_mjlab.rl.stage3_bptt.env_bridge import root_quat_wxyz_from_state
+
+        quat = root_quat_wxyz_from_state(state)
         tilt = tilt_angle_from_root_quat(quat)
         stab = soft_stability_reward(
           tilt,
@@ -912,9 +922,15 @@ class Stage3SimCollector:
     sdf_k = int(self.cfg.sdf_query_count)
     actor_out = self.actor_out_dim
     loco_dim = int(self.loco_obs_dim)
+    from homierl_mjlab.rl.stage3_bptt.env_bridge import splice_loco_proprio_from_state
 
     def obs_fn(state, goal, geom, last_a, loco_obs=None):
-      """Build Stage3 actor obs. Optional ``loco_obs`` freezes HIM proprio in imag."""
+      """Build Stage3 actor obs.
+
+      When ``loco_obs`` is passed (imag), keep commands/grasp/sdf from that
+      freeze frame but **splice** ang_vel / gravity / joint_pos / joint_vel from
+      predicted ``state`` so body_net is not stuck on identical a_body for all H.
+      """
       palm = state[..., -3:]
       b = state.shape[0]
       if geom is not None and geom.shape[-1] >= 10:
@@ -955,6 +971,12 @@ class Stage3SimCollector:
             raise RuntimeError(
               f"obs_fn loco dim {loco.shape[-1]} != {loco_dim}"
             )
+          loco = splice_loco_proprio_from_state(
+            loco,
+            state,
+            n_joints=n_j,
+            default_q=default_q,
+          )
         return torch.cat((loco, reach), dim=-1)
       if hierarchical:
         return torch.cat(
