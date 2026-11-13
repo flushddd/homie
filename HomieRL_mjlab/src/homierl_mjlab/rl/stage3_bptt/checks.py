@@ -90,6 +90,74 @@ def check_body_ee_actor_grads() -> dict[str, float]:
   }
 
 
+def check_loco_hist6_dual_head() -> dict[str, float]:
+  """body_net takes flat 6×one_step; ee_net takes reach; grads both flow."""
+  one, hist = 16, 6
+  loco_dim = one * hist
+  reach_dim = 3 + 3 + 3 + 3 + 17 + 4 + 6
+  obs_dim = loco_dim + reach_dim
+  actor = Stage3Actor(
+    obs_dim,
+    (32, 32),
+    body_dim=14,
+    ee_dim=3,
+    ee_delta_scale_m=0.0,  # no hard-clip so EE grads are not killed
+    control_mode="body_ee_palm_delta",
+    loco_obs_dim=loco_dim,
+    near_zero_body_init=False,
+  )
+  assert actor.body_net is not None and actor.ee_net is not None
+  torch.manual_seed(0)
+  obs = torch.randn(4, obs_dim)
+  a_body, a_ee = actor(obs)
+  teacher = torch.randn_like(a_body)
+  ee_tgt = torch.randn_like(a_ee)
+  loss = (a_body - teacher).pow(2).mean() + (a_ee - ee_tgt).pow(2).mean()
+  loss.backward()
+  assert isinstance(actor.body_net[-1], torch.nn.Linear)
+  assert isinstance(actor.ee_net[-1], torch.nn.Linear)
+  body_g = float(actor.body_net[-1].weight.grad.abs().sum().item())  # type: ignore[union-attr]
+  ee_g = float(actor.ee_net[-1].weight.grad.abs().sum().item())  # type: ignore[union-attr]
+  first = actor.body_net[0]
+  assert isinstance(first, torch.nn.Linear)
+  return {
+    "loco_obs_dim": float(loco_dim),
+    "body_grad_sum": body_g,
+    "ee_grad_sum": ee_g,
+    "a_body_norm": float(a_body.detach().norm(dim=-1).mean().item()),
+    "in_features_body": float(first.in_features),
+  }
+
+
+def check_splice_last_hist_frame() -> dict[str, float]:
+  """Only the last one-step frame is refreshed from predicted state."""
+  from homierl_mjlab.rl.stage3_bptt.env_bridge import splice_loco_proprio_from_state
+
+  one, hist = 80, 6
+  loco_dim = one * hist
+  loco = torch.randn(2, loco_dim)
+  prefix = loco[..., :-one].clone()
+  state = torch.randn(2, 40 + 13)  # n_joints=20 + extras with quat/ang/palm
+  # Pack-like: q(20)|qd(20)|…|quat at -13:-9 style not required; splice uses
+  # ang=-6:-3, quat via helper — use n_joints=20.
+  n_j = 20
+  default_q = torch.zeros(n_j)
+  out = splice_loco_proprio_from_state(
+    loco,
+    state,
+    n_joints=n_j,
+    default_q=default_q,
+    loco_one_step_dim=one,
+  )
+  prefix_ok = float((out[..., :-one] - prefix).abs().max().item())
+  last_changed = float((out[..., -one:] - loco[..., -one:]).abs().max().item())
+  return {
+    "prefix_max_delta": prefix_ok,
+    "last_max_delta": last_changed,
+    "loco_dim": float(loco_dim),
+  }
+
+
 def check_refuse_old_semantics() -> dict[str, float]:
   """Trainer refuses silent load of old 3-D hier ckpts into body_ee."""
   cfg = Stage3BpttCfg(
@@ -373,6 +441,15 @@ def run_all_checks() -> dict[str, object]:
   refuse = check_refuse_old_semantics()
   out["refuse_old_semantics"] = refuse
   assert refuse["refused_legacy"] >= 1.0
+  hist6 = check_loco_hist6_dual_head()
+  out["loco_hist6_dual_head"] = hist6
+  assert hist6["body_grad_sum"] > 0.0
+  assert hist6["ee_grad_sum"] > 0.0
+  assert hist6["in_features_body"] == hist6["loco_obs_dim"]
+  splice = check_splice_last_hist_frame()
+  out["splice_last_hist_frame"] = splice
+  assert splice["prefix_max_delta"] < 1e-6
+  assert splice["last_max_delta"] > 1e-6
   out["bptt_graph"] = check_bptt_actor_graph()
   gate = check_present_reward_gate()
   out["present_gate"] = gate

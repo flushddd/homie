@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # Checkpoint / replay gate — refuse silent load of old actors / obs layouts.
-# v3: loco obs + raw a_body (no tanh; same joint space as phase-1/2 HIM).
-ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v3_raw_body"
+# v4: raw a_body + HIM-aligned 6-frame loco history for body_net (same as teacher).
+ACTION_SEMANTICS_BODY_EE = "body14_ee3_palm_delta_v4_loco_hist6"
 ACTION_SEMANTICS_HIER = "hier_ee0_offset_v0"
 ACTION_SEMANTICS_RESIDUAL = "ee_residual_v0"
 
@@ -23,6 +23,9 @@ class Stage3BpttCfg:
   action_semantics: str = ACTION_SEMANTICS_BODY_EE
   # Concat Phase-3 env actor (HIM) obs in front of reach features for body head.
   include_loco_obs: bool = True
+  # Match Homie / HIM ``actor_history_length``: body_net sees stacked one-step
+  # loco frames (same entry as teacher ``act_inference``), not a single frame.
+  loco_history_length: int = 6
   arm_side: str = "right"  # "left" | "right"
   body_dim: int = 14
   ee_dim: int = 3

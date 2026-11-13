@@ -545,6 +545,8 @@ def run_real(args: argparse.Namespace) -> int:
     f"[stage3_bptt] ee_mode={collector.ee_mode} "
     f"actor_out_dim={trainer.actor_out_dim} obs_dim={collector.obs_dim} "
     f"loco_obs_dim={collector.loco_obs_dim} "
+    f"(one_step={collector.loco_one_step_dim}×"
+    f"hist={collector.loco_history_length}) "
     f"arm_unlocked={collector.arm_unlocked}"
   )
 

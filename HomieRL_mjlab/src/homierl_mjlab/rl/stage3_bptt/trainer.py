@@ -556,6 +556,15 @@ class Stage3BpttTrainer:
       "actor_out_dim": self.actor_out_dim,
       "obs_dim": self.obs_dim,
       "loco_obs_dim": self.loco_obs_dim,
+      "loco_history_length": int(
+        getattr(self.cfg, "loco_history_length", 6)
+      ),
+      "loco_one_step_dim": int(
+        self.loco_obs_dim
+        // max(1, int(getattr(self.cfg, "loco_history_length", 6)))
+        if self.loco_obs_dim > 0
+        else 0
+      ),
       "arm_unlocked": bool(self.arm_unlocked),
     }
 
@@ -574,7 +583,7 @@ class Stage3BpttTrainer:
         raise RuntimeError(
           "Refusing to load Stage3 checkpoint without action_semantics "
           f"(current={self.action_semantics!r}). Old 3-D hierarchical actors "
-          "are incompatible with body14_ee3_palm_delta_v3_raw_body — train fresh."
+          "are incompatible with body14_ee3_palm_delta_v4_loco_hist6 — train fresh."
         )
     elif ckpt_sem is not None and ckpt_sem != self.action_semantics:
       raise RuntimeError(

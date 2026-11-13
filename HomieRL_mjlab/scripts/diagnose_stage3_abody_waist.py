@@ -119,6 +119,7 @@ def main() -> int:
     teacher_action_clip=float(saved.get("teacher_action_clip", 100.0)),
     body_action_clip=float(saved.get("body_action_clip", 100.0)),
     include_loco_obs=bool(saved.get("include_loco_obs", True)),
+    loco_history_length=int(saved.get("loco_history_length", 6)),
     control_mode=str(payload.get("control_mode") or "body_ee_palm_delta"),
     imagine_horizon=int(saved.get("imagine_horizon", 8)),
     sdf_query_count=int(saved.get("sdf_query_count", 64)),
@@ -167,6 +168,8 @@ def main() -> int:
         "joint_pos.target_names": names,
         "waist_pitch_action_index": waist_idx,
         "loco_obs_dim_runtime": collector.loco_obs_dim,
+        "loco_one_step_dim": collector.loco_one_step_dim,
+        "loco_history_length": collector.loco_history_length,
         "obs_dim_runtime": collector.obs_dim,
         "env_action_dim": int(collector.env.action_manager.total_action_dim),
       },
@@ -177,7 +180,7 @@ def main() -> int:
   # --- pre vs post inject loco obs / teacher ---
   collector._force_reach_flags()
   collector.palm_state.ensure_all(collector.env, arm_left=collector.arm_left)
-  loco_pre = collector._current_loco_obs()
+  loco_pre = collector._current_loco_step()
   assert loco_pre is not None
   a_body_pre, a_ee = collector._actor_body_ee()
   p_sub = collector.palm_state.apply_palm_delta_base(
@@ -190,8 +193,13 @@ def main() -> int:
   p_sub2 = p_sub.clone()
   p_sub2[:, 0] = p_sub2[:, 0] + 0.05
   inject_subgoal_into_grasp(collector.env, p_sub2)
-  loco_post = collector._current_loco_obs()
+  loco_post = collector._current_loco_step()
   assert loco_post is not None
+  # Advance student hist on post-inject (same path as collect) before teacher.
+  if collector._loco_hist is not None:
+    loco_hist_post = collector._advance_loco_hist(loco_post)
+  else:
+    loco_hist_post = None
   obs_td = collector.vec.get_observations()
   with torch.inference_mode():
     full_t = collector.policy(obs_td)
@@ -201,7 +209,7 @@ def main() -> int:
     clip=float(cfg.teacher_action_clip),
   )
   teacher_post = full_t[..., : collector.body_dim]
-  # Teacher on pre-inject: restore palm inject then query.
+  # Teacher on pre-inject: restore palm inject then query (advances teacher hist).
   inject_subgoal_into_grasp(collector.env, p_sub)
   with torch.inference_mode():
     full_pre = collector.policy(collector.vec.get_observations())
@@ -209,6 +217,18 @@ def main() -> int:
     full_pre, mode=str(cfg.teacher_action_norm), clip=float(cfg.teacher_action_clip)
   )
   teacher_pre = full_pre[..., : collector.body_dim]
+  # Student body on stacked post-inject hist (BC path).
+  if (
+    loco_hist_post is not None
+    and collector.actor is not None
+    and getattr(collector.actor, "body_net", None) is not None
+  ):
+    with torch.no_grad():
+      a_body_hist = collector.actor._clip_body(
+        collector.actor.body_net(loco_hist_post)
+      )
+  else:
+    a_body_hist = a_body_pre
 
   grasp = collector.env.command_manager.get_term("grasp")
   twist = collector.env.command_manager.get_term("twist")
@@ -233,6 +253,12 @@ def main() -> int:
         "align.student_waist_on_pre_loco": float(a_body_pre[0, waist_idx].item())
         if waist_idx >= 0
         else None,
+        "align.student_waist_on_hist6": float(a_body_hist[0, waist_idx].item())
+        if waist_idx >= 0
+        else None,
+        "align.loco_hist_dim": int(loco_hist_post.shape[-1])
+        if loco_hist_post is not None
+        else 0,
         "flags.is_target": float(grasp.is_target[0].item()),
         "flags.is_waist": float(grasp.is_waist[0].item()),
         "flags.height_cmd": float(twist.command[0, 3].item())

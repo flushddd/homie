@@ -672,7 +672,7 @@ def main() -> int:
       print(
         "error: refusing to load Stage3 ckpt without action_semantics into "
         f"{ACTION_SEMANTICS_BODY_EE}. Old layouts are incompatible — "
-        "retrain with loco-obs + raw a_body (v3).",
+        "retrain with 6-frame loco hist + raw a_body (v4).",
         file=sys.stderr,
       )
       return 2
@@ -680,7 +680,7 @@ def main() -> int:
       print(
         f"error: action_semantics mismatch ckpt={ckpt_sem!r} "
         f"expected={ACTION_SEMANTICS_BODY_EE!r}\n"
-        "  Prior tanh / reach-only actors need a fresh Stage3 train.",
+        "  Prior tanh / 1-frame loco (v3) actors need a fresh Stage3 train.",
         file=sys.stderr,
       )
       return 2
@@ -712,6 +712,8 @@ def main() -> int:
     teacher_action_norm=str(saved_cfg.get("teacher_action_norm", "none")),
     teacher_action_clip=float(saved_cfg.get("teacher_action_clip", 100.0)),
     body_action_clip=float(saved_cfg.get("body_action_clip", 100.0)),
+    include_loco_obs=bool(saved_cfg.get("include_loco_obs", True)),
+    loco_history_length=int(saved_cfg.get("loco_history_length", 6)),
   )
   cfg.action_semantics = cfg.resolve_action_semantics()
   if "actor_hidden" in saved_cfg:
@@ -793,7 +795,9 @@ def main() -> int:
     collector.actor = actor
     print(
       f"[bptt-play] loaded Stage3 actor out_dim={getattr(actor, 'out_dim', '?')} "
-      f"obs_dim={collector.obs_dim}"
+      f"obs_dim={collector.obs_dim} loco={loco_dim} "
+      f"(one_step={collector.loco_one_step_dim}×"
+      f"hist={collector.loco_history_length})"
     )
   else:
     collector.actor = None

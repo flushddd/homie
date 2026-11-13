@@ -73,8 +73,8 @@ def projected_gravity_from_quat_wxyz(quat_wxyz: torch.Tensor) -> torch.Tensor:
   return torch.stack((-gx, -gy, -gz), dim=-1)
 
 
-def splice_loco_proprio_from_state(
-  loco: torch.Tensor,
+def splice_loco_one_step_proprio(
+  loco_step: torch.Tensor,
   state: torch.Tensor,
   *,
   n_joints: int,
@@ -83,17 +83,9 @@ def splice_loco_proprio_from_state(
   joint_vel_scale: float = 0.05,
   n_obs_joints: int = 29,
 ) -> torch.Tensor:
-  """Refresh HIM one-step proprio slots from predicted packed state.
-
-  Keeps commands / last_action / grasp / sdf / clearance from ``loco`` (not
-  reconstructed). Phase-2/3 actor prefix::
-
-    twist3 | height1 | ang_vel3 | gravity3 | joint_pos29 | joint_vel29 | ...
-
-  This is **partial** closed-loop imag support — not a full HIM obs rebuild.
-  """
-  if loco.shape[-1] < 68:
-    return loco
+  """Refresh one-step HIM proprio slots from predicted packed state."""
+  if loco_step.shape[-1] < 68:
+    return loco_step
   q = state[..., :n_joints]
   qd = state[..., n_joints : 2 * n_joints]
   ang = state[..., -6:-3]
@@ -110,12 +102,52 @@ def splice_loco_proprio_from_state(
     pad_v = torch.zeros_like(pad_p)
     jp = torch.cat((jp, pad_p), dim=-1)
     jv = torch.cat((jv, pad_v), dim=-1)
-  out = loco.clone()
+  out = loco_step.clone()
   out[..., 4:7] = ang * float(ang_vel_scale)
   out[..., 7:10] = grav
   out[..., 10:39] = jp
   out[..., 39:68] = jv
   return out
+
+
+def splice_loco_proprio_from_state(
+  loco: torch.Tensor,
+  state: torch.Tensor,
+  *,
+  n_joints: int,
+  default_q: torch.Tensor,
+  ang_vel_scale: float = 0.5,
+  joint_vel_scale: float = 0.05,
+  n_obs_joints: int = 29,
+  loco_one_step_dim: int = 0,
+) -> torch.Tensor:
+  """Refresh HIM proprio in loco obs; if stacked history, only the **last** frame.
+
+  Keeps commands / last_action / grasp / sdf / clearance (and older hist frames)
+  from ``loco``. Partial closed-loop imag — not a full HIM rebuild.
+  """
+  one = int(loco_one_step_dim)
+  if one > 0 and loco.shape[-1] >= one and loco.shape[-1] % one == 0:
+    prefix = loco[..., :-one]
+    last = splice_loco_one_step_proprio(
+      loco[..., -one:],
+      state,
+      n_joints=n_joints,
+      default_q=default_q,
+      ang_vel_scale=ang_vel_scale,
+      joint_vel_scale=joint_vel_scale,
+      n_obs_joints=n_obs_joints,
+    )
+    return torch.cat((prefix, last), dim=-1)
+  return splice_loco_one_step_proprio(
+    loco,
+    state,
+    n_joints=n_joints,
+    default_q=default_q,
+    ang_vel_scale=ang_vel_scale,
+    joint_vel_scale=joint_vel_scale,
+    n_obs_joints=n_obs_joints,
+  )
 
 
 def palm_pos_base(env: ManagerBasedRlEnv, *, arm_left: bool) -> torch.Tensor:

@@ -281,18 +281,24 @@ class Stage3SimCollector:
       self.body_dim + self.ee_dim if self.body_ee else 3
     )
 
-    # HIM actor obs dim (Phase-3 remapped layout) for body-head distillation.
+    # HIM one-step actor obs; body_net sees stacked history like teacher.
     self.include_loco_obs = bool(
       self.body_ee and getattr(cfg, "include_loco_obs", True)
     )
+    self.loco_history_length = max(
+      1, int(getattr(cfg, "loco_history_length", 6))
+    )
     try:
-      self.loco_obs_dim = int(
+      self.loco_one_step_dim = int(
         flat_him_actor_obs(self.vec.get_observations()).shape[-1]
       )
     except Exception:  # noqa: BLE001
-      self.loco_obs_dim = 0
+      self.loco_one_step_dim = 0
     if not self.include_loco_obs:
-      self.loco_obs_dim = 0
+      self.loco_one_step_dim = 0
+      self.loco_history_length = 1
+    # Flat dim fed to body_net / stored in replay (= teacher act_inference width).
+    self.loco_obs_dim = int(self.loco_one_step_dim * self.loco_history_length)
 
     if self.body_ee:
       self.reach_obs_dim = body_ee_reach_obs_dim(
@@ -318,6 +324,19 @@ class Stage3SimCollector:
       self.env.num_envs, self.actor_out_dim, device=self.device
     )
     self._last_loco_obs: torch.Tensor | None = None
+    self._loco_hist = (
+      torch.zeros(
+        self.env.num_envs, self.loco_obs_dim, device=self.device
+      )
+      if self.loco_obs_dim > 0
+      else None
+    )
+    # Per-env warm-fill (match HomieInferencePolicy / history_adapter reset).
+    self._loco_need_fill = (
+      torch.ones(self.env.num_envs, dtype=torch.bool, device=self.device)
+      if self.loco_obs_dim > 0
+      else None
+    )
     self._env_ep_id = torch.zeros(
       self.env.num_envs, device=self.device, dtype=torch.long
     )
@@ -382,17 +401,36 @@ class Stage3SimCollector:
       clr = torch.ones(self.env.num_envs, 6, device=self.device) * self.cfg.d_max
     return sdf, clr
 
-  def _current_loco_obs(self) -> torch.Tensor | None:
-    if self.loco_obs_dim <= 0:
+  def _current_loco_step(self) -> torch.Tensor | None:
+    """One-step HIM actor obs (env frame), not history."""
+    if self.loco_one_step_dim <= 0:
       return None
     loco = flat_him_actor_obs(self.vec.get_observations())
-    if loco.shape[-1] != self.loco_obs_dim:
+    if loco.shape[-1] != self.loco_one_step_dim:
       raise RuntimeError(
-        f"loco_obs dim changed: got {loco.shape[-1]} expected {self.loco_obs_dim}"
+        f"loco one-step dim changed: got {loco.shape[-1]} "
+        f"expected {self.loco_one_step_dim}"
       )
     return loco
 
-  def _build_actor_obs(self) -> torch.Tensor:
+  def _advance_loco_hist(self, step: torch.Tensor) -> torch.Tensor:
+    """Append one-step loco; envs in ``_loco_need_fill`` warm-start like HIM."""
+    assert self._loco_hist is not None and self._loco_need_fill is not None
+    one = self.loco_one_step_dim
+    h = self.loco_history_length
+    if h <= 1:
+      self._loco_hist[:] = step
+      self._loco_need_fill.zero_()
+      return self._loco_hist
+    new_hist = torch.cat([self._loco_hist[:, one:], step], dim=-1)
+    if bool(self._loco_need_fill.any()):
+      ids = self._loco_need_fill.nonzero(as_tuple=False).flatten()
+      new_hist[ids] = step[ids].repeat(1, h)
+      self._loco_need_fill[ids] = False
+    self._loco_hist[:] = new_hist
+    return self._loco_hist
+
+  def _build_actor_obs(self, *, loco_hist: torch.Tensor | None = None) -> torch.Tensor:
     sdf, clr = self._sdf_clr()
     if self.body_ee:
       return build_body_ee_obs(
@@ -402,7 +440,7 @@ class Stage3SimCollector:
         sdf=sdf,
         clearance=clr,
         last_a=self.last_a,
-        loco_obs=self._current_loco_obs(),
+        loco_obs=loco_hist if loco_hist is not None else self._loco_hist,
       )
     if self.hierarchical:
       return build_hierarchical_obs(
@@ -417,32 +455,25 @@ class Stage3SimCollector:
     return torch.cat((palm, goal, self.last_a[..., :3], sdf, clr), dim=-1)
 
   def _actor_body_ee(self) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(a_body, a_ee_delta_m)`` from actor or attractor+teacher."""
+    """Return ``(a_body, a_ee_delta_m)``. EE may use pre-inject reach; body is
+    refreshed post-inject on stacked loco hist in ``collect`` (do not advance
+    hist here — pre-inject would desync teacher)."""
     n = self.env.num_envs
-    self._last_loco_obs = None
     if self.ee_mode == "actor" and self.actor is not None:
       obs = self._build_actor_obs()
-      if self.loco_obs_dim > 0:
-        self._last_loco_obs = obs[..., : self.loco_obs_dim].detach()
       with torch.no_grad():
         out = self.actor(obs)
       if isinstance(out, tuple):
         return out[0], out[1]
-      # Legacy 3-D actor misconfigured — treat as EE only.
       return torch.zeros(n, self.body_dim, device=self.device), out
 
     # Attractor: EE toward true goal; body from frozen teacher after inject.
-    if self.loco_obs_dim > 0:
-      self._last_loco_obs = self._current_loco_obs()
-      if self._last_loco_obs is not None:
-        self._last_loco_obs = self._last_loco_obs.detach()
     a_ee = attractor_palm_delta_b(
       self.env,
       self.palm_state,
       arm_left=self.arm_left,
       scale_m=min(self.cfg.ee_delta_scale_m, 0.02),
     )
-    # Placeholder body; overwritten after inject + teacher query in collect.
     a_body = torch.zeros(n, self.body_dim, device=self.device)
     return a_body, a_ee
 
@@ -575,11 +606,13 @@ class Stage3SimCollector:
             rate_m=self.cfg.subgoal_rate_limit_m,
           )
         inject_subgoal_into_grasp(self.env, p_sub)
-        # Teacher + student body share post-inject HIM loco (same grasp/cmd).
+        # Teacher + student share the same post-inject one-step frame, then both
+        # advance a 6-frame stack (HIM act_inference vs student body_net hist).
         obs_td = self.vec.get_observations()
-        loco_post = flat_him_actor_obs(obs_td)
-        if self.loco_obs_dim > 0:
-          self._last_loco_obs = loco_post.detach()
+        loco_step = flat_him_actor_obs(obs_td)
+        if self._loco_hist is not None:
+          loco_hist = self._advance_loco_hist(loco_step)
+          self._last_loco_obs = loco_hist.detach()
         with torch.inference_mode():
           full_teacher = self.policy(obs_td)
         # Same space as phase-1/2: raw HIM mean, ±clip_actions (default 100).
@@ -592,9 +625,10 @@ class Stage3SimCollector:
         if self.ee_mode != "actor" or self.actor is None:
           a_body = teacher_body.clone()
         elif self.actor is not None and getattr(self.actor, "body_net", None) is not None:
-          # Re-read body head on post-inject loco so BC labels match teacher.
           with torch.no_grad():
-            a_body = self.actor._clip_body(self.actor.body_net(loco_post))
+            a_body = self.actor._clip_body(
+              self.actor.body_net(self._last_loco_obs)
+            )
         packed_a = torch.cat((a_body, a_ee), dim=-1)
         # Sim exec: never apply raw a_body. Normalized teacher (+ trust-region)
         # keeps feet on the ground; packed_a still stores actor for BC / critic.
@@ -782,8 +816,12 @@ class Stage3SimCollector:
           self.palm_state.reset_envs(self.env, done_ids, arm_left=self.arm_left)
         else:
           self.hier.reset_envs(self.env, done_ids, arm_left=self.arm_left)
+        # Mark done envs for warm-fill on the *next* post-inject frame so
+        # student hist matches teacher HomieInferencePolicy refill.
+        if self._loco_need_fill is not None:
+          self._loco_need_fill[done_ids] = True
         if hasattr(self.policy, "reset"):
-          self.policy.reset()
+          self.policy.reset(done_ids)
       rew_sum += float(r.mean().item())
       ppo_step_rew_sum += float(ppo_rew.mean().item())
       hit = (clr.min(dim=-1).values < 0.0) & (present > 0.5)
@@ -922,14 +960,14 @@ class Stage3SimCollector:
     sdf_k = int(self.cfg.sdf_query_count)
     actor_out = self.actor_out_dim
     loco_dim = int(self.loco_obs_dim)
+    loco_one = int(self.loco_one_step_dim)
     from homierl_mjlab.rl.stage3_bptt.env_bridge import splice_loco_proprio_from_state
 
     def obs_fn(state, goal, geom, last_a, loco_obs=None):
       """Build Stage3 actor obs.
 
-      When ``loco_obs`` is passed (imag), keep commands/grasp/sdf from that
-      freeze frame but **splice** ang_vel / gravity / joint_pos / joint_vel from
-      predicted ``state`` so body_net is not stuck on identical a_body for all H.
+      Imag: ``loco_obs`` is the frozen 6-frame stack from replay; only the
+      **latest** frame's proprio is spliced from predicted ``state``.
       """
       palm = state[..., -3:]
       b = state.shape[0]
@@ -976,6 +1014,7 @@ class Stage3SimCollector:
             state,
             n_joints=n_j,
             default_q=default_q,
+            loco_one_step_dim=loco_one,
           )
         return torch.cat((loco, reach), dim=-1)
       if hierarchical:

@@ -997,17 +997,34 @@ class HomieOnPolicyRunner:
     class HomieInferencePolicy:
       def __init__(self):
         self._hist: torch.Tensor | None = None
+        self._refill: torch.Tensor | None = None
 
-      def reset(self):
-        self._hist = None
+      def reset(self, env_ids=None):
+        """Clear hist, or mark ``env_ids`` to warm-fill on the next call."""
+        if env_ids is None or self._hist is None:
+          self._hist = None
+          self._refill = None
+          return
+        if self._refill is None or self._refill.shape[0] != self._hist.shape[0]:
+          self._refill = torch.zeros(
+            self._hist.shape[0], dtype=torch.bool, device=self._hist.device
+          )
+        self._refill[env_ids] = True
 
       def __call__(self, obs) -> torch.Tensor:
         step = _actor_step(obs)
-        if self._hist is None or self._hist.shape[0] != step.shape[0]:
+        n = int(step.shape[0])
+        if self._hist is None or self._hist.shape[0] != n:
           # Warm-start history with the current frame (same as adapter.reset).
           self._hist = step.repeat(1, hist_len)
+          self._refill = torch.zeros(n, dtype=torch.bool, device=step.device)
         else:
-          self._hist = torch.cat([self._hist[:, one_step:], step], dim=-1)
+          new_hist = torch.cat([self._hist[:, one_step:], step], dim=-1)
+          if self._refill is not None and bool(self._refill.any()):
+            ids = self._refill.nonzero(as_tuple=False).flatten()
+            new_hist[ids] = step[ids].repeat(1, hist_len)
+            self._refill[ids] = False
+          self._hist = new_hist
         with torch.inference_mode():
           return actor_critic.act_inference(self._hist)
 

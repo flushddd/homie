@@ -21,12 +21,13 @@ def _mlp(in_dim: int, hidden: Sequence[int], out_dim: int) -> nn.Sequential:
 class Stage3Actor(nn.Module):
   """Deterministic actor.
 
-  Default ``body_ee_palm_delta`` with ``loco_obs_dim>0`` (v3):
-    * ``body_net(loco_obs) → a_body(14)`` raw (no tanh; phase-1/2 HIM space)
-    * ``ee_net(reach_obs) → a_ee(3)`` meters Δp, hard-clipped (no tanh);
-      injected as ``p_sub`` like oracle grasp chase (policy EE residual off)
+  Default ``body_ee_palm_delta`` with ``loco_obs_dim>0`` (v4):
+    * ``body_net(loco_hist) → a_body(14)`` raw; ``loco_hist`` is HIM-aligned
+      ``history_length × one_step`` (default 6×229), same entry as teacher
+    * ``ee_net(reach_obs) → a_ee(3)`` meters Δp, hard-clipped;
+      injected as ``p_sub`` (policy EE residual off)
 
-  Obs layout must be ``[loco | reach]``. Legacy ``loco_obs_dim=0`` keeps a
+  Obs layout must be ``[loco_hist | reach]``. Legacy ``loco_obs_dim=0`` keeps a
   single MLP on the full vector (reach-only or packed).
   """
 
