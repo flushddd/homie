@@ -29,7 +29,7 @@ class ProgressiveCurriculum:
   body_min_iters: int = 30
   body_hold_iters: int = 5
   teacher_mse_max: float = 0.08
-  ep_len_frac_min: float = 0.75  # vs max episode length (policy steps)
+  ep_len_frac_min: float = 0.8  # vs max episode length (policy steps)
   # ARM → BOX
   arm_min_iters: int = 40
   arm_hold_iters: int = 5
@@ -64,7 +64,7 @@ class ProgressiveCurriculum:
       body_min_iters=int(getattr(cfg, "curr_body_min_iters", 30)),
       body_hold_iters=int(getattr(cfg, "curr_body_hold_iters", 5)),
       teacher_mse_max=float(getattr(cfg, "curr_teacher_mse_max", 0.08)),
-      ep_len_frac_min=float(getattr(cfg, "curr_ep_len_frac_min", 0.75)),
+      ep_len_frac_min=float(getattr(cfg, "curr_ep_len_frac_min", 0.8)),
       arm_min_iters=int(getattr(cfg, "curr_arm_min_iters", 40)),
       arm_hold_iters=int(getattr(cfg, "curr_arm_hold_iters", 5)),
       reach_unlock_box=float(getattr(cfg, "curr_reach_unlock_box", 0.50)),

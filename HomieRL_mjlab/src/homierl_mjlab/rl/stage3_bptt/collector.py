@@ -635,21 +635,13 @@ class Stage3SimCollector:
         packed_a = torch.cat((a_body, a_ee), dim=-1)
         # Sim exec: never apply raw a_body. Normalized teacher (+ trust-region)
         # keeps feet on the ground; packed_a still stores actor for BC / critic.
-        pure_teacher = (not self.arm_unlocked) and bool(
-          getattr(self.cfg, "body_exec_teacher", True)
-        )
-        mix = (
-          float(getattr(self.cfg, "body_exec_mix", 0.0))
-          if pure_teacher
-          else 1.0
-        )
-        exec_body = safe_exec_body(
-          a_body,
-          teacher_body,
-          mix=mix,
-          trust=float(getattr(self.cfg, "body_trust_region", 0.20)),
-          max_norm=float(getattr(self.cfg, "body_max_norm", 0.0)),
-        )
+        if self.ee_mode != "actor" or self.actor is None:
+          raise RuntimeError(
+        "Student-only execution requires ee_mode='actor' and a loaded actor. "
+        "Teacher fallback has been disabled."
+          )
+
+        exec_body = a_body
         act = full_teacher.clone()
         act[:, : self.body_dim] = exec_body
         # Env policy action is 14-D (IK residual off). Only pad if the env
@@ -849,7 +841,7 @@ class Stage3SimCollector:
       "presence_prob": float(self._presence_prob),
       "w_loco": float(getattr(self.cfg, "w_loco", 1.0)),
       "body_exec_teacher": (
-        1.0
+        0.0
         if (
           self.body_ee
           and (not self.arm_unlocked)
@@ -858,7 +850,7 @@ class Stage3SimCollector:
         else 0.0
       ),
       "body_exec_mix": float(
-        getattr(self.cfg, "body_exec_mix", 0.0)
+        getattr(self.cfg, "body_exec_mix", 1.0)
         if (
           self.body_ee
           and (not self.arm_unlocked)

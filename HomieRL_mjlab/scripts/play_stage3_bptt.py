@@ -482,13 +482,8 @@ class Stage3BpttPlayPolicy:
         exec_body = teacher_body
       else:
         # Trust-region in the normalized space — no takeoff.
-        exec_body = safe_exec_body(
-          a_body,
-          teacher_body,
-          mix=1.0,
-          trust=float(getattr(c.cfg, "body_trust_region", 0.20)),
-          max_norm=float(getattr(c.cfg, "body_max_norm", 0.0)),
-        )
+        exec_body = a_body
+        
       packed = torch.cat((a_body, a_ee), dim=-1)
       act = full_teacher.clone()
       act[:, : c.body_dim] = exec_body

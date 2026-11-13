@@ -138,7 +138,7 @@ class Stage3BpttCfg:
   curr_body_min_iters: int = 30
   curr_body_hold_iters: int = 5
   curr_teacher_mse_max: float = 0.08
-  curr_ep_len_frac_min: float = 0.75
+  curr_ep_len_frac_min: float = 0.8
   curr_arm_min_iters: int = 40
   curr_arm_hold_iters: int = 5
   curr_reach_unlock_box: float = 0.50
